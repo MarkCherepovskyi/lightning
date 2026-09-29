@@ -5295,3 +5295,35 @@ def test_connect_proxy_maxlen_hostname(node_factory):
                        + bytes([len(hostname)])
                        + hostname.encode('ascii')
                        + (1234).to_bytes(2, 'big'))
+
+
+@pytest.mark.slow_test
+def test_parallel_opens(node_factory, bitcoind, executor):
+    """On macOS a socket closed by its sender while in flight over SCM_RIGHTS
+    could arrive unable to read, losing a subdaemon its hsmd or peer
+    connection under load (#5808)."""
+    pairs, opens = 6, 50
+    nodes = node_factory.get_nodes(2 * pairs)
+    openers, peers = nodes[:pairs], nodes[pairs:]
+
+    outputs = {}
+    for l1, l2 in zip(openers, peers):
+        l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
+        for _ in range(opens):
+            outputs[l1.rpc.newaddr('bech32')['bech32']] = 0.02
+    bitcoind.rpc.sendmany("", outputs)
+    bitcoind.generate_block(1)
+    for l1 in openers:
+        wait_for(lambda: len([o for o in l1.rpc.listfunds()['outputs']
+                              if o['status'] == 'confirmed']) == opens)
+
+    def open_all(l1, l2):
+        for _ in range(opens):
+            l1.rpc.fundchannel(l2.info['id'], 10**6)
+
+    futs = [executor.submit(open_all, l1, l2) for l1, l2 in zip(openers, peers)]
+    for fut in futs:
+        fut.result(TIMEOUT)
+
+    for node in nodes:
+        assert not node.daemon.is_in_log(r'Owning subdaemon channeld died \(0\)')
