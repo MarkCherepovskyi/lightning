@@ -19,6 +19,26 @@ struct bitcoin_tx *create_close_tx(const tal_t *ctx,
 				   struct amount_sat to_us,
 				   struct amount_sat to_them,
 				   struct amount_sat dust_limit);
+
+/* PoC: Liquid asset channel version of create_close_tx.  Spends the funding
+ * (asset) output and the L-BTC fee reserve; @to_us / @to_them are full asset
+ * balances (the @fee comes out of the fee reserve, the rest of which goes
+ * back to the opener). */
+struct bitcoin_tx *create_asset_close_tx(const tal_t *ctx,
+					 const struct chainparams *chainparams,
+					 u32 *local_wallet_index,
+					 const struct ext_key *local_wallet_ext_key,
+					 const u8 *our_script,
+					 const u8 *their_script,
+					 const u8 *funding_wscript,
+					 const struct bitcoin_outpoint *funding,
+					 struct amount_sat funding_sats,
+					 struct amount_sat to_us,
+					 struct amount_sat to_them,
+					 struct amount_sat dust_limit,
+					 bool we_opened,
+					 struct amount_sat fee);
+
 /* Create simple close tx (option_simple_close) to spend the anchor tx output.
  * The closer pays the fee; closee output is omitted if closee_script is NULL.
  * Closer output is omitted if closer_script is NULL (or OP_RETURN with amount 0).

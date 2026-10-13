@@ -31,8 +31,10 @@
  */
 #include "config.h"
 #include <bitcoin/psbt.h>
+#include <ccan/mem/mem.h>
 #include <ccan/tal/str/str.h>
 #include <common/addr.h>
+#include <common/liquid_asset.h>
 #include <lightningd/chaintopology.h>
 #include <lightningd/channel.h>
 #include <lightningd/lightningd.h>
@@ -459,7 +461,18 @@ bool watch_check_tx_outputs(const struct chain_topology *topo,
 				bad_outnum = true;
 				continue;
 			}
-			if (!amount_asset_is_main(&outasset)
+			/* PoC: Liquid asset channel funding is in the
+			 * channel asset, not L-BTC. */
+			const u8 *chan_asset = liquid_channel_asset();
+			if (chan_asset
+			    && memeq(outasset.asset, sizeof(outasset.asset),
+				     chan_asset, sizeof(outasset.asset))) {
+				if (!amount_sat_eq(amount_sat(outasset.value),
+						   w->expected_amount)) {
+					bad_amount = true;
+					continue;
+				}
+			} else if (!amount_asset_is_main(&outasset)
 			    || !amount_sat_eq(amount_asset_to_sat(&outasset), w->expected_amount)) {
 				bad_amount = true;
 				continue;

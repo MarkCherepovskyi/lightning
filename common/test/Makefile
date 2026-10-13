@@ -172,6 +172,7 @@ common/test/run-jsonrpc_io: common/json_parse_simple.o
 common/test/run-close_tx:			\
 	common/amount.o					\
 	common/close_tx.o				\
+	common/liquid_asset.o				\
 	common/permute_tx.o				\
 	common/psbt_keypath.o			\
 	common/pseudorand.o				\

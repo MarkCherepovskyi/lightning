@@ -2,6 +2,7 @@
 #include <assert.h>
 #include <bitcoin/script.h>
 #include <common/close_tx.h>
+#include <common/liquid_asset.h>
 #include <common/permute_tx.h>
 #include <common/psbt_keypath.h>
 #include <common/utils.h>
@@ -87,6 +88,71 @@ struct bitcoin_tx *create_close_tx(const tal_t *ctx,
 	if (num_outputs == 0)
 		return tal_free(tx);
 
+	permute_outputs(tx, NULL, NULL);
+
+	bitcoin_tx_finalize(tx);
+	assert(bitcoin_tx_check(tx));
+	return tx;
+}
+
+struct bitcoin_tx *create_asset_close_tx(const tal_t *ctx,
+					 const struct chainparams *chainparams,
+					 u32 *local_wallet_index,
+					 const struct ext_key *local_wallet_ext_key,
+					 const u8 *our_script,
+					 const u8 *their_script,
+					 const u8 *funding_wscript,
+					 const struct bitcoin_outpoint *funding,
+					 struct amount_sat funding_sats,
+					 struct amount_sat to_us,
+					 struct amount_sat to_them,
+					 struct amount_sat dust_limit,
+					 bool we_opened,
+					 struct amount_sat fee)
+{
+	const u8 *asset = liquid_channel_asset();
+	struct bitcoin_tx *tx;
+	int our_outnum = -1, their_outnum = -1;
+	u8 *script;
+
+	assert(asset);
+	if (amount_sat_greater(fee, liquid_fee_reserve()))
+		return NULL;
+
+	/* Two inputs (asset funding, L-BTC fee reserve); our and their asset
+	 * outputs, and the opener's L-BTC change. */
+	tx = bitcoin_tx(ctx, chainparams, 2, 3, 0);
+	bitcoin_tx_add_asset_input(tx, funding,
+				   BITCOIN_TX_DEFAULT_SEQUENCE, NULL,
+				   funding_sats, NULL, funding_wscript, asset);
+	liquid_add_fee_reserve_input(tx, funding, BITCOIN_TX_DEFAULT_SEQUENCE,
+				     funding_wscript);
+
+	if (amount_sat_greater_eq(to_us, dust_limit)) {
+		script = tal_dup_talarr(tx, u8, our_script);
+		our_outnum = bitcoin_tx_add_asset_output(tx, script, NULL,
+							 to_us, asset);
+		assert((local_wallet_index == NULL) == (local_wallet_ext_key == NULL));
+		if (local_wallet_index) {
+			size_t script_len = tal_bytelen(script);
+			if (!psbt_add_keypath_to_last_output(
+				    tx, *local_wallet_index, local_wallet_ext_key,
+				    is_p2tr(script, script_len, NULL)))
+				return tal_free(tx);
+		}
+	}
+
+	if (amount_sat_greater_eq(to_them, dust_limit)) {
+		script = tal_dup_talarr(tx, u8, their_script);
+		their_outnum = bitcoin_tx_add_asset_output(tx, script, NULL,
+							   to_them, asset);
+	}
+
+	if (our_outnum < 0 && their_outnum < 0)
+		return tal_free(tx);
+
+	liquid_finish_channel_tx(tx, funding_sats,
+				 we_opened ? our_outnum : their_outnum, fee);
 	permute_outputs(tx, NULL, NULL);
 
 	bitcoin_tx_finalize(tx);

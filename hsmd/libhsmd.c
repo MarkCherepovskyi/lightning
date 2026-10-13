@@ -1665,7 +1665,9 @@ static u8 *handle_sign_remote_commitment_tx(struct hsmd_client *c, const u8 *msg
 	tx->chainparams = c->chainparams;
 
 	/* Basic sanity checks. */
-	if (tx->wtx->num_inputs != 1)
+	/* PoC: Liquid asset channels also spend the L-BTC fee reserve. */
+	if (tx->wtx->num_inputs != 1
+	    && !(is_elements(chainparams) && tx->wtx->num_inputs == 2))
 		return hsmd_status_bad_request_fmt(c, msg_in,
 						   "tx must have 1 input");
 
@@ -1867,7 +1869,9 @@ static u8 *handle_sign_commitment_tx(struct hsmd_client *c, const u8 *msg_in)
 	tx->chainparams = c->chainparams;
 
 	/* Basic sanity checks. */
-	if (tx->wtx->num_inputs != 1)
+	/* PoC: Liquid asset channels also spend the L-BTC fee reserve. */
+	if (tx->wtx->num_inputs != 1
+	    && !(is_elements(chainparams) && tx->wtx->num_inputs == 2))
 		return hsmd_status_bad_request(c, msg_in,
 					       "tx must have 1 input");
 

@@ -5,6 +5,7 @@
 #include <closingd/closingd_wiregen.h>
 #include <common/closing_fee.h>
 #include <common/json_command.h>
+#include <common/liquid_asset.h>
 #include <common/shutdown_scriptpubkey.h>
 #include <common/timeout.h>
 #include <errno.h>
@@ -219,9 +220,12 @@ static bool closing_fee_is_acceptable(struct lightningd *ld,
 	struct amount_sat fee, last_fee;
 	u64 weight;
 
-	/* Calculate actual fee (adds in eliminated outputs) */
-	fee = calc_tx_fee(channel->funding_sats, tx);
-	last_fee = calc_tx_fee(channel->funding_sats, channel->last_tx);
+	/* Calculate actual fee (adds in eliminated outputs).  Liquid asset
+	 * channels pay fees from the L-BTC fee reserve, not the funding. */
+	struct amount_sat fee_input = liquid_channel_asset()
+		? liquid_fee_reserve() : channel->funding_sats;
+	fee = calc_tx_fee(fee_input, tx);
+	last_fee = calc_tx_fee(fee_input, channel->last_tx);
 
 	/* Weight once we add in sigs. */
 	assert(!tx->wtx->inputs[0].witness
@@ -406,7 +410,10 @@ void peer_start_closingd(struct channel *channel, struct peer_fd *peer_fd)
 
 	hsmfd = hsm_get_client_fd(ld, &channel->peer->id, channel->dbid,
 				  HSM_PERM_SIGN_CLOSING_TX
-				  | HSM_PERM_COMMITMENT_POINT);
+				  | HSM_PERM_COMMITMENT_POINT
+				  /* PoC: Liquid asset channels: closingd signs
+				   * the fee reserve input with hsmd_sign_splice_tx */
+				  | (liquid_channel_asset() ? HSM_PERM_SIGN_SPLICE_TX : 0));
 	if (hsmfd < 0) {
 		log_broken(channel->log, "Could not get hsm fd for closing: %s",
 			   strerror(errno));

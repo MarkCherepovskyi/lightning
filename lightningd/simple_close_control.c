@@ -6,6 +6,7 @@
 #include <closingd/simpleclosed_wiregen.h>
 #include <common/features.h>
 #include <common/fee_states.h>
+#include <common/liquid_asset.h>
 #include <common/memleak.h>
 #include <common/shutdown_scriptpubkey.h>
 #include <common/timeout.h>
@@ -43,8 +44,19 @@ const char *close_tx_check(const tal_t *ctx,
 			   const struct bitcoin_tx *tx)
 {
 	bool local_matched = false, remote_matched = false;
+	/* PoC: Liquid asset channels also spend the L-BTC fee reserve, and
+	 * the opener's L-BTC change shares the opener's shutdown script. */
+	bool asset = liquid_channel_asset() != NULL;
 
-	if (tx->wtx->num_inputs != 1)
+	if (asset) {
+		struct bitcoin_outpoint reserve
+			= liquid_fee_reserve_outpoint(&channel->funding);
+		if (tx->wtx->num_inputs != 2
+		    || !wally_tx_input_spends(&tx->wtx->inputs[1], &reserve))
+			return tal_fmt(ctx, "expected 2nd input to spend fee"
+				       " reserve %s",
+				       fmt_bitcoin_outpoint(ctx, &reserve));
+	} else if (tx->wtx->num_inputs != 1)
 		return tal_fmt(ctx, "expected 1 input, got %zu",
 			tx->wtx->num_inputs);
 
@@ -73,12 +85,12 @@ const char *close_tx_check(const tal_t *ctx,
 					       out->script, out->script_len, 0);
 		/* Only let each side's output match once. */
 		if (scripteq(script, channel->shutdown_scriptpubkey[LOCAL])
-		    && !local_matched) {
+		    && (!local_matched || asset)) {
 			local_matched = true;
 			continue;
 		}
 		if (scripteq(script, channel->shutdown_scriptpubkey[REMOTE])
-		    && !remote_matched) {
+		    && (!remote_matched || asset)) {
 			remote_matched = true;
 			continue;
 		}

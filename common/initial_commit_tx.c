@@ -3,6 +3,7 @@
 #include <ccan/array_size/array_size.h>
 #include <common/initial_commit_tx.h>
 #include <common/keyset.h>
+#include <common/liquid_asset.h>
 #include <common/permute_tx.h>
 #include <common/status.h>
 
@@ -99,11 +100,15 @@ struct bitcoin_tx *initial_commit_tx(const tal_t *ctx,
 	enum side lessor = !opener;
 	u32 sequence;
 	void *dummy_local = (void *)LOCAL, *dummy_remote = (void *)REMOTE;
-	/* There is a direct, and possibly an anchor output for each side. */
-	const void *output_order[2 * NUM_SIDES];
+	/* There is a direct, and possibly an anchor output for each side,
+	 * plus the opener's L-BTC change for Liquid asset channels. */
+	const void *output_order[2 * NUM_SIDES + 1];
 	const u8 *funding_wscript = bitcoin_redeem_2of2(tmpctx,
 							&funding_key[LOCAL],
 							&funding_key[REMOTE]);
+	/* PoC: Liquid asset channel?  Then fees come from the fee reserve. */
+	const u8 *asset = liquid_channel_asset();
+	int outnum[NUM_SIDES] = { -1, -1 };
 
 	if (!amount_msat_add(&total_pay, self_pay, other_pay))
 		abort();
@@ -145,7 +150,14 @@ struct bitcoin_tx *initial_commit_tx(const tal_t *ctx,
 	 * also subtract two times the fixed anchor size of 330 sats from the
 	 * funder (either `to_local` or `to_remote`).
 	 */
-	if (!try_subtract_fee(opener, side, base_fee, &self_pay, &other_pay)) {
+	if (asset) {
+		/* The fee is paid in L-BTC from the fee reserve, not from
+		 * the opener's (asset) balance. */
+		if (amount_sat_greater(base_fee, liquid_fee_reserve())) {
+			*err_reason = "Fee reserve cannot afford fee on initial commitment transaction";
+			return NULL;
+		}
+	} else if (!try_subtract_fee(opener, side, base_fee, &self_pay, &other_pay)) {
 		/* BOLT #2:
 		 *
 		 * The receiving node MUST fail the channel if:
@@ -182,8 +194,10 @@ struct bitcoin_tx *initial_commit_tx(const tal_t *ctx,
 	}
 
 
-	/* Worst-case sizing: both to-local and to-remote outputs + anchors. */
-	tx = bitcoin_tx(ctx, chainparams, 1, untrimmed + 4, 0);
+	/* Worst-case sizing: both to-local and to-remote outputs + anchors
+	 * (+ fee reserve input and L-BTC change for asset channels). */
+	tx = bitcoin_tx(ctx, chainparams, asset ? 2 : 1,
+			untrimmed + 4 + (asset ? 1 : 0), 0);
 
 	/* This could be done in a single loop, but we follow the BOLT
 	 * literally to make comments in test vectors clearer. */
@@ -213,9 +227,10 @@ struct bitcoin_tx *initial_commit_tx(const tal_t *ctx,
 					      side == lessor ? csv_lock : 0,
 					      keyset);
 		amount = amount_msat_to_sat_round_down(self_pay);
-		int pos = bitcoin_tx_add_output(
-		    tx, scriptpubkey_p2wsh(tx, wscript), wscript, amount);
+		int pos = bitcoin_tx_add_asset_output(
+		    tx, scriptpubkey_p2wsh(tx, wscript), wscript, amount, asset);
 		assert(pos == n);
+		outnum[side] = pos;
 		output_order[n] = dummy_local;
 		n++;
 		to_local = true;
@@ -254,13 +269,24 @@ struct bitcoin_tx *initial_commit_tx(const tal_t *ctx,
 			scriptpubkey = scriptpubkey_p2wpkh(tmpctx,
 							   &keyset->other_payment_key);
 		}
-		pos = bitcoin_tx_add_output(tx, scriptpubkey, redeem, amount);
+		pos = bitcoin_tx_add_asset_output(tx, scriptpubkey, redeem,
+						  amount, asset);
 		assert(pos == n);
+		outnum[!side] = pos;
 		output_order[n] = dummy_remote;
 		n++;
 		to_remote = true;
 	} else
 		to_remote = false;
+
+	/* Liquid asset channel: leftovers to the opener, plus the opener's
+	 * L-BTC change from the fee reserve. */
+	if (asset
+	    && liquid_finish_channel_tx(tx, funding_sats, outnum[opener],
+					base_fee) >= 0) {
+		output_order[n] = NULL;
+		n++;
+	}
 
 	/* BOLT #3:
 	 * 8. If `option_anchors` applies to the commitment transaction:
@@ -318,8 +344,12 @@ struct bitcoin_tx *initial_commit_tx(const tal_t *ctx,
 	 *    * `txin[0]` script bytes: 0
 	 */
 	sequence = (0x80000000 | ((obscured_commitment_number>>24) & 0xFFFFFF));
-	bitcoin_tx_add_input(tx, funding, sequence,
-			     NULL, funding_sats, NULL, funding_wscript);
+	bitcoin_tx_add_asset_input(tx, funding, sequence,
+				   NULL, funding_sats, NULL, funding_wscript,
+				   asset);
+	if (asset)
+		liquid_add_fee_reserve_input(tx, funding, sequence,
+					     funding_wscript);
 
 	if (direct_outputs != NULL) {
 		direct_outputs[LOCAL] = direct_outputs[REMOTE] = NULL;

@@ -24,6 +24,14 @@ struct wally_tx_output *wally_tx_output(const tal_t *ctx,
 					const u8 *script,
 					struct amount_sat amount)
 {
+	return wally_tx_output_asset(ctx, script, amount, NULL);
+}
+
+struct wally_tx_output *wally_tx_output_asset(const tal_t *ctx,
+					      const u8 *script,
+					      struct amount_sat amount,
+					      const u8 *asset)
+{
 	u64 satoshis = amount.satoshis; /* Raw: wally API */
 	struct wally_tx_output *output;
 	int ret;
@@ -35,7 +43,8 @@ struct wally_tx_output *wally_tx_output(const tal_t *ctx,
 							       sizeof(value));
 		assert(ret == WALLY_OK);
 		ret = wally_tx_elements_output_init_alloc(
-		    script, tal_bytelen(script), chainparams->fee_asset_tag, 33,
+		    script, tal_bytelen(script),
+		    asset ? asset : chainparams->fee_asset_tag, 33,
 		    value, sizeof(value), NULL, 0, NULL, 0, NULL, 0, &output);
 		if (ret != WALLY_OK) {
 			output = NULL;
@@ -62,6 +71,13 @@ done:
 int bitcoin_tx_add_output(struct bitcoin_tx *tx, const u8 *script,
 			  const u8 *wscript, struct amount_sat amount)
 {
+	return bitcoin_tx_add_asset_output(tx, script, wscript, amount, NULL);
+}
+
+int bitcoin_tx_add_asset_output(struct bitcoin_tx *tx, const u8 *script,
+				const u8 *wscript, struct amount_sat amount,
+				const u8 *asset)
+{
 	size_t i = tx->wtx->num_outputs;
 	struct wally_tx_output *output;
 	struct wally_psbt_output *psbt_out;
@@ -72,7 +88,7 @@ int bitcoin_tx_add_output(struct bitcoin_tx *tx, const u8 *script,
 	assert(tx->wtx != NULL);
 	assert(chainparams);
 
-	output = wally_tx_output(NULL, script, amount);
+	output = wally_tx_output_asset(NULL, script, amount, asset);
 	assert(output);
 	tal_wally_start();
 	ret = wally_tx_add_output(tx->wtx, output);
@@ -146,6 +162,15 @@ struct amount_sat bitcoin_tx_compute_fee(const struct bitcoin_tx *tx)
 	bool ok;
 
 	for (size_t i = 0; i < tx->psbt->num_inputs; i++) {
+		/* Elements: only the fee asset can pay fees (outputs in other
+		 * assets are skipped below too). */
+		if (chainparams->is_elements
+		    && tx->psbt->inputs[i].witness_utxo) {
+			struct amount_asset asset
+				= wally_tx_output_get_amount(tx->psbt->inputs[i].witness_utxo);
+			if (!amount_asset_is_main(&asset))
+				continue;
+		}
 		input_amt = psbt_input_get_amount(tx->psbt, i);
 		ok = amount_sat_add(&input_total, input_total, input_amt);
 		assert(ok);
@@ -228,6 +253,18 @@ int bitcoin_tx_add_input(struct bitcoin_tx *tx,
 			 struct amount_sat amount, const u8 *scriptPubkey,
 			 const u8 *input_wscript)
 {
+	return bitcoin_tx_add_asset_input(tx, outpoint, sequence, scriptSig,
+					  amount, scriptPubkey, input_wscript,
+					  NULL);
+}
+
+int bitcoin_tx_add_asset_input(struct bitcoin_tx *tx,
+			       const struct bitcoin_outpoint *outpoint,
+			       u32 sequence, const u8 *scriptSig,
+			       struct amount_sat amount, const u8 *scriptPubkey,
+			       const u8 *input_wscript,
+			       const u8 *asset)
+{
 	int wally_err;
 	int input_num = tx->wtx->num_inputs;
 	struct wally_tx_input *tx_input;
@@ -241,8 +278,8 @@ int bitcoin_tx_add_input(struct bitcoin_tx *tx,
 	}
 
 	assert(scriptPubkey);
-	psbt_input_set_wit_utxo(tx->psbt, input_num,
-				scriptPubkey, amount);
+	psbt_input_set_wit_utxo_asset(tx->psbt, input_num,
+				      scriptPubkey, amount, asset);
 
 	tal_wally_start();
 	tx_input = wally_tx_input_from_outpoint_sequence(outpoint, sequence);

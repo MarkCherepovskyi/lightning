@@ -5,6 +5,7 @@
 #include <closingd/closingd_wiregen.h>
 #include <common/close_tx.h>
 #include <common/closing_fee.h>
+#include <common/liquid_asset.h>
 #include <common/memleak.h>
 #include <common/peer_billboard.h>
 #include <common/peer_failed.h>
@@ -58,6 +59,27 @@ static struct bitcoin_tx *close_tx(const tal_t *ctx,
 {
 	struct bitcoin_tx *tx;
 	struct amount_sat out_minus_fee[NUM_SIDES];
+
+	/* PoC: Liquid asset channels pay the fee from the L-BTC fee reserve,
+	 * so neither asset output is reduced. */
+	if (liquid_channel_asset()) {
+		tx = create_asset_close_tx(ctx, chainparams,
+					   local_wallet_index,
+					   local_wallet_ext_key,
+					   scriptpubkey[LOCAL],
+					   scriptpubkey[REMOTE],
+					   funding_wscript, funding,
+					   funding_sats,
+					   out[LOCAL], out[REMOTE],
+					   dust_limit, opener == LOCAL, fee);
+		if (!tx)
+			peer_failed_warn(pps, channel_id,
+					 "Fee reserve %s cannot afford fee %s",
+					 fmt_amount_sat(tmpctx,
+							liquid_fee_reserve()),
+					 fmt_amount_sat(tmpctx, fee));
+		return tx;
+	}
 
 	/* BOLT #3:
 	 * ## Legacy Closing Transaction
@@ -125,6 +147,26 @@ static u8 *closing_read_peer_msg(const tal_t *ctx,
 		if (!handle_peer_error_or_warning(pps, msg))
 			return msg;
 	}
+}
+
+/* PoC: Liquid asset channels: our signature for input 1, the L-BTC fee
+ * reserve (same 2-of-2 as the funding output, so the splice signer fits). */
+static struct bitcoin_signature sign_fee_reserve(const struct bitcoin_tx *tx,
+						 const struct pubkey *remote_funding_key)
+{
+	struct bitcoin_signature sig;
+	u8 *msg;
+
+	wire_sync_write(HSM_FD,
+			take(towire_hsmd_sign_splice_tx(NULL, tx,
+							remote_funding_key,
+							1)));
+	msg = wire_sync_read(tmpctx, HSM_FD);
+	if (!fromwire_hsmd_sign_tx_reply(msg, &sig))
+		status_failed(STATUS_FAIL_HSM_IO,
+			      "Bad hsm_sign_splice_tx reply %s",
+			      tal_hex(tmpctx, msg));
+	return sig;
 }
 
 static void send_offer(struct per_peer_state *pps,
@@ -207,6 +249,17 @@ static void send_offer(struct per_peer_state *pps,
 		       fmt_amount_sat(tmpctx, tlv_fees->max_fee_satoshis));
 	} else
 		close_tlvs = NULL;
+
+	/* PoC: Liquid asset channels: also sign the fee reserve input. */
+	if (liquid_channel_asset()) {
+		struct bitcoin_signature reserve_sig
+			= sign_fee_reserve(tx, &funding_pubkey[REMOTE]);
+		if (!close_tlvs)
+			close_tlvs = tlv_closing_signed_tlvs_new(tmpctx);
+		close_tlvs->fee_reserve_sig
+			= tal_dup(close_tlvs, secp256k1_ecdsa_signature,
+				  &reserve_sig.s);
+	}
 
 	assert(our_sig.sighash_type == SIGHASH_ALL);
 	msg = towire_closing_signed(NULL, channel_id, fee_to_offer, &our_sig.s,
@@ -356,6 +409,30 @@ receive_offer(struct per_peer_state *pps,
 					 : "NONE");
 		}
 		tx = trimmed;
+	}
+
+	/* PoC: Liquid asset channels: check their signature for the fee
+	 * reserve input, add ours, and complete that input's witness so
+	 * lightningd only has to sign the funding input as usual. */
+	if (liquid_channel_asset()) {
+		struct bitcoin_signature their_reserve_sig, our_reserve_sig;
+
+		if (!close_tlvs || !close_tlvs->fee_reserve_sig)
+			peer_failed_warn(pps, channel_id,
+					 "closing_signed without fee_reserve_sig");
+		their_reserve_sig.s = *close_tlvs->fee_reserve_sig;
+		their_reserve_sig.sighash_type = SIGHASH_ALL;
+		if (!check_tx_sig(tx, 1, NULL, funding_wscript,
+				  &funding_pubkey[REMOTE], &their_reserve_sig))
+			peer_failed_warn(pps, channel_id,
+					 "Bad fee_reserve_sig for %s",
+					 fmt_bitcoin_tx(tmpctx, tx));
+		our_reserve_sig = sign_fee_reserve(tx, &funding_pubkey[REMOTE]);
+		bitcoin_tx_input_set_witness(tx, 1,
+			take(bitcoin_witness_2of2(NULL, &their_reserve_sig,
+						  &our_reserve_sig,
+						  &funding_pubkey[REMOTE],
+						  &funding_pubkey[LOCAL])));
 	}
 
 	status_debug("Received fee offer %s",
@@ -578,6 +655,22 @@ static size_t closing_tx_weight_estimate(u8 *scriptpubkey[NUM_SIDES],
 	struct bitcoin_outpoint dummy_funding;
 
 	memset(&dummy_funding, 0, sizeof(dummy_funding));
+	/* PoC: Liquid asset channels also spend the fee reserve. */
+	if (liquid_channel_asset()) {
+		tx = create_asset_close_tx(tmpctx, chainparams,
+					   local_wallet_index,
+					   local_wallet_ext_key,
+					   scriptpubkey[LOCAL],
+					   scriptpubkey[REMOTE],
+					   funding_wscript,
+					   &dummy_funding,
+					   funding_sats,
+					   out[LOCAL], out[REMOTE],
+					   dust_limit, true, AMOUNT_SAT(0));
+		return bitcoin_tx_weight(tx)
+			+ 2 * bitcoin_tx_2of2_input_witness_weight();
+	}
+
 	tx = create_close_tx(tmpctx, chainparams,
 			     local_wallet_index, local_wallet_ext_key,
 			     scriptpubkey[LOCAL], scriptpubkey[REMOTE],
@@ -634,6 +727,11 @@ static void calc_fee_bounds(size_t expected_weight,
 			     max_feerate,
 			     fmt_amount_sat(tmpctx, *maxfee));
 	}
+
+	/* PoC: Liquid asset channels can't pay more than the fee reserve. */
+	if (liquid_channel_asset()
+	    && amount_sat_greater(*maxfee, liquid_fee_reserve()))
+		*maxfee = liquid_fee_reserve();
 
 	/* Can't exceed maxfee. */
 	if (amount_sat_greater(*minfee, *maxfee))

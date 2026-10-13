@@ -9,6 +9,7 @@
 #include <common/fee_states.h>
 #include <common/json_channel_type.h>
 #include <common/json_command.h>
+#include <common/liquid_asset.h>
 #include <common/memleak.h>
 #include <connectd/connectd_wiregen.h>
 #include <errno.h>
@@ -1079,6 +1080,13 @@ static struct command_result *json_fundchannel_complete(struct command *cmd,
 			  funding_psbt->outputs[i].script_len,
 			  fc->funding_scriptpubkey,
 			  tal_bytelen(fc->funding_scriptpubkey))) {
+			/* PoC: Liquid asset channels pay the L-BTC fee
+			 * reserve to the same 2-of-2, right after the
+			 * funding output. */
+			if (funding_txout_num
+			    && liquid_channel_asset()
+			    && i == *funding_txout_num + 1)
+				continue;
 			if (funding_txout_num)
 				return command_fail(cmd, FUNDING_PSBT_INVALID,
 						    "Two outputs to open channel");
@@ -1089,6 +1097,19 @@ static struct command_result *json_fundchannel_complete(struct command *cmd,
 	if (!funding_txout_num)
 		return command_fail(cmd, FUNDING_PSBT_INVALID,
 				    "No output to open channel");
+
+	if (liquid_channel_asset()) {
+		size_t reserve = *funding_txout_num + 1;
+		if (reserve >= funding_psbt->num_outputs
+		    || !memeq(funding_psbt->outputs[reserve].script,
+			      funding_psbt->outputs[reserve].script_len,
+			      fc->funding_scriptpubkey,
+			      tal_bytelen(fc->funding_scriptpubkey)))
+			return command_fail(cmd, FUNDING_PSBT_INVALID,
+					    "Liquid asset channel: output %zu"
+					    " must pay the L-BTC fee reserve"
+					    " to the channel too", reserve);
+	}
 
 	/* Can't really check amounts for elements. */
 	if (!chainparams->is_elements
