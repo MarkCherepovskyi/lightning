@@ -864,9 +864,10 @@ to invoice request from trying to connect directly to the offering node as a las
   Proof of concept, Liquid only. Follow the gossip network of this issued
 asset (its id as elements-cli prints it), and allow announcing asset
 channels in it. Announced asset channels are gossiped with the asset id in
-place of the chain hash: nodes that don't follow the asset ignore them.
-`getroutes` and `xpay` only route in an asset when given `asset`. This
-option can be specified multiple times.
+place of the chain hash: nodes that don't follow the asset ignore them, and
+peers that both follow it exchange its gossip (streaming and gossip queries)
+on that network only. `getroutes` and `xpay` only route in an asset when
+given `asset`. This option can be specified multiple times.
 
 * **experimental-shutdown-wrong-funding**
 
