@@ -118,8 +118,9 @@ static void connectd_new_peer(struct daemon *daemon, const u8 *msg)
 {
 	struct peer *peer = tal(daemon, struct peer);
 
-	if (!fromwire_gossipd_new_peer(msg, &peer->id,
-				      &peer->gossip_queries_feature)) {
+	if (!fromwire_gossipd_new_peer(peer, msg, &peer->id,
+				      &peer->gossip_queries_feature,
+				      &peer->liquid_networks)) {
 		status_failed(STATUS_FAIL_INTERNAL_ERROR,
 			      "Bad new_peer msg from connectd: %s",
 			      tal_hex(tmpctx, msg));

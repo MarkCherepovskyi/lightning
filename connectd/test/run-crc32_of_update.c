@@ -20,6 +20,10 @@ bool fromwire_connectd_dev_set_max_scids_encode_size(const void *p UNNEEDED, u32
 /* Generated stub for get_gossmap */
 struct gossmap *get_gossmap(struct daemon *daemon UNNEEDED)
 { fprintf(stderr, "get_gossmap called!\n"); abort(); }
+/* Generated stub for gossip_network_known */
+bool gossip_network_known(const struct daemon *daemon UNNEEDED,
+			  const struct bitcoin_blkid *network UNNEEDED)
+{ fprintf(stderr, "gossip_network_known called!\n"); abort(); }
 /* Generated stub for inject_peer_msg */
 void inject_peer_msg(struct peer *peer UNNEEDED, const u8 *msg TAKES UNNEEDED)
 { fprintf(stderr, "inject_peer_msg called!\n"); abort(); }

@@ -306,13 +306,24 @@ static void gossipd_init_done(struct subd *gossipd,
 	io_break(gossipd);
 }
 
+struct bitcoin_blkid *liquid_gossip_networks(const tal_t *ctx,
+					     const struct lightningd *ld)
+{
+	struct bitcoin_blkid *networks;
+
+	networks = tal_arr(ctx, struct bitcoin_blkid,
+			   tal_count(ld->liquid_gossip_assets));
+	for (size_t i = 0; i < tal_count(networks); i++)
+		liquid_asset_network(ld->liquid_gossip_assets[i], &networks[i]);
+	return networks;
+}
+
 /* Create the `gossipd` subdaemon and send the initialization
  * message */
 void gossip_init(struct lightningd *ld, int connectd_fd)
 {
 	u8 *msg;
 	void *ret;
-	struct bitcoin_blkid *liquid_networks;
 
 	ld->gossip = new_global_subd(ld, "lightning_gossipd",
 				     gossipd_wire_name, gossip_msg,
@@ -324,12 +335,6 @@ void gossip_init(struct lightningd *ld, int connectd_fd)
 	topology_add_sync_waiter(ld->gossip, ld->topology,
 				 gossip_topology_synced, NULL);
 
-	liquid_networks = tal_arr(tmpctx, struct bitcoin_blkid,
-				  tal_count(ld->liquid_gossip_assets));
-	for (size_t i = 0; i < tal_count(liquid_networks); i++)
-		liquid_asset_network(ld->liquid_gossip_assets[i],
-				     &liquid_networks[i]);
-
 	msg = towire_gossipd_init(
 	    NULL,
 	    chainparams,
@@ -339,7 +344,7 @@ void gossip_init(struct lightningd *ld, int connectd_fd)
 	    subdaemon_path(tmpctx, ld, "lightning_gossip_compactd"),
 	    ld->dev_fast_gossip,
 	    ld->dev_fast_gossip_prune,
-	    liquid_networks);
+	    liquid_gossip_networks(tmpctx, ld));
 
 	subd_req(ld->gossip, ld->gossip, take(msg), -1, 0,
 		 gossipd_init_done, NULL);

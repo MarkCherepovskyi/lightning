@@ -286,6 +286,7 @@ void setup_peer_gossip_store(struct peer *peer,
 
 	peer->gs.grf = new_gossip_rcvd_filter(peer);
 	peer->gs.iter = gossmap_iter_new(peer, gossmap);
+	peer->gs.liquid_filters = tal_arr(peer, struct liquid_gossip_filter, 0);
 	peer->gs.bytes_this_second = 0;
 	peer->gs.bytes_start_time = time_mono();
 
@@ -619,6 +620,66 @@ static void wake_gossip(struct peer *peer)
 }
 
 /* Gossip response or something from gossip store */
+/* PoC: which gossip network is this channel_announcement or channel_update
+ * in?  (node_announcements have none: they go with the chain's own.) */
+static bool streamed_network(const u8 *msg, struct bitcoin_blkid *network)
+{
+	size_t off, len = tal_bytelen(msg);
+
+	switch (fromwire_peektype(msg)) {
+	case WIRE_CHANNEL_UPDATE:
+		/* type, signature, then chain_hash */
+		off = 2 + 64;
+		break;
+	case WIRE_CHANNEL_ANNOUNCEMENT:
+		/* type, 4 signatures, features (u16 length first), then
+		 * chain_hash */
+		off = 2 + 64 * 4;
+		if (len < off + 2)
+			return false;
+		off += 2 + ((msg[off] << 8) | msg[off + 1]);
+		break;
+	default:
+		return false;
+	}
+	if (len < off + sizeof(*network))
+		return false;
+	memcpy(network, msg + off, sizeof(*network));
+	return true;
+}
+
+static struct liquid_gossip_filter *find_liquid_filter(const struct peer *peer,
+							const struct bitcoin_blkid *network)
+{
+	for (size_t i = 0; i < tal_count(peer->gs.liquid_filters); i++)
+		if (bitcoin_blkid_eq(&peer->gs.liquid_filters[i].network, network))
+			return &peer->gs.liquid_filters[i];
+	return NULL;
+}
+
+/* Did they ask for this gossip?  Each network has its own timestamp filter
+ * (PoC: Liquid asset networks only get gossip if they asked for them). */
+static bool want_streamed(const struct peer *peer, const u8 *msg, u32 timestamp)
+{
+	u32 tmin = peer->gs.timestamp_min, tmax = peer->gs.timestamp_max;
+	struct bitcoin_blkid network;
+
+	if (chainparams->is_elements
+	    && streamed_network(msg, &network)
+	    && !bitcoin_blkid_eq(&network, &chainparams->genesis_blockhash)) {
+		const struct liquid_gossip_filter *f
+			= find_liquid_filter(peer, &network);
+		if (!f)
+			return false;
+		tmin = f->timestamp_min;
+		tmax = f->timestamp_max;
+	}
+
+	/* Check timestamp (zero for channel_announcement with
+	 * no update yet!):  FIXME: we could ignore this! */
+	return !timestamp || (timestamp >= tmin && timestamp <= tmax);
+}
+
 static const u8 *maybe_gossip_msg(const tal_t *ctx, struct peer *peer)
 {
 	const u8 *msg;
@@ -683,10 +744,7 @@ again:
 			msg = tal_free(msg);
 			goto again;
 		}
-		/* Check timestamp (zero for channel_announcement with
-		 * no update yet!):  FIXME: we could ignore this! */
-		if (timestamp
-		    && (timestamp < peer->gs.timestamp_min || timestamp > peer->gs.timestamp_max)) {
+		if (!want_streamed(peer, msg, timestamp)) {
 			msg = tal_free(msg);
 			goto again;
 		}
@@ -845,6 +903,7 @@ static void handle_gossip_timestamp_filter_in(struct peer *peer, const u8 *msg)
 {
 	struct bitcoin_blkid chain_hash;
 	u32 first_timestamp, timestamp_range;
+	u32 *tmin, *tmax;
 	struct gossmap *gossmap = get_gossmap(peer->daemon);
 
 	if (!fromwire_gossip_timestamp_filter(msg, &chain_hash,
@@ -855,17 +914,32 @@ static void handle_gossip_timestamp_filter_in(struct peer *peer, const u8 *msg)
 		return;
 	}
 
-	if (!bitcoin_blkid_eq(&chainparams->genesis_blockhash, &chain_hash)) {
+	if (bitcoin_blkid_eq(&chainparams->genesis_blockhash, &chain_hash)) {
+		tmin = &peer->gs.timestamp_min;
+		tmax = &peer->gs.timestamp_max;
+	} else if (gossip_network_known(peer->daemon, &chain_hash)) {
+		/* PoC: a Liquid asset gossip network we follow */
+		struct liquid_gossip_filter *f
+			= find_liquid_filter(peer, &chain_hash);
+		if (!f) {
+			struct liquid_gossip_filter newf;
+			newf.network = chain_hash;
+			tal_arr_expand(&peer->gs.liquid_filters, newf);
+			f = &peer->gs.liquid_filters[tal_count(peer->gs.liquid_filters) - 1];
+		}
+		tmin = &f->timestamp_min;
+		tmax = &f->timestamp_max;
+	} else {
 		send_warning(peer, "gossip_timestamp_filter for bad chain: %s",
 			     tal_hex(tmpctx, msg));
 		return;
 	}
 
-	peer->gs.timestamp_min = first_timestamp;
-	peer->gs.timestamp_max = first_timestamp + timestamp_range - 1;
+	*tmin = first_timestamp;
+	*tmax = first_timestamp + timestamp_range - 1;
 	/* Make sure we never leave it on an impossible value. */
-	if (peer->gs.timestamp_max < peer->gs.timestamp_min)
-		peer->gs.timestamp_max = UINT32_MAX;
+	if (*tmax < *tmin)
+		*tmax = UINT32_MAX;
 
 	/* BOLT-gossip-filter-simplify #7:
 	 * The receiver:

@@ -8,6 +8,7 @@
 #include <lightningd/channel.h>
 #include <lightningd/connect_control.h>
 #include <lightningd/dual_open_control.h>
+#include <lightningd/gossip_control.h>
 #include <lightningd/hsm_control.h>
 #include <lightningd/notification.h>
 #include <lightningd/onion_message.h>
@@ -728,7 +729,8 @@ int connectd_init(struct lightningd *ld)
 				   !ld->reconnect,
 				   ld->dev_fast_reconnect,
 				   ld->dev_limit_connections_inflight,
-				   ld->dev_keep_nagle);
+				   ld->dev_keep_nagle,
+				   liquid_gossip_networks(tmpctx, ld));
 
 	subd_req(ld->connectd, ld->connectd, take(msg), -1, 0,
 		 connect_init_done, NULL);

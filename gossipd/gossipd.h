@@ -105,6 +105,9 @@ struct peer {
 	/* The two features gossip cares about (so far) */
 	bool gossip_queries_feature, initial_routing_sync_feature;
 
+	/* PoC: Liquid asset gossip networks we both follow */
+	struct bitcoin_blkid *liquid_networks;
+
 	/* Are there outstanding responses for queries on short_channel_ids? */
 	const struct short_channel_id *scid_queries;
 	const bigsize_t *scid_query_flags;
@@ -120,6 +123,7 @@ struct peer {
 
 	/* What we're querying: [range_first_blocknum, range_end_blocknum) */
 	u32 range_first_blocknum, range_end_blocknum;
+
 	u32 range_blocks_outstanding;
 	struct range_query_reply *range_replies;
 	void (*query_channel_range_cb)(struct peer *peer,

@@ -290,6 +290,17 @@ void send_disconnected(struct daemon *daemon,
 
 /*~ Note the lack of static: this is called by peer_exchange_initmsg.c once the
  * INIT messages are exchanged, and also by the retry code above. */
+bool gossip_network_known(const struct daemon *daemon,
+			  const struct bitcoin_blkid *network)
+{
+	if (bitcoin_blkid_eq(network, &chainparams->genesis_blockhash))
+		return true;
+	for (size_t i = 0; i < tal_count(daemon->liquid_networks); i++)
+		if (bitcoin_blkid_eq(network, &daemon->liquid_networks[i]))
+			return true;
+	return false;
+}
+
 struct io_plan *peer_connected(struct io_conn *conn,
 			       struct daemon *daemon,
 			       const struct node_id *id,
@@ -299,7 +310,8 @@ struct io_plan *peer_connected(struct io_conn *conn,
 			       const u8 *their_features TAKES,
 			       enum is_websocket is_websocket,
 			       struct timemono starttime,
-			       bool incoming)
+			       bool incoming,
+			       const struct bitcoin_blkid *their_networks)
 {
 	u8 *msg;
 	struct peer *peer, *oldpeer;
@@ -425,8 +437,19 @@ struct io_plan *peer_connected(struct io_conn *conn,
 						       incoming, peer->their_features,
 						       time_to_nsec(timemono_since(prev_connect_start)));
 	} else {
+		/* PoC: Liquid asset gossip networks we both follow */
+		struct bitcoin_blkid *liquid_networks
+			= tal_arr(tmpctx, struct bitcoin_blkid, 0);
+		for (size_t i = 0; i < tal_count(their_networks); i++) {
+			if (!bitcoin_blkid_eq(&their_networks[i],
+					      &chainparams->genesis_blockhash)
+			    && gossip_network_known(daemon, &their_networks[i]))
+				tal_arr_expand(&liquid_networks, their_networks[i]);
+		}
+
 		/* Tell gossipd about new peer */
-		msg = towire_gossipd_new_peer(NULL, id, option_gossip_queries);
+		msg = towire_gossipd_new_peer(NULL, id, option_gossip_queries,
+					      liquid_networks);
 		daemon_conn_send(daemon->gossipd, take(msg));
 
 		msg = towire_connectd_peer_connected(NULL, id, peer->counter,
@@ -1717,7 +1740,8 @@ static void connect_init(struct daemon *daemon, const u8 *msg)
 				    &daemon->dev_no_reconnect,
 				    &daemon->dev_fast_reconnect,
 				    &dev_limit_connections_inflight,
-				    &daemon->dev_keep_nagle)) {
+				    &daemon->dev_keep_nagle,
+				    &daemon->liquid_networks)) {
 		/* This is a helper which prints the type expected and the actual
 		 * message, then exits (it should never be called!). */
 		master_badmsg(WIRE_CONNECTD_INIT, msg);

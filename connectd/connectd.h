@@ -1,6 +1,7 @@
 #ifndef LIGHTNING_CONNECTD_CONNECTD_H
 #define LIGHTNING_CONNECTD_CONNECTD_H
 #include "config.h"
+#include <bitcoin/block.h>
 #include <bitcoin/short_channel_id.h>
 #include <ccan/htable/htable_type.h>
 #include <ccan/membuf/membuf.h>
@@ -23,6 +24,12 @@ struct gossip_state {
 	struct oneshot *gossip_timer;
 	/* Timestamp filtering for gossip. */
 	u32 timestamp_min, timestamp_max;
+	/* PoC: the same, for each Liquid asset gossip network they asked for
+	 * (gossip from other asset networks isn't sent at all). */
+	struct liquid_gossip_filter {
+		struct bitcoin_blkid network;
+		u32 timestamp_min, timestamp_max;
+	} *liquid_filters;
 	/* I think this is called "echo cancellation" */
 	struct gossip_rcvd_filter *grf;
 	/* Offset within the gossip_store file */
@@ -137,6 +144,8 @@ struct peer {
 	const struct short_channel_id *scid_queries;
 	const bigsize_t *scid_query_flags;
 	size_t scid_query_idx;
+	/* PoC: which gossip network that query is about */
+	struct bitcoin_blkid scid_query_network;
 
 	/* Are there outstanding node_announcements from scid_queries? */
 	struct node_id *scid_query_nodes;
@@ -282,6 +291,10 @@ struct daemon {
 	/* Who am I? */
 	struct node_id id;
 
+	/* PoC: Liquid asset gossip networks we follow, besides the chain's
+	 * own (see common/liquid_asset.h). */
+	struct bitcoin_blkid *liquid_networks;
+
 	/* --developer? */
 	bool developer;
 
@@ -404,6 +417,11 @@ void update_recent_timestamp(struct daemon *daemon, struct gossmap *gossmap);
 /* add erros to error list */
 void add_errors_to_error_list(struct connecting *connect, const char *error);
 
+/* PoC: is this gossip network the chain's own, or a Liquid asset's we
+ * follow? */
+bool gossip_network_known(const struct daemon *daemon,
+			  const struct bitcoin_blkid *network);
+
 /* Called by peer_exchange_initmsg if successful. */
 struct io_plan *peer_connected(struct io_conn *conn,
 			       struct daemon *daemon,
@@ -414,7 +432,8 @@ struct io_plan *peer_connected(struct io_conn *conn,
 			       const u8 *their_features TAKES,
 			       enum is_websocket is_websocket,
 			       struct timemono starttime,
-			       bool incoming);
+			       bool incoming,
+			       const struct bitcoin_blkid *their_networks);
 
 /* Tell gossipd and lightningd that this peer is gone. */
 void send_disconnected(struct daemon *daemon,

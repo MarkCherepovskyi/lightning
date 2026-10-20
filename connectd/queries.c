@@ -3,6 +3,7 @@
 #include <ccan/array_size/array_size.h>
 #include <ccan/asort/asort.h>
 #include <ccan/crc32c/crc32c.h>
+#include <ccan/mem/mem.h>
 #include <common/decode_array.h>
 #include <common/gossmap.h>
 #include <common/status.h>
@@ -106,6 +107,21 @@ static void uniquify_node_ids(struct node_id **ids)
 	tal_resize(ids, dst);
 }
 
+/* PoC: is this channel in this gossip network (the chain's own, or a Liquid
+ * asset's)?  Gossip without a chain_hash (generated test stores) counts as
+ * the chain's own. */
+static bool chan_in_network(const struct gossmap *gossmap,
+			    const struct gossmap_chan *chan,
+			    const struct bitcoin_blkid *network)
+{
+	struct bitcoin_blkid chain_hash;
+
+	gossmap_chan_get_chain_hash(gossmap, chan, &chain_hash);
+	if (memeqzero(&chain_hash, sizeof(chain_hash)))
+		chain_hash = chainparams->genesis_blockhash;
+	return bitcoin_blkid_eq(&chain_hash, network);
+}
+
 /* We are fairly careful to avoid the peer DoSing us with channel queries:
  * this routine creates messages about a single short_channel_id, unless
  * it's finished all of them. */
@@ -128,7 +144,9 @@ const u8 **maybe_create_query_responses(const tal_t *ctx,
 		struct node_id node_id;
 
 		chan = gossmap_find_chan(gossmap, &peer->scid_queries[i]);
-		if (!chan)
+		/* (PoC: channels in other networks count as unknown) */
+		if (!chan
+		    || !chan_in_network(gossmap, chan, &peer->scid_query_network))
 			continue;
 
 		/* BOLT #7:
@@ -239,7 +257,7 @@ const u8 **maybe_create_query_responses(const tal_t *ctx,
 		 */
 		/* FIXME: We consider ourselves to have complete knowledge. */
 		u8 *end = towire_reply_short_channel_ids_end(peer,
-							     &chainparams->genesis_blockhash,
+							     &peer->scid_query_network,
 							     true);
 		tal_arr_expand(&msgs, end);
 
@@ -301,7 +319,7 @@ void handle_query_short_channel_ids(struct peer *peer, const u8 *msg)
 	 *   - if does not maintain up-to-date channel information for `chain_hash`:
 	 *     - MUST set `full_information` to 0.
 	 */
-	if (!bitcoin_blkid_eq(&chainparams->genesis_blockhash, &chain)) {
+	if (!gossip_network_known(peer->daemon, &chain)) {
 		status_peer_debug(&peer->id,
 				  "sent query_short_channel_ids chainhash %s",
 				  fmt_bitcoin_blkid(tmpctx, &chain));
@@ -361,6 +379,7 @@ void handle_query_short_channel_ids(struct peer *peer, const u8 *msg)
 	peer->scid_queries = tal_steal(peer, scids);
 	peer->scid_query_flags = tal_steal(peer, flags);
 	peer->scid_query_idx = 0;
+	peer->scid_query_network = chain;
 	peer->scid_query_nodes = tal_arr(peer, struct node_id, 0);
 
 	/* Notify the write loop to invoke maybe_send_query_responses */
@@ -370,6 +389,7 @@ void handle_query_short_channel_ids(struct peer *peer, const u8 *msg)
 /*~ We can send multiple replies when the peer queries for all channels in
  * a given range of blocks; each one indicates the range of blocks it covers. */
 static void send_reply_channel_range(struct peer *peer,
+				     const struct bitcoin_blkid *network,
 				     u32 first_blocknum, u32 number_of_blocks,
 				     const struct short_channel_id *scids,
 				     const struct channel_update_timestamps *tstamps,
@@ -418,7 +438,7 @@ static void send_reply_channel_range(struct peer *peer,
 	 *   `reply_channel_range`.
 	 */
 	u8 *msg = towire_reply_channel_range(NULL,
-					     &chainparams->genesis_blockhash,
+					     network,
 					     first_blocknum,
 					     number_of_blocks,
 					     final, encoded_scids, tlvs);
@@ -563,6 +583,7 @@ static size_t max_entries(enum query_option_flags query_option_flags)
 /* This gets all the scids they asked for, and optionally the timestamps and checksums */
 static struct short_channel_id *gather_range(const tal_t *ctx,
 					     struct daemon *daemon,
+					     const struct bitcoin_blkid *network,
 					     u32 first_blocknum, u32 number_of_blocks,
 					     enum query_option_flags query_option_flags,
 					     struct channel_update_timestamps **tstamps,
@@ -606,6 +627,10 @@ static struct short_channel_id *gather_range(const tal_t *ctx,
 			continue;
 		}
 
+		/* PoC: only channels in the network they asked about */
+		if (!chan_in_network(gossmap, chan, network))
+			continue;
+
 		scid = gossmap_chan_scid(gossmap, chan);
 		if (short_channel_id_blocknum(scid) < first_blocknum
 		    || short_channel_id_blocknum(scid) > end_block) {
@@ -639,6 +664,7 @@ static struct short_channel_id *gather_range(const tal_t *ctx,
  * compress afterwards.
  */
 static void queue_channel_ranges(struct peer *peer,
+				 const struct bitcoin_blkid *network,
 				 u32 first_blocknum, u32 number_of_blocks,
 				 enum query_option_flags query_option_flags)
 {
@@ -648,7 +674,8 @@ static void queue_channel_ranges(struct peer *peer,
 	struct short_channel_id *scids;
 	size_t off, limit;
 
-	scids = gather_range(tmpctx, daemon, first_blocknum, number_of_blocks,
+	scids = gather_range(tmpctx, daemon, network,
+			     first_blocknum, number_of_blocks,
 			     query_option_flags, &tstamps, &csums);
 
 	limit = max_entries(query_option_flags);
@@ -696,7 +723,8 @@ static void queue_channel_ranges(struct peer *peer,
 		 * - if bit 1 in `query_option_flags` is set, the receiver MAY
 		 *   append a `checksums_tlv`...
 		 */
-		send_reply_channel_range(peer, first_blocknum, this_num_blocks,
+		send_reply_channel_range(peer, network,
+					 first_blocknum, this_num_blocks,
 					 scids + off,
 					 query_option_flags & QUERY_ADD_TIMESTAMPS
 					 ? tstamps + off : NULL,
@@ -732,8 +760,9 @@ void handle_query_channel_range(struct peer *peer, const u8 *msg)
 	else
 		query_option_flags = 0;
 
-	/* Unknown chain_hash: reply with sync_complete=false. */
-	if (!bitcoin_blkid_eq(&chainparams->genesis_blockhash, &chain_hash)) {
+	/* Unknown chain_hash: reply with sync_complete=false.  (PoC: Liquid
+	 * asset networks we follow are known.) */
+	if (!gossip_network_known(peer->daemon, &chain_hash)) {
 		status_peer_debug(&peer->id,
 				  "query_channel_range with chainhash %s",
 				  fmt_bitcoin_blkid(tmpctx, &chain_hash));
@@ -747,7 +776,7 @@ void handle_query_channel_range(struct peer *peer, const u8 *msg)
 	if (first_blocknum + number_of_blocks < first_blocknum)
 		number_of_blocks = UINT_MAX - first_blocknum;
 
-	queue_channel_ranges(peer, first_blocknum, number_of_blocks,
+	queue_channel_ranges(peer, &chain_hash, first_blocknum, number_of_blocks,
 			     query_option_flags);
 }
 
