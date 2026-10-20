@@ -101,6 +101,13 @@
                 "The total capacity of this channel (always a whole number of satoshis)."
               ]
             },
+            "liquid_asset": {
+              "type": "hash",
+              "added": "v26.09",
+              "description": [
+                "PoC: the Liquid asset this channel is in, as elements-cli prints asset ids (only for asset channels, which are gossiped on their asset's own network)."
+              ]
+            },
             "message_flags": {
               "type": "u8",
               "description": [

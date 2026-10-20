@@ -4692,6 +4692,8 @@ pub mod requests {
 	#[derive(Clone, Debug, Deserialize, Serialize)]
 	pub struct GetroutesRequest {
 	    #[serde(skip_serializing_if = "Option::is_none")]
+	    pub asset: Option<Sha256>,
+	    #[serde(skip_serializing_if = "Option::is_none")]
 	    pub maxdelay: Option<u32>,
 	    #[serde(skip_serializing_if = "Option::is_none")]
 	    pub maxhops: Option<u32>,
@@ -5008,6 +5010,8 @@ pub mod requests {
 	pub struct XpayRequest {
 	    #[serde(skip_serializing_if = "Option::is_none")]
 	    pub amount_msat: Option<Amount>,
+	    #[serde(skip_serializing_if = "Option::is_none")]
+	    pub asset: Option<Sha256>,
 	    #[serde(skip_serializing_if = "Option::is_none")]
 	    pub dev_use_shadow: Option<bool>,
 	    #[serde(skip_serializing_if = "Option::is_none")]
@@ -5912,6 +5916,8 @@ pub mod responses {
 
 	#[derive(Clone, Debug, Deserialize, Serialize)]
 	pub struct ListchannelsChannels {
+	    #[serde(skip_serializing_if = "Option::is_none")]
+	    pub liquid_asset: Option<Sha256>,
 	    pub active: bool,
 	    pub amount_msat: Amount,
 	    pub base_fee_millisatoshi: u32,

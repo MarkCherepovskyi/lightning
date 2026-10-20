@@ -2245,6 +2245,7 @@
         },
         "GetroutesRequest": {
             "GetRoutes.amount_msat": 3,
+            "GetRoutes.asset": 10,
             "GetRoutes.destination": 2,
             "GetRoutes.final_cltv": 7,
             "GetRoutes.finalcltv": 6,
@@ -2471,6 +2472,7 @@
             "ListChannels.channels[].htlc_maximum_msat": 14,
             "ListChannels.channels[].htlc_minimum_msat": 13,
             "ListChannels.channels[].last_update": 9,
+            "ListChannels.channels[].liquid_asset": 17,
             "ListChannels.channels[].message_flags": 6,
             "ListChannels.channels[].public": 4,
             "ListChannels.channels[].short_channel_id": 3,
@@ -4650,6 +4652,7 @@
         },
         "XpayRequest": {
             "Xpay.amount_msat": 2,
+            "Xpay.asset": 12,
             "Xpay.dev_use_shadow": 11,
             "Xpay.invstring": 1,
             "Xpay.label": 9,
@@ -8806,6 +8809,10 @@
             "added": "v24.08",
             "deprecated": null
         },
+        "GetRoutes.asset": {
+            "added": "v26.09",
+            "deprecated": null
+        },
         "GetRoutes.destination": {
             "added": "v24.08",
             "deprecated": null
@@ -9588,6 +9595,10 @@
         },
         "ListChannels.channels[].last_update": {
             "added": "pre-v0.10.1",
+            "deprecated": null
+        },
+        "ListChannels.channels[].liquid_asset": {
+            "added": "v26.09",
             "deprecated": null
         },
         "ListChannels.channels[].message_flags": {
@@ -15372,6 +15383,10 @@
         },
         "Xpay.amount_sent_msat": {
             "added": "v24.11",
+            "deprecated": null
+        },
+        "Xpay.asset": {
+            "added": "v26.09",
             "deprecated": null
         },
         "Xpay.dev_use_shadow": {

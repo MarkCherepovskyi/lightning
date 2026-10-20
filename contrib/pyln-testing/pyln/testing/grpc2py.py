@@ -169,6 +169,7 @@ def listchannels_channels2py(m):
         "htlc_maximum_msat": amount2msat(m.htlc_maximum_msat),  # PrimitiveField in generate_composite
         "htlc_minimum_msat": amount2msat(m.htlc_minimum_msat),  # PrimitiveField in generate_composite
         "last_update": m.last_update,  # PrimitiveField in generate_composite
+        "liquid_asset": hexlify(m.liquid_asset),  # PrimitiveField in generate_composite
         "message_flags": m.message_flags,  # PrimitiveField in generate_composite
         "public": m.public,  # PrimitiveField in generate_composite
         "short_channel_id": m.short_channel_id,  # PrimitiveField in generate_composite

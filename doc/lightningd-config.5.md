@@ -859,6 +859,15 @@ features.
   Specifying this prevents `fetchinvoice`, `sendinvoice` and replying
 to invoice request from trying to connect directly to the offering node as a last resort.
 
+* **liquid-gossip-asset**=*ASSET*
+
+  Proof of concept, Liquid only. Follow the gossip network of this issued
+asset (its id as elements-cli prints it), and allow announcing asset
+channels in it. Announced asset channels are gossiped with the asset id in
+place of the chain hash: nodes that don't follow the asset ignore them.
+`getroutes` and `xpay` only route in an asset when given `asset`. This
+option can be specified multiple times.
+
 * **experimental-shutdown-wrong-funding**
 
   Specifying this allows the `wrong_funding` field in _shutdown: if a
