@@ -33,6 +33,10 @@ struct daemon {
 	/* Who am I?  Helps us find ourself in the routing map. */
 	struct node_id id;
 
+	/* PoC: Liquid asset gossip networks we follow (besides the chain's
+	 * own), see common/liquid_asset.h. */
+	struct bitcoin_blkid *liquid_networks;
+
 	/* Peers we are gossiping to: id is unique */
 	struct peer_node_id_map *peers;
 

@@ -384,7 +384,8 @@ static void gossip_init(struct daemon *daemon, const u8 *msg)
 				   &daemon->autoconnect_seeker_peers,
 				   &daemon->compactd_helper,
 				   &daemon->dev_fast_gossip,
-				   &daemon->dev_fast_gossip_prune)) {
+				   &daemon->dev_fast_gossip_prune,
+				   &daemon->liquid_networks)) {
 		master_badmsg(WIRE_GOSSIPD_INIT, msg);
 	}
 

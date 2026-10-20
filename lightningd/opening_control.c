@@ -1377,6 +1377,14 @@ static struct command_result *json_fundchannel_start(struct command *cmd,
 	if (liquid_asset && !chainparams->is_elements)
 		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
 				    "asset channels only exist on Liquid");
+	/* Announced asset channels are gossiped on the asset's network,
+	 * which we must follow. */
+	if (liquid_asset && *announce_channel
+	    && !liquid_asset_in(liquid_asset, cmd->ld->liquid_gossip_assets))
+		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+				    "Can't announce a channel in asset %s: it's not"
+				    " a liquid-gossip-asset (use announce=false)",
+				    fmt_liquid_asset(tmpctx, liquid_asset));
 	fc->liquid_asset = tal_steal(fc, liquid_asset);
 	fc->liquid_fee_reserve = liquid_asset ? *liquid_fee_reserve
 		: AMOUNT_SAT(0);

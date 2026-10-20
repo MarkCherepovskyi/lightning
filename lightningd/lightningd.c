@@ -355,6 +355,7 @@ static struct lightningd *new_lightningd(const tal_t *ctx)
 	 * we allow overriding them with --force-feerates, in which
 	 * case this is a pointer to an enum feerate-indexed array of values */
 	ld->force_feerates = NULL;
+	ld->liquid_gossip_assets = tal_arr(ld, u8 *, 0);
 
 	/*~ We need some funds to help CPFP spend unilateral closes.  How
 	 * much?  But let's assume we want to boost the commitment tx (1112

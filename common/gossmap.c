@@ -634,6 +634,15 @@ struct short_channel_id gossmap_chan_scid(const struct gossmap *map,
 	return scid;
 }
 
+void gossmap_chan_get_chain_hash(const struct gossmap *map,
+				 const struct gossmap_chan *c,
+				 struct bitcoin_blkid *chain_hash)
+{
+	/* In channel_announcement, chain_hash comes right before the scid */
+	map_copy(map, c->cann_off + c->plus_scid_off - sizeof(*chain_hash),
+		 chain_hash, sizeof(*chain_hash));
+}
+
 /* BOLT #7:
  * 1. type: 257 (`node_announcement`)
  * 2. data:
@@ -1106,7 +1115,8 @@ bool gossmap_local_addchan(struct gossmap_localmods *localmods,
 		memcpy(localmods->local_announces + off, features, tal_bytelen(features));
 	off += tal_bytelen(features);
 
-	/* Skip chain_hash */
+	/* Zero chain_hash: local channels don't say which network they're in */
+	memset(localmods->local_announces + off, 0, 32);
 	off += 32;
 
 	/* Set scid */

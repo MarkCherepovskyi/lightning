@@ -1,6 +1,7 @@
 #ifndef LIGHTNING_COMMON_GOSSMAP_H
 #define LIGHTNING_COMMON_GOSSMAP_H
 #include "config.h"
+#include <bitcoin/block.h>
 #include <bitcoin/short_channel_id.h>
 #include <common/fp16.h>
 #include <common/status_levels.h>
@@ -161,6 +162,13 @@ struct gossmap_chan *gossmap_find_chan(const struct gossmap *map,
 /* Get the short_channel_id of this chan */
 struct short_channel_id gossmap_chan_scid(const struct gossmap *map,
 					  const struct gossmap_chan *c);
+
+/* Get the chain_hash this chan was announced with: the chain's genesis
+ * hash, or (PoC) a Liquid asset's gossip network, see common/liquid_asset.h.
+ * All zeroes for local-only channels. */
+void gossmap_chan_get_chain_hash(const struct gossmap *map,
+				 const struct gossmap_chan *c,
+				 struct bitcoin_blkid *chain_hash);
 
 /* Given a struct node, get the node_id */
 void gossmap_node_get_id(const struct gossmap *map,

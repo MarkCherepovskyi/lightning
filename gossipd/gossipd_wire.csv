@@ -13,6 +13,9 @@ msgdata,gossipd_init,autoconnect_seeker_peers,u32,
 msgdata,gossipd_init,compactd_helper,wirestring,
 msgdata,gossipd_init,dev_fast_gossip,bool,
 msgdata,gossipd_init,dev_fast_gossip_prune,bool,
+# PoC: Liquid asset gossip networks we follow (see common/liquid_asset.h)
+msgdata,gossipd_init,num_liquid_networks,u16,
+msgdata,gossipd_init,liquid_networks,bitcoin_blkid,num_liquid_networks
 
 # Gossipd tells us all our public channel_updates before init_reply.
 msgtype,gossipd_init_cupdate,3101

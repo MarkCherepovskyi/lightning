@@ -1,6 +1,7 @@
 #include "config.h"
 #include <assert.h>
 #include <bitcoin/chainparams.h>
+#include <ccan/build_assert/build_assert.h>
 #include <ccan/str/hex/hex.h>
 #include <common/liquid_asset.h>
 #include <common/utils.h>
@@ -65,6 +66,20 @@ u8 *liquid_asset_from_hex(const tal_t *ctx, const char *hex, size_t hexlen)
 	for (size_t i = 0; i < sizeof(id); i++)
 		asset[1 + i] = id[sizeof(id) - 1 - i];
 	return asset;
+}
+
+void liquid_asset_network(const u8 *asset, struct bitcoin_blkid *network)
+{
+	BUILD_ASSERT(sizeof(*network) == ELEMENTS_ASSET_LEN - 1);
+	memcpy(network, asset + 1, sizeof(*network));
+}
+
+bool liquid_asset_in(const u8 *asset, u8 *const *assets)
+{
+	for (size_t i = 0; i < tal_count(assets); i++)
+		if (liquid_asset_eq(asset, assets[i]))
+			return true;
+	return false;
 }
 
 char *fmt_liquid_asset(const tal_t *ctx, const u8 *asset)

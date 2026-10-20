@@ -3,6 +3,7 @@
 #include <ccan/io/io.h>
 #include <ccan/ptrint/ptrint.h>
 #include <common/json_command.h>
+#include <common/liquid_asset.h>
 #include <connectd/connectd_wiregen.h>
 #include <hsmd/permissions.h>
 #include <lightningd/chaintopology.h>
@@ -305,6 +306,7 @@ void gossip_init(struct lightningd *ld, int connectd_fd)
 {
 	u8 *msg;
 	void *ret;
+	struct bitcoin_blkid *liquid_networks;
 
 	ld->gossip = new_global_subd(ld, "lightning_gossipd",
 				     gossipd_wire_name, gossip_msg,
@@ -316,6 +318,12 @@ void gossip_init(struct lightningd *ld, int connectd_fd)
 	topology_add_sync_waiter(ld->gossip, ld->topology,
 				 gossip_topology_synced, NULL);
 
+	liquid_networks = tal_arr(tmpctx, struct bitcoin_blkid,
+				  tal_count(ld->liquid_gossip_assets));
+	for (size_t i = 0; i < tal_count(liquid_networks); i++)
+		liquid_asset_network(ld->liquid_gossip_assets[i],
+				     &liquid_networks[i]);
+
 	msg = towire_gossipd_init(
 	    NULL,
 	    chainparams,
@@ -324,7 +332,8 @@ void gossip_init(struct lightningd *ld, int connectd_fd)
 	    ld->autoconnect_seeker_peers,
 	    subdaemon_path(tmpctx, ld, "lightning_gossip_compactd"),
 	    ld->dev_fast_gossip,
-	    ld->dev_fast_gossip_prune);
+	    ld->dev_fast_gossip_prune,
+	    liquid_networks);
 
 	subd_req(ld->gossip, ld->gossip, take(msg), -1, 0,
 		 gossipd_init_done, NULL);

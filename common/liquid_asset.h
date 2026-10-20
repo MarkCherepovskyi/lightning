@@ -1,6 +1,7 @@
 #ifndef LIGHTNING_COMMON_LIQUID_ASSET_H
 #define LIGHTNING_COMMON_LIQUID_ASSET_H
 #include "config.h"
+#include <bitcoin/block.h>
 #include <bitcoin/tx.h>
 
 /* PROOF OF CONCEPT: Liquid issued-asset channels.
@@ -41,6 +42,14 @@ u8 *liquid_asset_from_hex(const tal_t *ctx, const char *hex, size_t hexlen);
 
 /* Asset id as printed by elements-cli. */
 char *fmt_liquid_asset(const tal_t *ctx, const u8 *asset);
+
+/* Announced asset channels are gossiped on their own network: the asset id
+ * goes where gossip messages carry the chain_hash (so it prints as the asset
+ * id).  Nodes that don't follow the asset ignore it as an unknown chain. */
+void liquid_asset_network(const u8 *asset, struct bitcoin_blkid *network);
+
+/* Is @asset one of the (tal array of) @assets? */
+bool liquid_asset_in(const u8 *asset, u8 *const *assets);
 
 /* The fee reserve always directly follows the funding output. */
 struct bitcoin_outpoint liquid_fee_reserve_outpoint(const struct bitcoin_outpoint *funding);

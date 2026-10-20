@@ -2,13 +2,29 @@
 #include <ccan/cast/cast.h>
 #include <ccan/mem/mem.h>
 #include <common/clock_time.h>
+#include <common/liquid_asset.h>
 #include <lightningd/channel.h>
 #include <lightningd/gossip_generation.h>
 #include <lightningd/lightningd.h>
 
+/* PoC: announced Liquid asset channels are gossiped on the asset's own
+ * network; everything else (including private asset channels, whose
+ * updates only go to the peer) on the chain's. */
+static const struct bitcoin_blkid *gossip_network(const struct channel *channel,
+						  struct bitcoin_blkid *buf)
+{
+	if (channel->liquid_asset
+	    && (channel->channel_flags & CHANNEL_FLAGS_ANNOUNCE_CHANNEL)) {
+		liquid_asset_network(channel->liquid_asset, buf);
+		return buf;
+	}
+	return &chainparams->genesis_blockhash;
+}
+
 /* Once we know which way nodes go, it's easy to construct */
 static u8 *create_channel_announcement_dir(const tal_t *ctx,
 					   const u8 *features,
+					   const struct bitcoin_blkid *chain_hash,
 					   struct short_channel_id scid,
 					   const secp256k1_ecdsa_signature node_signature[NUM_SIDES],
 					   const secp256k1_ecdsa_signature bitcoin_signature[NUM_SIDES],
@@ -29,7 +45,7 @@ static u8 *create_channel_announcement_dir(const tal_t *ctx,
 					   &bitcoin_signature[first],
 					   &bitcoin_signature[second],
 					   features,
-					   &chainparams->genesis_blockhash,
+					   chain_hash,
 					   scid,
 					   &node_id[first],
 					   &node_id[second],
@@ -57,6 +73,7 @@ u8 *create_channel_announcement(const tal_t *ctx,
 	secp256k1_ecdsa_signature node_signature[NUM_SIDES], bitcoin_signature[NUM_SIDES];
 	struct node_id node_id[NUM_SIDES];
 	struct pubkey funding_pubkey[NUM_SIDES];
+	struct bitcoin_blkid network;
 	u8 *features;
 
 	features = get_agreed_channelfeatures(tmpctx, channel->peer->ld->our_features,
@@ -70,7 +87,9 @@ u8 *create_channel_announcement(const tal_t *ctx,
 	node_id[REMOTE] = channel->peer->id;
 	funding_pubkey[LOCAL] = channel->local_funding_pubkey;
 	funding_pubkey[REMOTE] = channel->channel_info.remote_fundingkey;
-	return create_channel_announcement_dir(ctx, features, scid,
+	return create_channel_announcement_dir(ctx, features,
+					       gossip_network(channel, &network),
+					       scid,
 					       node_signature, bitcoin_signature, node_id, funding_pubkey);
 }
 
@@ -82,6 +101,7 @@ u8 *unsigned_channel_update(const tal_t *ctx,
 			    bool enabled)
 {
 	struct lightningd *ld = channel->peer->ld;
+	struct bitcoin_blkid network;
 	secp256k1_ecdsa_signature dummy_sig;
 	u8 message_flags, channel_flags;
 	u32 timestamp;
@@ -130,7 +150,7 @@ u8 *unsigned_channel_update(const tal_t *ctx,
 
 	return towire_channel_update(ctx,
 				     &dummy_sig,
-				     &chainparams->genesis_blockhash,
+				     gossip_network(channel, &network),
 				     scid,
 				     timestamp,
 				     message_flags,

@@ -13,6 +13,7 @@
 #include <common/configvar.h>
 #include <common/errcode.h>
 #include <common/hsm_secret.h>
+#include <common/liquid_asset.h>
 #include <common/version.h>
 #include <dirent.h>
 #include <errno.h>
@@ -166,6 +167,21 @@ static char *opt_set_mode(const char *arg, mode_t *m)
 	 * 9-bit, which fits mode_t (unless your Unix is seriously borked).
 	 */
 
+	return NULL;
+}
+
+/* PoC: follow (and allow announcing channels in) a Liquid asset's gossip
+ * network. */
+static char *opt_add_liquid_gossip_asset(const char *arg, struct lightningd *ld)
+{
+	u8 *asset;
+
+	if (!chainparams->is_elements)
+		return tal_fmt(tmpctx, "liquid-gossip-asset only works on Liquid");
+	asset = liquid_asset_from_hex(ld->liquid_gossip_assets, arg, strlen(arg));
+	if (!asset)
+		return tal_fmt(tmpctx, "'%s' is not an asset id", arg);
+	tal_arr_expand(&ld->liquid_gossip_assets, asset);
 	return NULL;
 }
 
@@ -1628,6 +1644,9 @@ static void register_opts(struct lightningd *ld)
 			 "Set the file mode (permissions) for the "
 			 "JSON-RPC socket");
 
+	clnopt_witharg("--liquid-gossip-asset", OPT_MULTI,
+		       opt_add_liquid_gossip_asset, NULL, ld,
+		       "Liquid asset id whose channels we gossip about and may announce (PoC)");
 	opt_register_arg("--force-feerates",
 			 opt_force_feerates, NULL, ld,
 			 "Set testnet/regtest feerates in sats perkw, opening/mutual_close/unlateral_close/delayed_to_us/htlc_resolution/penalty: if fewer specified, last number applies to remainder");
@@ -1926,6 +1945,7 @@ bool is_known_opt_cb_arg(char *(*cb_arg)(const char *, void *))
 	return cb_arg == (void *)opt_set_talstr
 		|| cb_arg == (void *)opt_add_proxy_addr
 		|| cb_arg == (void *)opt_force_feerates
+		|| cb_arg == (void *)opt_add_liquid_gossip_asset
 		|| cb_arg == (void *)opt_add_plugin
 		|| cb_arg == (void *)opt_add_plugin_dir
 		|| cb_arg == (void *)opt_important_plugin
