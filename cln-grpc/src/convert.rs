@@ -207,6 +207,7 @@ impl From<responses::ListchannelsChannels> for pb::ListchannelsChannels {
             htlc_maximum_msat: Some(c.htlc_maximum_msat.into()), // Rule #2 for type msat
             htlc_minimum_msat: Some(c.htlc_minimum_msat.into()), // Rule #2 for type msat
             last_update: c.last_update, // Rule #2 for type u32
+            liquid_asset: c.liquid_asset.map(|v| <Sha256 as AsRef<[u8]>>::as_ref(&v).to_vec()), // Rule #2 for type hash?
             message_flags: c.message_flags.into(), // Rule #2 for type u8
             public: c.public, // Rule #2 for type boolean
             short_channel_id: c.short_channel_id.to_string(), // Rule #2 for type short_channel_id
@@ -7127,6 +7128,7 @@ impl From<requests::GetroutesRequest> for pb::GetroutesRequest {
     fn from(c: requests::GetroutesRequest) -> Self {
         Self {
             amount_msat: Some(c.amount_msat.into()), // Rule #2 for type msat
+            asset: c.asset.map(|v| <Sha256 as AsRef<[u8]>>::as_ref(&v).to_vec()), // Rule #2 for type hash?
             destination: c.destination.serialize().to_vec(), // Rule #2 for type pubkey
             final_cltv: c.final_cltv, // Rule #2 for type u32
             // Field: GetRoutes.layers[]
@@ -7259,6 +7261,7 @@ impl From<requests::XpayRequest> for pb::XpayRequest {
     fn from(c: requests::XpayRequest) -> Self {
         Self {
             amount_msat: c.amount_msat.map(|f| f.into()), // Rule #2 for type msat?
+            asset: c.asset.map(|v| <Sha256 as AsRef<[u8]>>::as_ref(&v).to_vec()), // Rule #2 for type hash?
             dev_use_shadow: c.dev_use_shadow, // Rule #2 for type boolean?
             invstring: c.invstring, // Rule #2 for type string
             label: c.label, // Rule #2 for type string?
@@ -9191,6 +9194,7 @@ impl From<pb::GetroutesRequest> for requests::GetroutesRequest {
     fn from(c: pb::GetroutesRequest) -> Self {
         Self {
             amount_msat: c.amount_msat.unwrap().into(), // Rule #1 for type msat
+            asset: c.asset.map(|v| Sha256::from_slice(&v).unwrap()), // Rule #1 for type hash?
             destination: PublicKey::from_slice(&c.destination).unwrap(), // Rule #1 for type pubkey
             final_cltv: c.final_cltv, // Rule #1 for type u32
             layers: c.layers.into_iter().map(|s| s.into()).collect(), // Rule #4
@@ -9322,6 +9326,7 @@ impl From<pb::XpayRequest> for requests::XpayRequest {
     fn from(c: pb::XpayRequest) -> Self {
         Self {
             amount_msat: c.amount_msat.map(|a| a.into()), // Rule #1 for type msat?
+            asset: c.asset.map(|v| Sha256::from_slice(&v).unwrap()), // Rule #1 for type hash?
             dev_use_shadow: c.dev_use_shadow, // Rule #1 for type boolean?
             invstring: c.invstring, // Rule #1 for type string
             label: c.label, // Rule #1 for type string?

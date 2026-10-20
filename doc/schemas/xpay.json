@@ -88,6 +88,14 @@
           "`localinvreqid` is used by offers to link a payment attempt to a local `invoice_request` offer created by lightningd-invoicerequest(7). This  ensures that we only make a single payment for an offer, and that the offer is marked `used` once paid."
         ]
       },
+      "asset": {
+        "type": "hash",
+        "added": "v26.09",
+        "description": [
+          "PoC: on Liquid, pay in this issued asset (its id as elements-cli prints it), over channels in that asset only.",
+          "The invoice must be one for that asset."
+        ]
+      },
       "dev_use_shadow": {
         "hidden": true,
         "type": "boolean",

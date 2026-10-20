@@ -1152,7 +1152,7 @@ const char *gossmap_manage_channel_update(const tal_t *ctx,
 	/* PoC: an update must be for the network its channel was announced
 	 * in (an L-BTC update can't describe an asset channel). */
 	chan = gossmap_find_chan(gossmap, &scid);
-	if (chan) {
+	if (chan && chainparams->is_elements) {
 		struct bitcoin_blkid chan_network;
 		gossmap_chan_get_chain_hash(gossmap, chan, &chan_network);
 		if (!bitcoin_blkid_eq(&chain_hash, &chan_network)) {

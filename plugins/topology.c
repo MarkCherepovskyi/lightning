@@ -1,6 +1,7 @@
 #include "config.h"
 #include <ccan/array_size/array_size.h>
 #include <ccan/json_escape/json_escape.h>
+#include <ccan/mem/mem.h>
 #include <ccan/tal/str/str.h>
 #include <common/dijkstra.h>
 #include <common/gossmap.h>
@@ -209,9 +210,18 @@ static void json_add_halfchan(struct json_stream *response,
 	struct node_id node_id[2];
 	const u8 *chanfeatures;
 	struct amount_msat capacity_msat;
+	struct bitcoin_blkid chain_hash;
+	bool liquid_asset;
 
 	/* These are channel (not per-direction) properties */
 	chanfeatures = gossmap_chan_get_features(tmpctx, gossmap, c);
+	/* PoC: channels gossiped on a Liquid asset's network carry its asset
+	 * id where the chain_hash goes (see common/liquid_asset.h). */
+	gossmap_chan_get_chain_hash(gossmap, c, &chain_hash);
+	liquid_asset = chainparams->is_elements
+		&& !gossmap_chan_is_localmod(gossmap, c)
+		&& !bitcoin_blkid_eq(&chain_hash, &chainparams->genesis_blockhash)
+		&& !memeqzero(&chain_hash, sizeof(chain_hash));
 	scid = gossmap_chan_scid(gossmap, c);
 	for (size_t i = 0; i < 2; i++)
 		gossmap_node_get_id(gossmap, gossmap_nth_node(gossmap, c, i),
@@ -249,6 +259,8 @@ static void json_add_halfchan(struct json_stream *response,
 						&htlc_maximum_msat);
 
 		json_add_amount_msat(response, "amount_msat", capacity_msat);
+		if (liquid_asset)
+			json_add_bitcoin_blkid(response, "liquid_asset", &chain_hash);
 		json_add_num(response, "message_flags", message_flags);
 		json_add_num(response, "channel_flags", channel_flags);
 

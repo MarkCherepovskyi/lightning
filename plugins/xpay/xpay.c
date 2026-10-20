@@ -86,6 +86,8 @@ struct payment {
 	const char *invstring;
 	/* Explicit layers they told us to include */
 	const char **layers;
+	/* PoC: Liquid asset id to pay in (NULL: the chain's own coin) */
+	const char *asset;
 	/* Where we're trying to pay */
 	struct pubkey destination;
 	/* Hash we want the preimage for */
@@ -214,7 +216,8 @@ static struct command_result *xpay_core(struct command *cmd,
 					const struct sha256 *local_invreq_id,
 					bool use_shadow,
 					bool as_pay,
-					const struct amount_msat *includefees_msat);
+					const struct amount_msat *includefees_msat,
+					const char *asset);
 
 /* Wrapper for pending commands (ignores return) */
 static void was_pending(const struct command_result *res)
@@ -1949,6 +1952,8 @@ static struct command_result *getroutes_for(struct command *aux_cmd,
 	json_add_amount_msat(req->js, "maxfee_msat", maxfee);
 	json_add_u32(req->js, "final_cltv", payment->final_cltv);
 	json_add_u32(req->js, "maxdelay", payment->maxdelay);
+	if (payment->asset)
+		json_add_string(req->js, "asset", payment->asset);
 	if (payment->maxparts) {
 		size_t count_pending = count_current_attempts(payment);
 		assert(payment->maxparts > count_pending);
@@ -2360,7 +2365,7 @@ invoice_fetched(struct command *cmd,
 			 NULL, params->maxfee, params->layers,
 			 params->retryfor, params->partial, params->maxdelay,
 			 params->label, NULL, false, false,
-			 params->includefees_msat);
+			 params->includefees_msat, NULL);
 }
 
 static struct command_result *
@@ -2443,6 +2448,7 @@ static struct command_result *json_xpay_params(struct command *cmd,
 	struct out_req *req;
 	struct xpay_params *xparams;
 	bool *dev_use_shadow;
+	const char *asset;
 
 	if (!param_check(cmd, buffer, params,
 			 p_req("invstring", param_invstring, &invstring),
@@ -2455,6 +2461,7 @@ static struct command_result *json_xpay_params(struct command *cmd,
 			 p_opt("payer_note", param_string, &payer_note),
 			 p_opt("label", param_label, &label),
 			 p_opt("localinvreqid", param_sha256, &localinvreqid),
+			 p_opt("asset", param_string, &asset),
 			 p_opt_dev("dev_use_shadow", param_bool, &dev_use_shadow, true),
                          NULL))
 		return command_param_failed();
@@ -2532,7 +2539,8 @@ static struct command_result *json_xpay_params(struct command *cmd,
 
 	return xpay_core(cmd, invstring,
 			 msat, maxfee, layers, *retryfor, partial, *maxdelay,
-			 label, localinvreqid, *dev_use_shadow, as_pay, NULL);
+			 label, localinvreqid, *dev_use_shadow, as_pay, NULL,
+			 asset);
 }
 
 static void destroy_payment(struct payment *payment)
@@ -2592,6 +2600,7 @@ static struct payment *new_payment(const tal_t *ctx,
 		payment->layers = tal_dup_talarr(payment, const char *, layers);
 	else
 		payment->layers = NULL;
+	payment->asset = NULL;
 	payment->destination = *destination;
 	payment->payment_hash = *payment_hash;
 	payment->mpp_amount = mpp_amount;
@@ -2675,7 +2684,8 @@ static struct command_result *xpay_core(struct command *cmd,
 					const struct sha256 *localinvreqid,
 					bool use_shadow,
 					bool as_pay,
-					const struct amount_msat *includefees_msat)
+					const struct amount_msat *includefees_msat,
+					const char *asset)
 {
 	struct payment *payment;
 	struct xpay *xpay = xpay_of(cmd->plugin);
@@ -2858,6 +2868,7 @@ static struct command_result *xpay_core(struct command *cmd,
 			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
 					    "%s", err);
 
+		payment->asset = tal_strdup_or_null(payment, asset);
 		payment->route_hints = tal_steal(payment, b11->routes);
 		disable_mpp = !feature_offered(b11->features, OPT_BASIC_MPP);
 		if (!includefees_msat && amount_msat_is_zero(payment->mpp_amount))
@@ -3050,7 +3061,7 @@ static struct command_result *json_sendamount(struct command *cmd,
 	/* Probably a bolt11, an invoice already. */
 	return xpay_core(cmd, invstring,
 			 &invoice_msat, maxfee, layers, *retryfor, NULL, *maxdelay,
-			 label, NULL, false, false, send_msat);
+			 label, NULL, false, false, send_msat, NULL);
 }
 
 static struct command_result *getchaininfo_done(struct command *aux_cmd,

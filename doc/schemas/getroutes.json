@@ -81,6 +81,14 @@
           "Maximum number of routes in the solution."
         ],
         "default": "100"
+      },
+      "asset": {
+        "type": "hash",
+        "added": "v26.09",
+        "description": [
+          "PoC: on Liquid, route in this issued asset's channels only (its id as elements-cli prints it).",
+          "By default only channels in the chain's own coin (L-BTC) are used."
+        ]
       }
     }
   },

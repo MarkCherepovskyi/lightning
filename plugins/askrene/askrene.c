@@ -8,6 +8,7 @@
  */
 #include "config.h"
 #include <ccan/array_size/array_size.h>
+#include <ccan/mem/mem.h>
 #include <ccan/noerr/noerr.h>
 #include <ccan/tal/grab_file/grab_file.h>
 #include <ccan/tal/str/str.h>
@@ -359,7 +360,51 @@ struct getroutes_info {
 	/* Non-NULL if we are told to use "auto.localchans" */
 	struct layer *local_layer;
 	u32 maxparts;
+	/* PoC: gossip network to route in: the chain's own, or a Liquid
+	 * asset's (see common/liquid_asset.h). */
+	struct bitcoin_blkid network;
 };
+
+/* PoC: which network is this local channel in (per listpeerchannels)? */
+static void local_channel_network(const char *buf, const jsmntok_t *chantok,
+				  struct bitcoin_blkid *network)
+{
+	const jsmntok_t *assettok = json_get_member(buf, chantok, "liquid_asset");
+
+	if (!assettok || !json_to_bitcoin_blkid(buf, assettok, network))
+		*network = chainparams->genesis_blockhash;
+}
+
+/* PoC: payments stay in one network: never route an L-BTC payment over
+ * asset channels or the other way round.  Disable every announced channel
+ * from another network. */
+static void disable_other_networks(const struct gossmap *gossmap,
+				   struct gossmap_localmods *localmods,
+				   const struct bitcoin_blkid *network)
+{
+	/* Only Liquid has more than one network */
+	if (!chainparams->is_elements)
+		return;
+
+	for (struct gossmap_chan *c = gossmap_first_chan(gossmap);
+	     c;
+	     c = gossmap_next_chan(gossmap, c)) {
+		struct bitcoin_blkid chain_hash;
+		struct short_channel_id_dir scidd;
+		bool enabled = false;
+
+		gossmap_chan_get_chain_hash(gossmap, c, &chain_hash);
+		/* (Generated test gossip has no chain_hash: count it as ours) */
+		if (memeqzero(&chain_hash, sizeof(chain_hash)))
+			chain_hash = chainparams->genesis_blockhash;
+		if (bitcoin_blkid_eq(&chain_hash, network))
+			continue;
+		scidd.scid = gossmap_chan_scid(gossmap, c);
+		for (scidd.dir = 0; scidd.dir < 2; scidd.dir++)
+			gossmap_local_updatechan(localmods, &scidd, &enabled,
+						 NULL, NULL, NULL, NULL, NULL);
+	}
+}
 
 static void add_layer(const struct layer ***layers,
 		      const struct layer *l,
@@ -611,6 +656,8 @@ static struct command_result *do_getroutes(struct command *cmd,
 			  localmods, capacities);
 	}
 
+	disable_other_networks(askrene->gossmap, localmods, &info->network);
+
 	/* Clear scids with reservations, too, so we don't have to look up
 	 * all the time! */
 	reserves_clear_capacities(askrene->reserved, askrene->gossmap,
@@ -768,6 +815,12 @@ static void add_localchan(struct gossmap_localmods *mods,
 	u32 feerate;
 	const char *opener;
 	const char *err;
+	struct bitcoin_blkid network;
+
+	/* PoC: only channels in the network we're routing in. */
+	local_channel_network(buf, chantok, &network);
+	if (!bitcoin_blkid_eq(&network, &info->network))
+		return;
 
 	/* We get called twice, once in each direction: only create once. */
 	if (!layer_find_local_channel(info->local_layer, scidd->scid))
@@ -791,7 +844,10 @@ static void add_localchan(struct gossmap_localmods *mods,
 		return;
 	}
 
-	if (feerate != 0 && streq(opener, "local")) {
+	/* (PoC: asset channels pay on-chain fees from their L-BTC reserve,
+	 * not from the asset balance.) */
+	if (feerate != 0 && streq(opener, "local")
+	    && bitcoin_blkid_eq(&network, &chainparams->genesis_blockhash)) {
 		/* BOLT #3:
 		 * The base fee for a commitment transaction:
 		 *   - MUST be calculated to match:
@@ -887,6 +943,22 @@ static struct command_result *begin_request(struct askrene *askrene,
 	return do_getroutes(info->cmd, gossmap_localmods_new(info->cmd), info);
 }
 
+/* PoC: a Liquid asset id (as elements-cli prints it) names its gossip
+ * network, see common/liquid_asset.h. */
+static struct command_result *param_liquid_asset_network(struct command *cmd,
+							  const char *name,
+							  const char *buffer,
+							  const jsmntok_t *tok,
+							  struct bitcoin_blkid **network)
+{
+	*network = tal(cmd, struct bitcoin_blkid);
+	if (!chainparams->is_elements
+	    || !json_to_bitcoin_blkid(buffer, tok, *network))
+		return command_fail_badparam(cmd, name, buffer, tok,
+					     "should be a Liquid asset id");
+	return NULL;
+}
+
 static struct command_result *json_getroutes(struct command *cmd,
 					     const char *buffer,
 					     const jsmntok_t *params)
@@ -908,6 +980,7 @@ static struct command_result *json_getroutes(struct command *cmd,
 	u32 *finalcltv, *maxdelay;
 	enum algorithm *dev_algo;
 	u32 *maxparts;
+	struct bitcoin_blkid *asset_network;
 
 	if (!param_check(cmd, buffer, params,
 			 p_req("source", param_node_id, &source),
@@ -920,6 +993,7 @@ static struct command_result *json_getroutes(struct command *cmd,
 				   maxdelay_allowed),
 			 p_opt_def("maxparts", param_u32, &maxparts,
 				   default_maxparts),
+			 p_opt("asset", param_liquid_asset_network, &asset_network),
 			 p_opt_dev("dev_algorithm", param_algorithm,
 				   &dev_algo, ALGO_DEFAULT),
 			 NULL))
@@ -961,6 +1035,8 @@ static struct command_result *json_getroutes(struct command *cmd,
 	info->dev_algo = *dev_algo;
 	info->additional_costs = new_htable(info, additional_cost_htable);
 	info->maxparts = *maxparts;
+	info->network = asset_network ? *asset_network
+		: chainparams->genesis_blockhash;
 
 	if (askrene->num_live_requests >= askrene->max_children) {
 		cmd_log(tmpctx, cmd, LOG_INFORM,
