@@ -48,6 +48,10 @@ char *fmt_liquid_asset(const tal_t *ctx, const u8 *asset);
  * id).  Nodes that don't follow the asset ignore it as an unknown chain. */
 void liquid_asset_network(const u8 *asset, struct bitcoin_blkid *network);
 
+/* Are this output's asset and value both explicit (always, off Liquid)?
+ * Only those can fund a channel. */
+bool liquid_output_is_explicit(const struct wally_tx_output *output);
+
 /* Is @asset one of the (tal array of) @assets? */
 bool liquid_asset_in(const u8 *asset, u8 *const *assets);
 

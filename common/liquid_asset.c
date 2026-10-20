@@ -74,6 +74,14 @@ void liquid_asset_network(const u8 *asset, struct bitcoin_blkid *network)
 	memcpy(network, asset + 1, sizeof(*network));
 }
 
+bool liquid_output_is_explicit(const struct wally_tx_output *output)
+{
+	if (!chainparams->is_elements)
+		return true;
+	return output->asset_len == ELEMENTS_ASSET_LEN && output->asset[0] == 0x01
+		&& output->value_len == 9 && output->value[0] == 0x01;
+}
+
 bool liquid_asset_in(const u8 *asset, u8 *const *assets)
 {
 	for (size_t i = 0; i < tal_count(assets); i++)
