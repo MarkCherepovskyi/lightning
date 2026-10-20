@@ -1,0 +1,89 @@
+# Liquid asset channel PoC: one Liquid regtest node and three Core Lightning
+# nodes (alice, bob, carol) built from this branch.
+#
+#   docker compose -f contrib/liquid-poc/docker-compose.yml up -d --build
+#   contrib/liquid-poc/lnpoc.py setup
+#
+# See README.md for the rest.
+
+name: liquid-ln-poc
+
+x-cln: &cln
+  image: liquid-ln-poc/cln
+  build:
+    context: ../..
+    dockerfile: contrib/liquid-poc/Dockerfile
+    target: cln
+  depends_on:
+    - elementsd
+  restart: unless-stopped
+  stop_grace_period: 30s
+  # One shared command line; each node only sets NODE_ALIAS.
+  entrypoint:
+    - sh
+    - -c
+    - >-
+      exec lightningd
+      --network=liquid-regtest
+      --lightning-dir=/data
+      --alias=$${NODE_ALIAS}
+      --bind-addr=0.0.0.0:20735
+      --bitcoin-rpcconnect=elementsd
+      --bitcoin-rpcport=18884
+      --bitcoin-rpcuser=poc
+      --bitcoin-rpcpassword=poc
+      --log-level=debug
+
+services:
+  elementsd:
+    image: liquid-ln-poc/elementsd
+    build:
+      context: ../..
+      dockerfile: contrib/liquid-poc/Dockerfile
+      target: elementsd
+    command:
+      - -chain=liquid-regtest
+      - -datadir=/data
+      - -printtoconsole
+      - -server=1
+      - -listen=0
+      - -txindex=1
+      - -validatepegin=0
+      - -con_blocksubsidy=5000000000
+      - -acceptnonstdtxn=1
+      - -fallbackfee=0.0001
+      - -rpcuser=poc
+      - -rpcpassword=poc
+      - -rpcport=18884
+      - -rpcbind=0.0.0.0
+      - -rpcallowip=0.0.0.0/0
+    volumes:
+      - elements-data:/data
+    restart: unless-stopped
+
+  alice:
+    <<: *cln
+    environment:
+      NODE_ALIAS: alice
+    volumes:
+      - alice-data:/data
+
+  bob:
+    <<: *cln
+    environment:
+      NODE_ALIAS: bob
+    volumes:
+      - bob-data:/data
+
+  carol:
+    <<: *cln
+    environment:
+      NODE_ALIAS: carol
+    volumes:
+      - carol-data:/data
+
+volumes:
+  elements-data:
+  alice-data:
+  bob-data:
+  carol-data:
