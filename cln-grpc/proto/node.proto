@@ -825,6 +825,7 @@ message InvoiceRequest {
 	repeated string exposeprivatechannels = 8;
 	optional bool deschashonly = 9;
 	AmountOrAny amount_msat = 10;
+	optional bytes asset = 11;
 }
 
 message InvoiceResponse {
@@ -2168,6 +2169,8 @@ message FundchannelStartRequest {
 	optional uint32 mindepth = 7;
 	optional AmountSat reserve = 8;
 	repeated uint32 channel_type = 9;
+	optional bytes asset = 10;
+	optional AmountSat fee_reserve = 11;
 }
 
 message FundchannelStartResponse {

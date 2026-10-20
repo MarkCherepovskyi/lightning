@@ -1190,6 +1190,8 @@ pub mod requests {
 	#[derive(Clone, Debug, Deserialize, Serialize)]
 	pub struct InvoiceRequest {
 	    #[serde(skip_serializing_if = "Option::is_none")]
+	    pub asset: Option<String>,
+	    #[serde(skip_serializing_if = "Option::is_none")]
 	    pub cltv: Option<u32>,
 	    #[serde(skip_serializing_if = "Option::is_none")]
 	    pub deschashonly: Option<bool>,
@@ -2572,7 +2574,11 @@ pub mod requests {
 	    #[serde(skip_serializing_if = "Option::is_none")]
 	    pub announce: Option<bool>,
 	    #[serde(skip_serializing_if = "Option::is_none")]
+	    pub asset: Option<String>,
+	    #[serde(skip_serializing_if = "Option::is_none")]
 	    pub close_to: Option<String>,
+	    #[serde(skip_serializing_if = "Option::is_none")]
+	    pub fee_reserve: Option<AmountSat>,
 	    #[serde(skip_serializing_if = "Option::is_none")]
 	    pub feerate: Option<Feerate>,
 	    #[serde(skip_serializing_if = "Option::is_none")]
