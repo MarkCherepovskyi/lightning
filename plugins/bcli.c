@@ -817,8 +817,9 @@ static const char *init(struct command *init_cmd, const char *buffer UNUSED,
 {
 	wait_and_check_bitcoind(init_cmd->plugin);
 
-	/* Usually we fake up fees in regtest */
-	if (streq(chainparams->network_name, "regtest"))
+	/* Usually we fake up fees in regtest (and Liquid's regtest) */
+	if (streq(chainparams->network_name, "regtest")
+	    || streq(chainparams->network_name, "liquid-regtest"))
 		bitcoind->fake_fees = !bitcoind->dev_no_fake_fees;
 	else
 		bitcoind->fake_fees = false;
