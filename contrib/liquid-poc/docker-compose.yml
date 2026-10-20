@@ -18,7 +18,8 @@ x-cln: &cln
     - elementsd
   restart: unless-stopped
   stop_grace_period: 30s
-  # One shared command line; each node only sets NODE_ALIAS.
+  # One shared command line; each node only sets NODE_ALIAS.  (Fast gossip,
+  # a developer option, makes announced channels show up in seconds.)
   entrypoint:
     - sh
     - -c
@@ -33,6 +34,8 @@ x-cln: &cln
       --bitcoin-rpcuser=poc
       --bitcoin-rpcpassword=poc
       --log-level=debug
+      --developer
+      --dev-fast-gossip
 
 services:
   elementsd:
