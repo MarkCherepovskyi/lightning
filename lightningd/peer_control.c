@@ -12,6 +12,7 @@
 #include <common/initial_commit_tx.h>
 #include <common/json_channel_type.h>
 #include <common/json_command.h>
+#include <common/liquid_asset.h>
 #include <common/psbt_open.h>
 #include <common/timeout.h>
 #include <common/version.h>
@@ -1043,6 +1044,13 @@ static void NON_NULL_ARGS(1, 2, 4, 5) json_add_channel(struct command *cmd,
 			fmt_channel_id(tmpctx, &channel->cid));
 	json_add_txid(response, "funding_txid", &channel->funding.txid);
 	json_add_num(response, "funding_outnum", channel->funding.n);
+	/* PoC: Liquid asset channel? */
+	if (channel->liquid_asset) {
+		json_add_string(response, "liquid_asset",
+				fmt_liquid_asset(tmpctx, channel->liquid_asset));
+		json_add_amount_sat_msat(response, "liquid_fee_reserve_msat",
+					 channel->liquid_fee_reserve);
+	}
 
 	has_valid_inflights = false;
 	if (!list_empty(&channel->inflights)) {

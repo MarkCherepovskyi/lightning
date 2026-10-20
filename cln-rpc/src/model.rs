@@ -7982,6 +7982,10 @@ pub mod responses {
 	    #[serde(skip_serializing_if = "Option::is_none")]
 	    pub last_tx_fee_msat: Option<Amount>,
 	    #[serde(skip_serializing_if = "Option::is_none")]
+	    pub liquid_asset: Option<String>,
+	    #[serde(skip_serializing_if = "Option::is_none")]
+	    pub liquid_fee_reserve_msat: Option<Amount>,
+	    #[serde(skip_serializing_if = "Option::is_none")]
 	    pub lost_state: Option<bool>,
 	    #[serde(skip_serializing_if = "Option::is_none")]
 	    pub max_accepted_htlcs: Option<u32>,

@@ -27034,6 +27034,20 @@
                     "The 0-based output number of the funding transaction which opens the channel."
                   ]
                 },
+                "liquid_asset": {
+                  "type": "hex",
+                  "added": "v26.09",
+                  "description": [
+                    "PoC, Liquid only: the issued asset this channel's balance is in (the asset id as printed by elements-cli); absent for ordinary L-BTC channels."
+                  ]
+                },
+                "liquid_fee_reserve_msat": {
+                  "type": "msat",
+                  "added": "v26.09",
+                  "description": [
+                    "PoC, Liquid only: L-BTC the opener put next to the funding output of an asset channel to pay on-chain fees."
+                  ]
+                },
                 "initial_feerate": {
                   "type": "string",
                   "description": [
@@ -27734,6 +27748,8 @@
                       "updates": {},
                       "funding_txid": {},
                       "funding_outnum": {},
+                      "liquid_asset": {},
+                      "liquid_fee_reserve_msat": {},
                       "close_to": {},
                       "private": {},
                       "alias": {},
@@ -27834,6 +27850,8 @@
                       "updates": {},
                       "funding_txid": {},
                       "funding_outnum": {},
+                      "liquid_asset": {},
+                      "liquid_fee_reserve_msat": {},
                       "inflight": {},
                       "close_to": {},
                       "private": {},
@@ -27933,6 +27951,8 @@
                       "updates": {},
                       "funding_txid": {},
                       "funding_outnum": {},
+                      "liquid_asset": {},
+                      "liquid_fee_reserve_msat": {},
                       "inflight": {},
                       "close_to": {},
                       "private": {},
@@ -28034,6 +28054,8 @@
                       "updates": {},
                       "funding_txid": {},
                       "funding_outnum": {},
+                      "liquid_asset": {},
+                      "liquid_fee_reserve_msat": {},
                       "close_to": {},
                       "private": {},
                       "opener": {},

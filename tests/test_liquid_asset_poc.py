@@ -165,6 +165,11 @@ def test_liquid_asset_channel_poc(node_factory, bitcoind):
                              for c in n.rpc.listpeerchannels()['channels']))
     funding = {'lbtc12': lbtc_funding[l1], 'lbtc23': lbtc_funding[l2],
                'asset12': asset_funding[l1], 'asset23': asset_funding[l2]}
+    # listpeerchannels says which channels are asset channels.
+    ch = channel_by_funding(l1, funding['asset12'])
+    assert ch['liquid_asset'] == asset
+    assert ch['liquid_fee_reserve_msat'] == FEE_RESERVE_SAT * 1000
+    assert 'liquid_asset' not in channel_by_funding(l1, funding['lbtc12'])
 
     # 1. Asset invoice, paid over the asset channels.
     inv = asset_invoice(l3, 'asset-ok', asset)
