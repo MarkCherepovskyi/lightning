@@ -8,6 +8,11 @@ output really is in that asset.  Everyone else ignores it as an unknown
 chain, as BOLT 7 requires.  Pathfinding keeps networks apart: `getroutes` and
 `xpay` stay in L-BTC unless asked for an asset.
 
+Catching up works per network too: gossip queries (query_channel_range,
+query_short_channel_ids) and the gossip_timestamp_filter stream only cover
+the network named by their chain_hash, and followers ask for each asset
+network they follow.
+
     TEST_NETWORK=liquid-regtest pytest tests/test_liquid_asset_gossip.py
 """
 from fixtures import *  # noqa: F401,F403
@@ -15,9 +20,11 @@ from pyln.client import RpcError
 from test_liquid_asset_poc import (CHANNEL_UNITS, LBTC_CHANNEL_SAT, PAY_MSAT,
                                    asset_invoice, channel_by_funding,
                                    fund_asset_channel, settled)
-from utils import wait_for, TEST_NETWORK
+from utils import wait_for, TEST_NETWORK, TIMEOUT
 
 import pytest
+import struct
+import subprocess
 
 
 pytestmark = pytest.mark.skipif(TEST_NETWORK != 'liquid-regtest',
@@ -167,3 +174,128 @@ def test_asset_payments_over_gossip(node_factory, bitcoind):
         ch = [c for c in l3.rpc.listpeerchannels()['channels']
               if c['short_channel_id'] == scid][0]
         assert PAY_MSAT <= ch['to_us_msat'] < 2 * PAY_MSAT
+
+
+def asset_network(asset):
+    """An asset's gossip network, as it goes on the wire where chain_hash
+    goes: the asset id (which elements-cli prints byte-reversed)."""
+    return bytes.fromhex(asset)[::-1].hex()
+
+
+def scid_str(v):
+    return f"{v >> 40}x{(v >> 16) & 0xFFFFFF}x{v & 0xFFFF}"
+
+
+def range_scids(node, network):
+    """Ask node (as a raw peer) which channels it knows in this network."""
+    msgs = node.query_gossip('query_channel_range', network, 0, 1000000,
+                             filters=['0109', '0107', '0012', '0105'])
+    scids = []
+    for m in msgs:
+        b = bytes.fromhex(m)
+        # reply_channel_range: type, chain_hash, first_blocknum,
+        # number_of_blocks, sync_complete, len, encoded_short_ids
+        assert b[:2] == bytes.fromhex('0108')
+        assert b[2:34].hex() == network
+        enclen = struct.unpack('>H', b[43:45])[0]
+        enc = b[45:45 + enclen]
+        assert enc[0] == 0  # uncompressed
+        scids += [scid_str(struct.unpack('>Q', enc[i:i + 8])[0])
+                  for i in range(1, len(enc), 8)]
+    return scids
+
+
+def scid_query(node, network, scid):
+    """Ask node (as a raw peer) about one channel; returns the message types
+    of its replies and the final reply_short_channel_ids_end."""
+    encoded = subprocess.run(['devtools/mkencoded', '--scids', '00', scid],
+                             check=True, timeout=TIMEOUT,
+                             stdout=subprocess.PIPE).stdout.strip().decode()
+    msgs = node.query_gossip('query_short_channel_ids', network, encoded,
+                             filters=['0109', '0107', '0012'])
+    return [m[:4] for m in msgs[:-1]], msgs[-1]
+
+
+def message_network(hmsg):
+    """The network of a channel_announcement / channel_update, else None."""
+    b = bytes.fromhex(hmsg)
+    if b[:2] == bytes.fromhex('0102'):
+        return b[2 + 64:2 + 64 + 32].hex()
+    if b[:2] == bytes.fromhex('0100'):
+        flen = struct.unpack('>H', b[2 + 256:2 + 258])[0]
+        off = 2 + 258 + flen
+        return b[off:off + 32].hex()
+    return None
+
+
+def streamed_gossip(node):
+    """Everything node streams to a peer that asks for all gossip on the
+    chain's own network (as an ordinary, non-asset node does)."""
+    out = subprocess.run(['devtools/gossipwith', '--all-gossip',
+                          '--network={}'.format(TEST_NETWORK),
+                          '--timeout-after=5',
+                          '{}@localhost:{}'.format(node.info['id'], node.port)],
+                         check=True, timeout=TIMEOUT,
+                         stdout=subprocess.PIPE).stdout
+    msgs = []
+    while len(out):
+        length = struct.unpack('>H', out[0:2])[0]
+        msgs.append(out[2:2 + length].hex())
+        out = out[2 + length:]
+    return msgs
+
+
+def test_asset_gossip_queries(node_factory, bitcoind, chainparams):
+    """Gossip queries and the gossip stream only cover the network their
+    chain_hash names."""
+    lbtc, asset = issue_asset(bitcoind)
+    follow = {'liquid-gossip-asset': asset}
+    l1, l2, l3 = node_factory.get_nodes(3, opts=follow)
+    l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
+    l3.rpc.connect(l2.info['id'], 'localhost', l2.port)
+    lbtc_scid, asset_scid = open_announced(bitcoind, l1, l2, asset, lbtc)
+    # l3 isn't in either channel, so it sends us nothing of its own.
+    for scid in (lbtc_scid, asset_scid):
+        wait_for(lambda: len(gossiped(l3, scid)) == 2)
+
+    chain = chainparams['chain_hash']
+    network = asset_network(asset)
+
+    # Ranges: each network has just its own channel.
+    assert range_scids(l3, chain) == [lbtc_scid]
+    assert range_scids(l3, network) == [asset_scid]
+
+    # Asking about the asset channel on the chain's network: nothing.
+    types, end = scid_query(l3, chain, asset_scid)
+    assert types == []
+    assert end == '0106' + chain + '01'
+    # On the asset's network: its announcement and both updates.
+    types, end = scid_query(l3, network, asset_scid)
+    assert types.count('0100') == 1 and types.count('0102') == 2
+    assert end == '0106' + network + '01'
+
+    # Streaming everything on the chain's own network leaks no asset gossip.
+    streamed = [message_network(m) for m in streamed_gossip(l3)]
+    assert chain in streamed
+    assert network not in streamed
+
+
+def test_asset_gossip_catch_up(node_factory, bitcoind):
+    """A follower catches up on an asset network with gossip queries, even
+    when its only peer doesn't stream gossip to it."""
+    lbtc, asset = issue_asset(bitcoind)
+    follow = {'liquid-gossip-asset': asset}
+    l1, l2, l3, l4 = node_factory.get_nodes(4, opts=follow)
+    l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
+    l4.rpc.connect(l2.info['id'], 'localhost', l2.port)
+    lbtc_scid, asset_scid = open_announced(bitcoind, l1, l2, asset, lbtc)
+    wait_for(lambda: len(gossiped(l4, asset_scid)) == 2)
+
+    # l4 stops streaming gossip to peers: l3 can only ask for it.
+    l4.rpc.call('dev-suppress-gossip')
+    l3.rpc.connect(l4.info['id'], 'localhost', l4.port)
+
+    wait_for(lambda: len(gossiped(l3, asset_scid)) == 2)
+    assert all(c['liquid_asset'] == asset and c['amount_msat'] == CHANNEL_UNITS * 1000
+               for c in gossiped(l3, asset_scid))
+    l3.daemon.wait_for_log('sending query_channel_range on network ' + asset)
