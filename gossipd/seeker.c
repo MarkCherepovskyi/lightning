@@ -2,6 +2,7 @@
 #include "config.h"
 #include <ccan/asort/asort.h>
 #include <ccan/intmap/intmap.h>
+#include <ccan/mem/mem.h>
 #include <ccan/tal/str/str.h>
 #include <common/clock_time.h>
 #include <common/daemon_conn.h>
@@ -215,25 +216,39 @@ static bool peer_made_progress(struct seeker *seeker, const struct peer *peer)
 	return false;
 }
 
-static void disable_gossip_stream(struct seeker *seeker, struct peer *peer)
+/* PoC: the same timestamp filter for the chain's own gossip network and
+ * every Liquid asset network we both follow. */
+static void send_gossip_filters(struct peer *peer,
+				u32 first_timestamp, u32 timestamp_range)
 {
 	u8 *msg;
-
-	status_peer_debug(&peer->id, "seeker: disabling gossip");
 
 	/* This is allowed even if they don't understand it (odd) */
 	msg = towire_gossip_timestamp_filter(NULL,
 					     &chainparams->genesis_blockhash,
-					     UINT32_MAX,
-					     UINT32_MAX);
+					     first_timestamp,
+					     timestamp_range);
 	queue_peer_msg(peer->daemon, &peer->id, take(msg));
+
+	for (size_t i = 0; i < tal_count(peer->liquid_networks); i++) {
+		msg = towire_gossip_timestamp_filter(NULL,
+						     &peer->liquid_networks[i],
+						     first_timestamp,
+						     timestamp_range);
+		queue_peer_msg(peer->daemon, &peer->id, take(msg));
+	}
+}
+
+static void disable_gossip_stream(struct seeker *seeker, struct peer *peer)
+{
+	status_peer_debug(&peer->id, "seeker: disabling gossip");
+	send_gossip_filters(peer, UINT32_MAX, UINT32_MAX);
 }
 
 static void enable_gossip_stream(struct seeker *seeker, struct peer *peer,
 				 bool ask_for_all)
 {
 	u32 start;
-	u8 *msg;
 
 	/* If we have no gossip, always ask for everything */
 	if (!gossmap_manage_populated(peer->daemon->gm))
@@ -250,13 +265,7 @@ static void enable_gossip_stream(struct seeker *seeker, struct peer *peer,
 
 	status_peer_debug(&peer->id, "seeker: starting gossip (%s)",
 			  ask_for_all ? "EVERYTHING" : "streaming");
-
-	/* This is allowed even if they don't understand it (odd) */
-	msg = towire_gossip_timestamp_filter(NULL,
-					     &chainparams->genesis_blockhash,
-					     start,
-					     UINT32_MAX);
-	queue_peer_msg(peer->daemon, &peer->id, take(msg));
+	send_gossip_filters(peer, start, UINT32_MAX);
 }
 
 static void normal_gossip_start(struct seeker *seeker, struct peer *peer, bool ask_for_all)
@@ -363,8 +372,9 @@ static bool seek_any_unknown_scids(struct seeker *seeker)
 	scids = unknown_scids_remove(tmpctx, seeker);
 	set_state(seeker, ASKING_FOR_UNKNOWN_SCIDS, peer,
 		  "Asking for %zu scids", tal_count(scids));
-	if (!query_short_channel_ids(seeker->daemon, peer, scids, NULL,
-				     scid_query_done))
+	if (!query_short_channel_ids(seeker->daemon, peer,
+				     &chainparams->genesis_blockhash,
+				     scids, NULL, scid_query_done))
 		status_failed(STATUS_FAIL_INTERNAL_ERROR,
 			      "seeker: quering %zu scids is too many?",
 			      tal_count(scids));
@@ -420,8 +430,9 @@ static bool seek_any_stale_scids(struct seeker *seeker)
 	set_state(seeker, ASKING_FOR_STALE_SCIDS, peer,
 		  "Asking for %zu scids", tal_count(scids));
 
-	if (!query_short_channel_ids(seeker->daemon, peer, scids, query_flags,
-				     scid_query_done))
+	if (!query_short_channel_ids(seeker->daemon, peer,
+				     &chainparams->genesis_blockhash,
+				     scids, query_flags, scid_query_done))
 		status_failed(STATUS_FAIL_INTERNAL_ERROR,
 			      "seeker: quering %zu scids is too many?",
 			      tal_count(scids));
@@ -505,8 +516,23 @@ static bool get_unannounced_nodes(const tal_t *ctx,
 		if (gossmap_node_announced(node))
 			continue;
 
-		/* Query first chan. */
-		chan = gossmap_nth_chan(gossmap, node, 0, NULL);
+		/* Query first chan (PoC: in the chain's own gossip network;
+		 * liquid_sync gets nodes with only Liquid asset channels). */
+		chan = NULL;
+		for (size_t c = 0; c < node->num_chans; c++) {
+			struct bitcoin_blkid chain_hash;
+			const struct gossmap_chan *ch
+				= gossmap_nth_chan(gossmap, node, c, NULL);
+			gossmap_chan_get_chain_hash(gossmap, ch, &chain_hash);
+			if (memeqzero(&chain_hash, sizeof(chain_hash))
+			    || bitcoin_blkid_eq(&chain_hash,
+						&chainparams->genesis_blockhash)) {
+				chan = ch;
+				break;
+			}
+		}
+		if (!chan)
+			continue;
 		(*scids)[num++] = gossmap_chan_scid(gossmap, chan);
 
 		if (num == max)
@@ -623,6 +649,7 @@ static void peer_gossip_probe_nannounces(struct seeker *seeker)
 		return;
 
 	if (!query_short_channel_ids(seeker->daemon, peer,
+				     &chainparams->genesis_blockhash,
 				     seeker->nannounce_scids,
 				     seeker->nannounce_query_flags,
 				     nodeannounce_query_done))
@@ -745,6 +772,7 @@ static void process_scid_probe(struct peer *peer,
 		selected_peer(seeker, peer);
 
 		query_channel_range(seeker->daemon, peer,
+				    &chainparams->genesis_blockhash,
 				    first_blocknum, number_of_blocks,
 				    QUERY_ADD_TIMESTAMPS,
 				    process_scid_probe);
@@ -777,6 +805,7 @@ static void peer_gossip_probe_scids(struct seeker *seeker)
 
 	/* This calls process_scid_probe when we get the reply. */
 	query_channel_range(seeker->daemon, peer,
+			    &chainparams->genesis_blockhash,
 			    seeker->scid_probe_start,
 			    seeker->scid_probe_end - seeker->scid_probe_start + 1,
 			    QUERY_ADD_TIMESTAMPS,

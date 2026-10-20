@@ -25,6 +25,7 @@
 #include <gossipd/gossipd.h>
 #include <gossipd/gossipd_wiregen.h>
 #include <gossipd/gossmap_manage.h>
+#include <gossipd/liquid_sync.h>
 #include <gossipd/queries.h>
 #include <gossipd/seeker.h>
 
@@ -143,6 +144,7 @@ static void connectd_new_peer(struct daemon *daemon, const u8 *msg)
 	peer->scid_query_outstanding = false;
 	peer->range_replies = NULL;
 	peer->query_channel_range_cb = NULL;
+	peer->liquid_sync = NULL;
 
 	/* We keep a htable so we can find peer by id */
 	peer_node_id_map_add(daemon->peers, peer);
@@ -150,6 +152,9 @@ static void connectd_new_peer(struct daemon *daemon, const u8 *msg)
 
 	/* This sends the initial timestamp filter. */
 	seeker_setup_peer_gossip(daemon->seeker, peer);
+
+	/* PoC: catch up on the Liquid asset networks we both follow */
+	liquid_sync_peer(daemon, peer);
 }
 
 static void connectd_peer_gone(struct daemon *daemon, const u8 *msg)

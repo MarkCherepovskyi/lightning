@@ -34,6 +34,7 @@ struct peer *next_random_peer(struct daemon *daemon UNNEEDED,
 /* Generated stub for query_channel_range */
 bool query_channel_range(struct daemon *daemon UNNEEDED,
 			 struct peer *peer UNNEEDED,
+			 const struct bitcoin_blkid *network UNNEEDED,
 			 u32 first_blocknum UNNEEDED, u32 number_of_blocks UNNEEDED,
 			 enum query_option_flags qflags UNNEEDED,
 			 void (*cb)(struct peer *peer_ UNNEEDED,
@@ -44,6 +45,7 @@ bool query_channel_range(struct daemon *daemon UNNEEDED,
 /* Generated stub for query_short_channel_ids */
 bool query_short_channel_ids(struct daemon *daemon UNNEEDED,
 			     struct peer *peer UNNEEDED,
+			     const struct bitcoin_blkid *network UNNEEDED,
 			     const struct short_channel_id *scids UNNEEDED,
 			     const u8 *query_flags UNNEEDED,
 			     void (*cb)(struct peer *peer_ UNNEEDED, bool complete))
