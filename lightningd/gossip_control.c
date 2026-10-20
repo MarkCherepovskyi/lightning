@@ -15,8 +15,10 @@
 #include <lightningd/lightningd.h>
 #include <lightningd/subd.h>
 
+/* @asset is NULL for the chain's own coin (PoC: else a Liquid asset tag) */
 static void got_txout(struct bitcoind *bitcoind,
 		      const struct bitcoin_tx_output *output,
+		      const u8 *asset,
 		      struct short_channel_id scid)
 {
 	const u8 *script;
@@ -29,11 +31,13 @@ static void got_txout(struct bitcoind *bitcoind,
 	} else {
 		script = NULL;
 		sat = AMOUNT_SAT(0);
+		asset = NULL;
 	}
 
 	subd_send_msg(
 	    bitcoind->ld->gossip,
-	    take(towire_gossipd_get_txout_reply(NULL, scid, sat, script)));
+	    take(towire_gossipd_get_txout_reply(NULL, scid, sat, script,
+						liquid_asset_dup(tmpctx, asset))));
 }
 
 static void got_filteredblock(struct bitcoind *bitcoind,
@@ -50,7 +54,7 @@ static void got_filteredblock(struct bitcoind *bitcoind,
 	/* If we failed to the filtered block we report the failure to
 	 * got_txout. */
 	if (fb == NULL)
-		return got_txout(bitcoind, NULL, scid);
+		return got_txout(bitcoind, NULL, NULL, scid);
 
 	/* This routine is mainly for past blocks.  As a corner case,
 	 * we will grab (but not save) future blocks if we're
@@ -71,9 +75,9 @@ static void got_filteredblock(struct bitcoind *bitcoind,
 	if (fbo) {
 		txo.amount = fbo->amount;
 		txo.script = (u8 *)fbo->scriptPubKey;
-		got_txout(bitcoind, &txo, scid);
+		got_txout(bitcoind, &txo, fbo->asset, scid);
 	} else
-		got_txout(bitcoind, NULL, scid);
+		got_txout(bitcoind, NULL, NULL, scid);
 }
 
 static void get_txout(struct subd *gossip, const u8 *msg)
@@ -94,14 +98,16 @@ static void get_txout(struct subd *gossip, const u8 *msg)
 	if (op) {
 		subd_send_msg(gossip,
 			      take(towire_gossipd_get_txout_reply(
-					   NULL, scid, op->sat, op->scriptpubkey)));
+					   NULL, scid, op->sat, op->scriptpubkey,
+					   op->asset)));
 	} else if (wallet_have_block(gossip->ld->wallet, blockheight)) {
 		/* We should have known about this outpoint since its header
 		 * is in the DB. The fact that we don't means that this is
 		 * either a spent outpoint or an invalid one. Return a
 		 * failure. */
 		subd_send_msg(gossip, take(towire_gossipd_get_txout_reply(
-						   NULL, scid, AMOUNT_SAT(0), NULL)));
+						   NULL, scid, AMOUNT_SAT(0), NULL,
+						   NULL)));
 	} else {
 		/* If we're shutting down, don't ask plugins */
 		if (gossip->ld->state == LD_STATE_SHUTDOWN)

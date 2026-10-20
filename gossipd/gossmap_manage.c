@@ -772,17 +772,29 @@ const char *gossmap_manage_channel_announcement(const tal_t *ctx,
 	return NULL;
 }
 
+/* PoC: a funding output must be in its network's asset: the chain's own coin,
+ * or the Liquid asset that the network is named after. */
+static bool funding_asset_ok(const struct bitcoin_blkid *network, const u8 *asset)
+{
+	if (bitcoin_blkid_eq(network, &chainparams->genesis_blockhash))
+		return tal_count(asset) == 0;
+	return tal_count(asset) == 1 + sizeof(*network)
+		&& asset[0] == 0x01
+		&& memcmp(asset + 1, network, sizeof(*network)) == 0;
+}
+
 /*~ We queue incoming channel_announcement pending confirmation from lightningd
  * that it really is an unspent output.  Here's its reply. */
 void gossmap_manage_handle_get_txout_reply(struct gossmap_manage *gm, const u8 *msg)
 {
 	struct short_channel_id scid;
-	u8 *outscript;
+	u8 *outscript, *asset;
 	struct amount_sat sat;
 	struct pending_cannounce *pca;
 	struct gossmap *gossmap;
 
-	if (!fromwire_gossipd_get_txout_reply(msg, msg, &scid, &sat, &outscript))
+	if (!fromwire_gossipd_get_txout_reply(msg, msg, &scid, &sat, &outscript,
+					      &asset))
 		master_badmsg(WIRE_GOSSIPD_GET_TXOUT_REPLY, msg);
 
 	status_trace("channel_announcement: got reply for %s...",
@@ -835,6 +847,13 @@ void gossmap_manage_handle_get_txout_reply(struct gossmap_manage *gm, const u8 *
 			     fmt_short_channel_id(tmpctx, scid),
 			     tal_hex(tmpctx, pca->scriptpubkey),
 			     tal_hex(tmpctx, outscript));
+		goto bad;
+	}
+
+	if (!funding_asset_ok(&pca->network, asset)) {
+		peer_warning(gm, pca->source_peer,
+			     "channel_announcement: txout %s is in the wrong asset",
+			     fmt_short_channel_id(tmpctx, scid));
 		goto bad;
 	}
 

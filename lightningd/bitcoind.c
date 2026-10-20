@@ -9,6 +9,7 @@
 #include <ccan/array_size/array_size.h>
 #include <ccan/io/io.h>
 #include <ccan/tal/str/str.h>
+#include <common/liquid_asset.h>
 #include <common/trace.h>
 #include <lightningd/bitcoind.h>
 #include <lightningd/chaintopology.h>
@@ -749,17 +750,21 @@ static void process_getfilteredblock_step1(struct bitcoind *bitcoind,
 			if (!is_p2wsh(output->script, output->script_len, NULL))
 				continue;
 
+			/* PoC: (explicit) Liquid asset outputs are interesting
+			 * too: they can fund asset channels. */
+			if (!liquid_output_is_explicit(output))
+				continue;
 			struct amount_asset amount = wally_tx_output_get_amount(output);
-			if (amount_asset_is_main(&amount)) {
-				/* This is an interesting output, remember it. */
-				o = tal(call->outpoints, struct filteredblock_outpoint);
-				bitcoin_txid(tx, &o->outpoint.txid);
-				o->outpoint.n = j;
-				o->amount = amount_asset_to_sat(&amount);
-				o->txindex = i;
-				o->scriptPubKey = tal_dup_arr(o, u8, output->script, output->script_len, 0);
-				tal_arr_expand(&call->outpoints, o);
-			}
+			/* This is an interesting output, remember it. */
+			o = tal(call->outpoints, struct filteredblock_outpoint);
+			bitcoin_txid(tx, &o->outpoint.txid);
+			o->outpoint.n = j;
+			o->amount = amount_sat(amount.value);
+			o->asset = amount_asset_is_main(&amount) ? NULL
+				: tal_dup_arr(o, u8, amount.asset, sizeof(amount.asset), 0);
+			o->txindex = i;
+			o->scriptPubKey = tal_dup_arr(o, u8, output->script, output->script_len, 0);
+			tal_arr_expand(&call->outpoints, o);
 		}
 	}
 

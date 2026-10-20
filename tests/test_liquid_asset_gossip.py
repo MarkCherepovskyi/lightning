@@ -76,7 +76,10 @@ def test_asset_channel_gossip(node_factory, bitcoind):
     capacity in asset units; other nodes ignore it."""
     lbtc, asset = issue_asset(bitcoind)
     follow = {'liquid-gossip-asset': asset}
-    l1, l2, l3, l4 = node_factory.get_nodes(4, opts=[follow, follow, follow, {}])
+    # node_announcement has no network, so l4 can see l2's before any
+    # channel of l2's that it accepts ("Bad gossip order").  Harmless.
+    l1, l2, l3, l4 = node_factory.get_nodes(4, opts=[follow, follow, follow,
+                                                     {'allow_bad_gossip': True}])
     l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
     for n in (l3, l4):
         n.rpc.connect(l2.info['id'], 'localhost', l2.port)

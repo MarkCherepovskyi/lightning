@@ -405,6 +405,8 @@ struct outpoint {
 	struct amount_sat sat;
 	u8 *scriptpubkey;
 	u32 spendheight;
+	/* PoC: Liquid asset tag, or NULL for the chain's own coin */
+	u8 *asset;
 };
 
 struct channeltx {
@@ -1233,11 +1235,13 @@ bool wallet_outpoint_spend(const tal_t *ctx, struct wallet *w,
 struct outpoint *wallet_outpoint_for_scid(const tal_t *ctx, struct wallet *w,
 					  struct short_channel_id scid);
 
+/* @asset is NULL for the chain's own coin (PoC: else a Liquid asset tag) */
 void wallet_utxoset_add(struct wallet *w,
 			const struct bitcoin_outpoint *outpoint,
 			const u32 blockheight, const u32 txindex,
 			const u8 *scriptpubkey, size_t scriptpubkey_len,
-			struct amount_sat sat);
+			struct amount_sat sat,
+			const u8 *asset);
 
 /**
  * Retrieve all UTXO entries that were spent by the given blockheight.

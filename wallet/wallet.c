@@ -4985,7 +4985,8 @@ void wallet_utxoset_add(struct wallet *w,
 			const struct bitcoin_outpoint *outpoint,
 			const u32 blockheight, const u32 txindex,
 			const u8 *scriptpubkey, size_t scriptpubkey_len,
-			struct amount_sat sat)
+			struct amount_sat sat,
+			const u8 *asset)
 {
 	struct db_stmt *stmt;
 
@@ -4996,8 +4997,9 @@ void wallet_utxoset_add(struct wallet *w,
 					" spendheight,"
 					" txindex,"
 					" scriptpubkey,"
-					" satoshis"
-					") VALUES(?, ?, ?, ?, ?, ?, ?);"));
+					" satoshis,"
+					" asset"
+					") VALUES(?, ?, ?, ?, ?, ?, ?, ?);"));
 	db_bind_txid(stmt, &outpoint->txid);
 	db_bind_int(stmt, outpoint->n);
 	db_bind_int(stmt, blockheight);
@@ -5005,6 +5007,10 @@ void wallet_utxoset_add(struct wallet *w,
 	db_bind_int(stmt, txindex);
 	db_bind_blob(stmt, scriptpubkey, scriptpubkey_len);
 	db_bind_amount_sat(stmt, sat);
+	if (asset)
+		db_bind_blob(stmt, asset, ELEMENTS_ASSET_LEN);
+	else
+		db_bind_null(stmt);
 	db_exec_prepared_v2(take(stmt));
 
 	outpointfilter_add(w->utxoset_outpoints, outpoint);
@@ -5034,8 +5040,9 @@ void wallet_filteredblock_add(struct wallet *w, const struct filteredblock *fb)
 					     " spendheight,"
 					     " txindex,"
 					     " scriptpubkey,"
-					     " satoshis"
-					     ") VALUES(?, ?, ?, ?, ?, ?, ?);"));
+					     " satoshis,"
+					     " asset"
+					     ") VALUES(?, ?, ?, ?, ?, ?, ?, ?);"));
 		db_bind_txid(stmt, &o->outpoint.txid);
 		db_bind_int(stmt, o->outpoint.n);
 		db_bind_int(stmt, fb->height);
@@ -5043,6 +5050,10 @@ void wallet_filteredblock_add(struct wallet *w, const struct filteredblock *fb)
 		db_bind_int(stmt, o->txindex);
 		db_bind_talarr(stmt, o->scriptPubKey);
 		db_bind_amount_sat(stmt, o->amount);
+		if (o->asset)
+			db_bind_talarr(stmt, o->asset);
+		else
+			db_bind_null(stmt);
 		db_exec_prepared_v2(take(stmt));
 
 		outpointfilter_add(w->utxoset_outpoints, &o->outpoint);
@@ -5072,7 +5083,8 @@ struct outpoint *wallet_outpoint_for_scid(const tal_t *ctx, struct wallet *w,
 					" txid,"
 					" spendheight,"
 					" scriptpubkey,"
-					" satoshis "
+					" satoshis,"
+					" asset "
 					"FROM utxoset "
 					"WHERE blockheight = ?"
 					" AND txindex = ?"
@@ -5099,6 +5111,10 @@ struct outpoint *wallet_outpoint_for_scid(const tal_t *ctx, struct wallet *w,
 		op->spendheight = db_col_int(stmt, "spendheight");
 	op->scriptpubkey = db_col_arr(op, stmt, "scriptpubkey", u8);
 	op->sat = db_col_amount_sat(stmt, "satoshis");
+	if (db_col_is_null(stmt, "asset"))
+		op->asset = NULL;
+	else
+		op->asset = db_col_arr(op, stmt, "asset", u8);
 	tal_free(stmt);
 
 	return op;

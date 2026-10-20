@@ -40,6 +40,8 @@ struct filteredblock_outpoint {
 	u32 txindex;
 	const u8 *scriptPubKey;
 	struct amount_sat amount;
+	/* PoC: Liquid asset tag, or NULL for the chain's own coin */
+	const u8 *asset;
 };
 
 /* A struct representing a block with most of the parts filtered out. */
