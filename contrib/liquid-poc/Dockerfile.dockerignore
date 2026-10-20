@@ -1,0 +1,20 @@
+# Build context is the repository root.  Leave out git history, editor and
+# Python/Rust caches, and anything built on the host (it's for a different OS:
+# the image rebuilds everything from source).  Submodules have a `.git` file
+# pointing into the top-level .git; without either, the build skips the
+# submodule refresh.
+**/.git
+.idea
+.venv
+target
+**/__pycache__
+**/*.dSYM
+**/*.o
+**/*.a
+**/*.so
+**/*.dylib
+external/build-*
+config.vars
+compile_commands.json
+# Not needed in the image; editing the scripts shouldn't rebuild Lightning.
+contrib/liquid-poc
