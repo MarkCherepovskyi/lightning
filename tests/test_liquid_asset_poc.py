@@ -64,11 +64,11 @@ def explicit_utxo(bitcoind, asset, amount):
     raise ValueError("no explicit output found")
 
 
-def fund_asset_channel(bitcoind, opener, peer, asset, lbtc):
+def fund_asset_channel(bitcoind, opener, peer, asset, lbtc, announce=False):
     # (pyln-client's typed wrapper doesn't know the PoC parameters yet)
     start = opener.rpc.call('fundchannel_start',
                             {'id': peer.info['id'], 'amount': CHANNEL_UNITS,
-                             'announce': False, 'asset': asset,
+                             'announce': announce, 'asset': asset,
                              'fee_reserve': FEE_RESERVE_SAT})
     funding_spk = bytes.fromhex(start['scriptpubkey'])
 
