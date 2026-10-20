@@ -1501,6 +1501,8 @@ message ListpeerchannelsChannels {
 	optional Amount their_max_htlc_value_in_flight_msat = 61;
 	optional Amount our_max_htlc_value_in_flight_msat = 62;
 	repeated string features = 63;
+	optional bytes liquid_asset = 64;
+	optional Amount liquid_fee_reserve_msat = 65;
 }
 
 message ListpeerchannelsChannelsAlias {

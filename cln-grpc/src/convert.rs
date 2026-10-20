@@ -1398,6 +1398,8 @@ impl From<responses::ListpeerchannelsChannels> for pb::ListpeerchannelsChannels 
             last_feerate: c.last_feerate, // Rule #2 for type string?
             last_stable_connection: c.last_stable_connection, // Rule #2 for type u64?
             last_tx_fee_msat: c.last_tx_fee_msat.map(|f| f.into()), // Rule #2 for type msat?
+            liquid_asset: c.liquid_asset.map(|v| hex::decode(v).unwrap()), // Rule #2 for type hex?
+            liquid_fee_reserve_msat: c.liquid_fee_reserve_msat.map(|f| f.into()), // Rule #2 for type msat?
             lost_state: c.lost_state, // Rule #2 for type boolean?
             max_accepted_htlcs: c.max_accepted_htlcs, // Rule #2 for type u32?
             max_to_us_msat: c.max_to_us_msat.map(|f| f.into()), // Rule #2 for type msat?
