@@ -96,7 +96,9 @@ wallet_commit_channel(struct lightningd *ld,
 		      const u8 *remote_upfront_shutdown_script,
 		      const struct channel_type *type,
 		      const struct wally_psbt *funding_psbt,
-		      bool withheld)
+		      bool withheld,
+		      const u8 *liquid_asset,
+		      struct amount_sat liquid_fee_reserve)
 {
 	struct channel *channel;
 	struct amount_msat our_msat;
@@ -237,6 +239,12 @@ wallet_commit_channel(struct lightningd *ld,
 			      tal_arr(NULL, struct channel_state_change *, 0),
 			      funding_psbt,
 			      withheld);
+
+	/* PoC: Liquid asset channel? */
+	channel->liquid_asset = liquid_asset
+		? tal_dup_arr(channel, u8, liquid_asset, ELEMENTS_ASSET_LEN, 0)
+		: NULL;
+	channel->liquid_fee_reserve = liquid_fee_reserve;
 
 	/* Now we finally put it in the database. */
 	wallet_channel_insert(ld->wallet, channel);
@@ -447,7 +455,9 @@ static void opening_funder_finished(struct subd *openingd, const u8 *resp,
 					remote_upfront_shutdown_script,
 					type,
 					fc->funding_psbt,
-					fc->withheld);
+					fc->withheld,
+					fc->liquid_asset,
+					fc->liquid_fee_reserve);
 	if (!channel) {
 		was_pending(command_fail(fc->cmd, LIGHTNINGD,
 					 "Key generation failure"));
@@ -496,6 +506,8 @@ static void opening_fundee_finished(struct subd *openingd,
 	struct peer_fd *peer_fd;
 	struct penalty_base *pbase;
 	struct channel_type *type;
+	u8 *liquid_asset;
+	struct amount_sat liquid_fee_reserve;
 
 	log_debug(uc->log, "Got opening_fundee_finish_response");
 
@@ -523,7 +535,9 @@ static void opening_fundee_finished(struct subd *openingd,
 				     &uc->our_config.channel_reserve,
 				     &local_upfront_shutdown_script,
 				     &remote_upfront_shutdown_script,
-				     &type)) {
+				     &type,
+				     &liquid_asset,
+				     &liquid_fee_reserve)) {
 		log_broken(uc->log, "bad OPENING_FUNDEE_REPLY %s",
 			   tal_hex(reply, reply));
 		uncommitted_channel_disconnect(uc, LOG_BROKEN,
@@ -562,7 +576,9 @@ static void opening_fundee_finished(struct subd *openingd,
 					remote_upfront_shutdown_script,
 					type,
 					NULL,
-					false);
+					false,
+					liquid_asset_or_null(liquid_asset),
+					liquid_fee_reserve);
 	if (!channel) {
 		uncommitted_channel_disconnect(uc, LOG_BROKEN,
 					       "Commit channel failed");
@@ -1084,7 +1100,7 @@ static struct command_result *json_fundchannel_complete(struct command *cmd,
 			 * reserve to the same 2-of-2, right after the
 			 * funding output. */
 			if (funding_txout_num
-			    && liquid_channel_asset()
+			    && fc->liquid_asset
 			    && i == *funding_txout_num + 1)
 				continue;
 			if (funding_txout_num)
@@ -1098,7 +1114,7 @@ static struct command_result *json_fundchannel_complete(struct command *cmd,
 		return command_fail(cmd, FUNDING_PSBT_INVALID,
 				    "No output to open channel");
 
-	if (liquid_channel_asset()) {
+	if (fc->liquid_asset) {
 		size_t reserve = *funding_txout_num + 1;
 		if (reserve >= funding_psbt->num_outputs
 		    || !memeq(funding_psbt->outputs[reserve].script,
@@ -1301,6 +1317,21 @@ static void fundchannel_start_after_sync(struct chain_topology *topo,
 /**
  * json_fundchannel_start - Entrypoint for funding a channel
  */
+/* PoC: asset id as printed by elements-cli */
+static struct command_result *param_liquid_asset(struct command *cmd,
+						 const char *name,
+						 const char *buffer,
+						 const jsmntok_t *tok,
+						 u8 **asset)
+{
+	*asset = liquid_asset_from_hex(cmd, buffer + tok->start,
+				       tok->end - tok->start);
+	if (*asset)
+		return NULL;
+	return command_fail_badparam(cmd, name, buffer, tok,
+				     "should be a 32-byte asset id");
+}
+
 static struct command_result *json_fundchannel_start(struct command *cmd,
 						     const char *buffer,
 						     const jsmntok_t *obj UNNEEDED,
@@ -1316,6 +1347,8 @@ static struct command_result *json_fundchannel_start(struct command *cmd,
 	u32 *upfront_shutdown_script_wallet_index;
 	struct channel_id tmp_channel_id;
 	struct channel_type *ctype;
+	u8 *liquid_asset;
+	struct amount_sat *liquid_fee_reserve;
 
 	fc->cmd = cmd;
 	fc->cancels = tal_arr(fc, struct command *, 0);
@@ -1333,8 +1366,20 @@ static struct command_result *json_fundchannel_start(struct command *cmd,
 			 p_opt("mindepth", param_u32, &mindepth),
 			 p_opt("reserve", param_sat, &reserve),
 			 p_opt("channel_type", param_channel_type, &ctype),
+			 p_opt("asset", param_liquid_asset, &liquid_asset),
+			 p_opt_def("fee_reserve", param_sat, &liquid_fee_reserve,
+				   AMOUNT_SAT(100000)),
 			 NULL))
 		return command_param_failed();
+
+	/* PoC: Liquid asset channel: balance in @asset, plus an L-BTC fee
+	 * reserve which must follow the funding output. */
+	if (liquid_asset && !chainparams->is_elements)
+		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+				    "asset channels only exist on Liquid");
+	fc->liquid_asset = tal_steal(fc, liquid_asset);
+	fc->liquid_fee_reserve = liquid_asset ? *liquid_fee_reserve
+		: AMOUNT_SAT(0);
 
 	if (ctype) {
 		fc->channel_type = tal_steal(fc, ctype);
@@ -1500,7 +1545,9 @@ static struct command_result *json_fundchannel_start(struct command *cmd,
 			&tmp_channel_id,
 			fc->channel_flags,
 			reserve,
-			fc->channel_type);
+			fc->channel_type,
+			fc->liquid_asset,
+			fc->liquid_fee_reserve);
 
 	if (!topology_synced(cmd->ld->topology)) {
 		struct fundchannel_start_info *info

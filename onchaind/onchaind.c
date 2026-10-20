@@ -9,7 +9,6 @@
 #include <common/initial_commit_tx.h>
 #include <common/keyset.h>
 #include <common/lease_rates.h>
-#include <common/liquid_asset.h>
 #include <common/memleak.h>
 #include <common/peer_billboard.h>
 #include <common/status.h>
@@ -868,12 +867,13 @@ static bool is_mutual_close(const struct tx_parts *tx,
 		} else if (wally_tx_output_scripteq(tx->outputs[i],
 						    local_scriptpubkey)
 			   /* PoC: Liquid asset channels: the opener's L-BTC
-			    * change shares its asset output's script. */
-			   && (!local_matched || liquid_channel_asset())) {
+			    * change shares its asset output's script.  (This
+			    * isn't a commitment tx, checked above.) */
+			   && (!local_matched || chainparams->is_elements)) {
 			local_matched = true;
 		} else if (wally_tx_output_scripteq(tx->outputs[i],
 						    remote_scriptpubkey)
-			   && (!remote_matched || liquid_channel_asset()))
+			   && (!remote_matched || chainparams->is_elements))
 			remote_matched = true;
 		else
 			return false;

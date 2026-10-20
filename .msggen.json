@@ -2077,8 +2077,10 @@
         "FundchannelStartRequest": {
             "FundChannel_Start.amount": 2,
             "FundChannel_Start.announce": 4,
+            "FundChannel_Start.asset": 10,
             "FundChannel_Start.channel_type[]": 9,
             "FundChannel_Start.close_to": 5,
+            "FundChannel_Start.fee_reserve": 11,
             "FundChannel_Start.feerate": 3,
             "FundChannel_Start.id": 1,
             "FundChannel_Start.mindepth": 7,
@@ -2333,6 +2335,7 @@
         },
         "InvoiceRequest": {
             "Invoice.amount_msat": 10,
+            "Invoice.asset": 11,
             "Invoice.cltv": 6,
             "Invoice.deschashonly": 9,
             "Invoice.description": 2,
@@ -8440,6 +8443,10 @@
             "added": "pre-v0.10.1",
             "deprecated": null
         },
+        "FundChannel_Start.asset": {
+            "added": "v26.09",
+            "deprecated": null
+        },
         "FundChannel_Start.channel_type": {
             "added": "v24.02",
             "deprecated": null
@@ -8458,6 +8465,10 @@
         },
         "FundChannel_Start.close_to": {
             "added": "pre-v0.10.1",
+            "deprecated": null
+        },
+        "FundChannel_Start.fee_reserve": {
+            "added": "v26.09",
             "deprecated": null
         },
         "FundChannel_Start.feerate": {
@@ -9146,6 +9157,10 @@
         },
         "Invoice.amount_msat": {
             "added": "pre-v0.10.1",
+            "deprecated": null
+        },
+        "Invoice.asset": {
+            "added": "v26.09",
             "deprecated": null
         },
         "Invoice.bolt11": {

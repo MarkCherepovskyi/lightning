@@ -92,6 +92,9 @@ msgdata,openingd_funder_start,temporary_channel_id,channel_id,
 msgdata,openingd_funder_start,channel_flags,u8,
 msgdata,openingd_funder_start,reserve,?amount_sat,
 msgdata,openingd_funder_start,channel_type,channel_type,
+msgdata,openingd_funder_start,liquid_asset_len,u16,
+msgdata,openingd_funder_start,liquid_asset,u8,liquid_asset_len
+msgdata,openingd_funder_start,liquid_fee_reserve,amount_sat,
 
 # openingd->master: send back output script for 2-of-2 funding output
 msgtype,openingd_funder_start_reply,6102
@@ -142,6 +145,9 @@ msgdata,openingd_fundee,local_shutdown_scriptpubkey,u8,local_shutdown_len
 msgdata,openingd_fundee,remote_shutdown_len,u16,
 msgdata,openingd_fundee,remote_shutdown_scriptpubkey,u8,remote_shutdown_len
 msgdata,openingd_fundee,channel_type,channel_type,
+msgdata,openingd_fundee,liquid_asset_len,u16,
+msgdata,openingd_fundee,liquid_asset,u8,liquid_asset_len
+msgdata,openingd_fundee,liquid_fee_reserve,amount_sat,
 
 # master -> openingd: do you have a memleak?
 msgtype,openingd_dev_memleak,6033

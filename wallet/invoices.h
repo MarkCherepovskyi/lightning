@@ -89,6 +89,14 @@ bool invoices_find_by_label(struct invoices *invoices,
 bool invoices_find_by_rhash(struct invoices *invoices,
 			    u64 *inv_dbid,
 			    const struct sha256 *rhash);
+
+/* PoC: Liquid asset this invoice must be paid in (NULL: L-BTC). */
+void invoices_set_liquid_asset(struct invoices *invoices,
+			       u64 inv_dbid,
+			       const u8 *asset);
+u8 *invoices_get_liquid_asset(const tal_t *ctx,
+			      struct invoices *invoices,
+			      u64 inv_dbid);
 /**
  * invoices_create_fallback - Add scriptpubkey into invoice_fallbacks for this inv
  *

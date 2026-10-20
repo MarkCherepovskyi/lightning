@@ -5,20 +5,42 @@
 
 /* PROOF OF CONCEPT: Liquid issued-asset channels.
  *
- * If CLN_DEV_LIQUID_ASSET (the asset id as printed by elements-cli) is set in
- * the environment on an Elements network, *every* channel is an asset
- * channel.  The funding transaction pays the asset to the 2-of-2 at output n,
- * and CLN_DEV_LIQUID_FEE_RESERVE_SAT of the policy asset (L-BTC) to the same
- * 2-of-2 at output n+1.  Commitment and closing transactions spend both, and
- * on-chain fees come out of that L-BTC "fee reserve" instead of the opener's
- * balance.  Subdaemons inherit the environment from lightningd. */
+ * An asset channel's funding transaction pays the asset to the 2-of-2 at
+ * output n, and an L-BTC "fee reserve" (put up by the opener) to the same
+ * 2-of-2 at output n+1.  Commitment and closing transactions spend both: the
+ * asset is the channel balance, and on-chain fees come out of the fee reserve
+ * instead of the opener's balance; the rest of the reserve returns to the
+ * opener.  Channels without an asset are ordinary L-BTC channels.
+ *
+ * Assets are 33-byte explicit asset tags (0x01 followed by the asset id in
+ * internal byte order).  On the wire to subdaemons they are a byte array
+ * which is empty for ordinary channels. */
 
-/* The 33-byte explicit asset tag of the channel asset, or NULL if we're not
- * running asset channels. */
+/* Subdaemons each serve one channel: they set its asset (NULL for an
+ * ordinary channel) once they know it, and the transaction builders use it. */
+void liquid_set_channel_asset(const u8 *asset, struct amount_sat fee_reserve);
+
+/* The 33-byte asset tag of this subdaemon's channel, or NULL. */
 const u8 *liquid_channel_asset(void);
 
-/* L-BTC locked in the fee reserve output (only meaningful in asset mode). */
+/* L-BTC locked in the fee reserve output (only valid for asset channels). */
 struct amount_sat liquid_fee_reserve(void);
+
+/* Same asset (NULL meaning L-BTC)? */
+bool liquid_asset_eq(const u8 *a, const u8 *b);
+
+/* Byte array from a wire message (empty means none) to an asset or NULL. */
+const u8 *liquid_asset_or_null(const u8 *arr);
+
+/* tal copy of @asset for wire messages (NULL stays NULL, i.e. empty). */
+u8 *liquid_asset_dup(const tal_t *ctx, const u8 *asset);
+
+/* Asset tag from an asset id as printed by elements-cli (byte-reversed hex),
+ * or NULL if it's not one. */
+u8 *liquid_asset_from_hex(const tal_t *ctx, const char *hex, size_t hexlen);
+
+/* Asset id as printed by elements-cli. */
+char *fmt_liquid_asset(const tal_t *ctx, const u8 *asset);
 
 /* The fee reserve always directly follows the funding output. */
 struct bitcoin_outpoint liquid_fee_reserve_outpoint(const struct bitcoin_outpoint *funding);

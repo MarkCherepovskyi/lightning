@@ -442,6 +442,8 @@ struct channel *new_unsaved_channel(struct peer *peer,
 	channel->forgets = tal_arr(channel, struct command *, 0);
 	channel->funding_psbt = NULL;
 	channel->withheld = false;
+	channel->liquid_asset = NULL;
+	channel->liquid_fee_reserve = AMOUNT_SAT(0);
 	list_add_tail(&peer->channels, &channel->list);
 	channel->rr_number = peer->ld->rr_counter++;
 	tal_add_destructor(channel, destroy_channel);
@@ -732,6 +734,8 @@ struct channel *new_channel(struct peer *peer, u64 dbid,
 						 "We can't be together anymore.");
 	channel->funding_psbt = tal_steal(channel, funding_psbt);
 	channel->withheld = withheld;
+	channel->liquid_asset = NULL;
+	channel->liquid_fee_reserve = AMOUNT_SAT(0);
 	return channel;
 }
 

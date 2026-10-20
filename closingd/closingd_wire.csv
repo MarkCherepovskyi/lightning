@@ -31,6 +31,9 @@ msgdata,closingd_init,fee_negotiation_step,u64,
 msgdata,closingd_init,fee_negotiation_step_unit,u8,
 msgdata,closingd_init,use_quickclose,bool,
 msgdata,closingd_init,shutdown_wrong_funding,?bitcoin_outpoint,
+msgdata,closingd_init,liquid_asset_len,u16,
+msgdata,closingd_init,liquid_asset,u8,liquid_asset_len
+msgdata,closingd_init,liquid_fee_reserve,amount_sat,
 
 # Message for any commands waiting.
 msgtype,closingd_notification,2003

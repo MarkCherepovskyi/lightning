@@ -1221,6 +1221,10 @@ static const struct db_migration dbmigrations[] = {
      /* Clamping is idempotent, so no revert needed */
      NULL, NULL},
     /* ^v26.09 */
+    /* PoC: Liquid asset channels (NULL/0 for ordinary channels). */
+    {SQL("ALTER TABLE channels ADD liquid_asset BLOB DEFAULT NULL;"), NULL},
+    {SQL("ALTER TABLE channels ADD liquid_fee_reserve BIGINT DEFAULT 0;"), NULL},
+    {SQL("ALTER TABLE invoices ADD liquid_asset BLOB DEFAULT NULL;"), NULL},
 };
 
 const struct db_migration *get_db_migrations(size_t *num)

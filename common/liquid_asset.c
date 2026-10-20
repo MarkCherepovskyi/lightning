@@ -7,49 +7,73 @@
 #include <stdlib.h>
 #include <string.h>
 
-static bool initialized;
 static bool asset_mode;
 static u8 asset_tag[ELEMENTS_ASSET_LEN];
 static struct amount_sat fee_reserve;
 
-static void liquid_asset_init(void)
+void liquid_set_channel_asset(const u8 *asset, struct amount_sat reserve)
 {
-	const char *hexid, *reserve;
-	u8 id[ELEMENTS_ASSET_LEN - 1];
-
-	/* Subdaemons only learn the chain from their init message. */
-	if (initialized || !chainparams)
-		return;
-	initialized = true;
-
-	if (!chainparams->is_elements)
-		return;
-
-	hexid = getenv("CLN_DEV_LIQUID_ASSET");
-	if (!hexid || !hex_decode(hexid, strlen(hexid), id, sizeof(id)))
-		return;
-
-	/* elements-cli prints asset ids byte-reversed, like txids. */
-	asset_tag[0] = 0x01;
-	for (size_t i = 0; i < sizeof(id); i++)
-		asset_tag[1 + i] = id[sizeof(id) - 1 - i];
-
-	reserve = getenv("CLN_DEV_LIQUID_FEE_RESERVE_SAT");
-	fee_reserve = amount_sat(reserve ? strtoull(reserve, NULL, 10) : 100000);
-	asset_mode = true;
+	asset_mode = (asset != NULL);
+	if (asset_mode)
+		memcpy(asset_tag, asset, sizeof(asset_tag));
+	fee_reserve = reserve;
 }
 
 const u8 *liquid_channel_asset(void)
 {
-	liquid_asset_init();
 	return asset_mode ? asset_tag : NULL;
 }
 
 struct amount_sat liquid_fee_reserve(void)
 {
-	liquid_asset_init();
 	assert(asset_mode);
 	return fee_reserve;
+}
+
+bool liquid_asset_eq(const u8 *a, const u8 *b)
+{
+	if (!a || !b)
+		return a == b;
+	return memcmp(a, b, ELEMENTS_ASSET_LEN) == 0;
+}
+
+const u8 *liquid_asset_or_null(const u8 *arr)
+{
+	if (!arr || tal_bytelen(arr) != ELEMENTS_ASSET_LEN)
+		return NULL;
+	return arr;
+}
+
+u8 *liquid_asset_dup(const tal_t *ctx, const u8 *asset)
+{
+	if (!asset)
+		return NULL;
+	return tal_dup_arr(ctx, u8, asset, ELEMENTS_ASSET_LEN, 0);
+}
+
+u8 *liquid_asset_from_hex(const tal_t *ctx, const char *hex, size_t hexlen)
+{
+	u8 id[ELEMENTS_ASSET_LEN - 1];
+	u8 *asset;
+
+	if (!hex_decode(hex, hexlen, id, sizeof(id)))
+		return NULL;
+
+	/* elements-cli prints asset ids byte-reversed, like txids. */
+	asset = tal_arr(ctx, u8, ELEMENTS_ASSET_LEN);
+	asset[0] = 0x01;
+	for (size_t i = 0; i < sizeof(id); i++)
+		asset[1 + i] = id[sizeof(id) - 1 - i];
+	return asset;
+}
+
+char *fmt_liquid_asset(const tal_t *ctx, const u8 *asset)
+{
+	u8 id[ELEMENTS_ASSET_LEN - 1];
+
+	for (size_t i = 0; i < sizeof(id); i++)
+		id[i] = asset[ELEMENTS_ASSET_LEN - 1 - i];
+	return tal_hexstr(ctx, id, sizeof(id));
 }
 
 struct bitcoin_outpoint liquid_fee_reserve_outpoint(const struct bitcoin_outpoint *funding)

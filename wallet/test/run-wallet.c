@@ -256,16 +256,6 @@ void   fatal(const char *fmt UNNEEDED, ...)
 /* Generated stub for fatal_vfmt */
 void  fatal_vfmt(const char *fmt UNNEEDED, va_list ap UNNEEDED)
 { fprintf(stderr, "fatal_vfmt called!\n"); abort(); }
-/* Generated stub for find_txwatch_ */
-struct txwatch *find_txwatch_(struct chain_topology *topo UNNEEDED,
-			      const struct bitcoin_txid *txid UNNEEDED,
-			      enum watch_result (*cb)(struct lightningd *ld UNNEEDED,
-						      const struct bitcoin_txid * UNNEEDED,
-						      const struct bitcoin_tx * UNNEEDED,
-						      unsigned int depth UNNEEDED,
-						      void *arg) UNNEEDED,
-			    void *arg UNNEEDED)
-{ fprintf(stderr, "find_txwatch_ called!\n"); abort(); }
 /* Generated stub for force_peer_disconnect */
 void force_peer_disconnect(struct lightningd *ld UNNEEDED,
 			   const struct peer *peer UNNEEDED,
@@ -420,6 +410,11 @@ bool invoices_find_by_rhash(struct invoices *invoices UNNEEDED,
 			    u64 *inv_dbid UNNEEDED,
 			    const struct sha256 *rhash UNNEEDED)
 { fprintf(stderr, "invoices_find_by_rhash called!\n"); abort(); }
+/* Generated stub for invoices_get_liquid_asset */
+u8 *invoices_get_liquid_asset(const tal_t *ctx UNNEEDED,
+			      struct invoices *invoices UNNEEDED,
+			      u64 inv_dbid UNNEEDED)
+{ fprintf(stderr, "invoices_get_liquid_asset called!\n"); abort(); }
 /* Generated stub for invoices_new */
 struct invoices *invoices_new(const tal_t *ctx UNNEEDED,
 			      struct wallet *wallet UNNEEDED,
@@ -803,6 +798,20 @@ bool watch_scriptpubkey_(const tal_t *ctx UNNEEDED,
 				    void *) UNNEEDED,
 			 void *arg UNNEEDED)
 { fprintf(stderr, "watch_scriptpubkey_ called!\n"); abort(); }
+/* Generated stub for watch_scriptpubkey_asset_ */
+bool watch_scriptpubkey_asset_(const tal_t *ctx UNNEEDED,
+			       struct chain_topology *topo UNNEEDED,
+			       const u8 *scriptpubkey TAKES UNNEEDED,
+			       const struct bitcoin_outpoint *expected_outpoint UNNEEDED,
+			       struct amount_sat expected_amount UNNEEDED,
+			       const u8 *expected_asset UNNEEDED,
+			       void (*cb)(struct lightningd *ld UNNEEDED,
+					  const struct bitcoin_tx *tx UNNEEDED,
+					  u32 outnum UNNEEDED,
+					  const struct txlocator *loc UNNEEDED,
+					  void *) UNNEEDED,
+			       void *arg UNNEEDED)
+{ fprintf(stderr, "watch_scriptpubkey_asset_ called!\n"); abort(); }
 /* Generated stub for watch_splice_inflight */
 void watch_splice_inflight(struct lightningd *ld UNNEEDED,
 			   struct channel_inflight *inflight UNNEEDED)
@@ -817,11 +826,6 @@ struct txowatch *watch_txo(const tal_t *ctx UNNEEDED,
 						   size_t input_num UNNEEDED,
 						   const struct block *block))
 { fprintf(stderr, "watch_txo called!\n"); abort(); }
-/* Generated stub for watchman_unwatch_outpoint */
-void watchman_unwatch_outpoint(struct lightningd *ld UNNEEDED,
-			       const char *owner UNNEEDED,
-			       const struct bitcoin_outpoint *outpoint UNNEEDED)
-{ fprintf(stderr, "watchman_unwatch_outpoint called!\n"); abort(); }
 /* Generated stub for watchman_watch_outpoint */
 void watchman_watch_outpoint(struct lightningd *ld UNNEEDED,
 			     const char *owner UNNEEDED,

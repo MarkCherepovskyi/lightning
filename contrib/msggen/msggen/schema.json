@@ -15410,6 +15410,21 @@
                 "Bit number."
               ]
             }
+          },
+          "asset": {
+            "type": "hex",
+            "added": "v26.09",
+            "description": [
+              "PoC, Liquid only: open an asset channel whose balance is in this issued asset (the asset id as printed by elements-cli). The funding transaction must pay `amount` of the asset to the channel at output n and `fee_reserve` of L-BTC to the channel at output n+1."
+            ]
+          },
+          "fee_reserve": {
+            "type": "sat",
+            "added": "v26.09",
+            "description": [
+              "PoC, Liquid only: L-BTC we put next to an `asset` channel's funding output to pay on-chain fees; the rest comes back to us on close."
+            ],
+            "default": "100000sat"
           }
         },
         "pairedWith": [
@@ -18062,6 +18077,13 @@
               "If True, then the bolt11 returned contains a hash of the *description*, rather than the *description* itself: this allows much longer descriptions, but they must be communicated via some other mechanism."
             ],
             "default": "False"
+          },
+          "asset": {
+            "type": "hex",
+            "added": "v26.09",
+            "description": [
+              "PoC, Liquid only: the invoice must be paid over channels in this issued asset (the asset id as printed by elements-cli); `amount_msat` is in its milli-units."
+            ]
           }
         }
       },

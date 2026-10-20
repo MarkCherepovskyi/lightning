@@ -8,6 +8,7 @@
 #include <common/ecdh.h>
 #include <common/json_command.h>
 #include <common/json_parse.h>
+#include <common/liquid_asset.h>
 #include <common/onion_decode.h>
 #include <common/onionreply.h>
 #include <common/timeout.h>
@@ -18,6 +19,7 @@
 #include <lightningd/peer_htlcs.h>
 #include <lightningd/plugin_hook.h>
 #include <lightningd/subd.h>
+#include <wallet/invoices.h>
 #include <onchaind/onchaind_wiregen.h>
 
 #ifndef SUPERVERBOSE
@@ -537,6 +539,26 @@ static void handle_localpay(struct htlc_in *hin,
 		goto fail;
 	}
 
+	/* PoC: an invoice in a Liquid asset can only be paid over channels
+	 * in that asset, and an ordinary invoice only over L-BTC channels:
+	 * the amounts are just numbers otherwise. */
+	{
+		u64 inv_dbid;
+		if (invoices_find_by_rhash(ld->wallet->invoices, &inv_dbid,
+					   &hin->payment_hash)
+		    && !liquid_asset_eq(invoices_get_liquid_asset(tmpctx,
+								  ld->wallet->invoices,
+								  inv_dbid),
+					hin->key.channel->liquid_asset)) {
+			log_info(hin->key.channel->log,
+				 "Payment for %s arrived in the wrong Liquid asset",
+				 fmt_sha256(tmpctx, &hin->payment_hash));
+			failmsg = failmsg_incorrect_or_unknown(NULL, ld,
+							       hin->msat);
+			goto fail;
+		}
+	}
+
 	htlc_set_add(ld, hin->key.channel->log,
 		     hin->msat, total_msat,
 		     invoice_msat_override,
@@ -794,6 +816,10 @@ struct channel *best_channel(struct lightningd *ld,
 			if (hint->feerate_base != channel->feerate_base
 			    || hint->feerate_ppm != channel->feerate_ppm)
 				continue;
+			/* PoC: ... or it's a different Liquid asset! */
+			if (!liquid_asset_eq(hint->liquid_asset,
+					     channel->liquid_asset))
+				continue;
 		}
 
 		/* Or if this would be below min for channel! */
@@ -845,6 +871,19 @@ static void forward_htlc(struct htlc_in *hin,
 					 FORWARD_LOCAL_FAILED,
 					 WIRE_UNKNOWN_NEXT_PEER);
 		return;
+	}
+
+	/* PoC: Liquid asset channels: amounts are in each channel's asset,
+	 * so forwarding between different assets would swap them 1:1. */
+	if (!liquid_asset_eq(hin->key.channel->liquid_asset,
+			     next->liquid_asset)) {
+		log_info(hin->key.channel->log,
+			 "Refusing to forward between different Liquid assets"
+			 " (to %s)",
+			 fmt_short_channel_id(tmpctx,
+					      channel_scid_or_local_alias(next)));
+		failmsg = towire_unknown_next_peer(tmpctx);
+		goto fail;
 	}
 
 	/* BOLT #7:

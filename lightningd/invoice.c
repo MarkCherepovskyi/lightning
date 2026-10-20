@@ -11,6 +11,7 @@
 #include <common/bolt12_merkle.h>
 #include <common/clock_time.h>
 #include <common/json_command.h>
+#include <common/liquid_asset.h>
 #include <common/randbytes.h>
 #include <common/random_select.h>
 #include <common/timeout.h>
@@ -693,7 +694,24 @@ struct invoice_info {
 	struct json_escape *label;
 	struct chanhints *chanhints;
 	bool custom_fallbacks;
+	/* PoC: Liquid asset to be paid in (NULL: L-BTC) */
+	u8 *liquid_asset;
 };
+
+/* PoC: asset id as printed by elements-cli */
+static struct command_result *param_liquid_invoice_asset(struct command *cmd,
+							 const char *name,
+							 const char *buffer,
+							 const jsmntok_t *tok,
+							 u8 **asset)
+{
+	*asset = liquid_asset_from_hex(cmd, buffer + tok->start,
+				       tok->end - tok->start);
+	if (*asset)
+		return NULL;
+	return command_fail_badparam(cmd, name, buffer, tok,
+				     "should be a 32-byte asset id");
+}
 
 /* Add routehints based on listincoming results: NULL means success. */
 static struct command_result *
@@ -876,6 +894,11 @@ invoice_complete(struct invoice_info *info,
 				    "Duplicate label '%s'",
 				    info->label->s);
 	}
+
+	/* PoC: Liquid asset invoice? */
+	if (info->liquid_asset)
+		invoices_set_liquid_asset(wallet->invoices, inv_dbid,
+					  info->liquid_asset);
 
 	if (info->cmd->ld->unified_invoices && info->b11->fallbacks && !info->custom_fallbacks) {
 		for (size_t i = 0; i < tal_count(info->b11->fallbacks); i++) {
@@ -1146,8 +1169,14 @@ static struct command_result *json_invoice(struct command *cmd,
 				   cmd->ld->config.cltv_final),
 			 p_opt_def("deschashonly", param_bool, &hashonly, false),
 			 p_opt("dev-routes", param_array, &dev_routes),
+			 p_opt("asset", param_liquid_invoice_asset,
+			       &info->liquid_asset),
 			 NULL))
 		return command_param_failed();
+
+	if (info->liquid_asset && !chainparams->is_elements)
+		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+				    "asset invoices only exist on Liquid");
 
 	if (dev_routes && !cmd->ld->developer)
 		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,

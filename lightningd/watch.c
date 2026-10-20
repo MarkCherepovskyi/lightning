@@ -324,6 +324,8 @@ struct scriptpubkeywatch {
 	struct script_with_len swl;
 	struct bitcoin_outpoint expected_outpoint;
 	struct amount_sat expected_amount;
+	/* PoC: Liquid asset the output must be in (NULL: L-BTC) */
+	const u8 *expected_asset;
 	void (*cb)(struct lightningd *ld,
 		   const struct bitcoin_tx *tx,
 		   u32 outnum,
@@ -386,6 +388,24 @@ bool watch_scriptpubkey_(const tal_t *ctx,
 				    void *),
 			 void *arg)
 {
+	return watch_scriptpubkey_asset_(ctx, topo, scriptpubkey,
+					 expected_outpoint, expected_amount,
+					 NULL, cb, arg);
+}
+
+bool watch_scriptpubkey_asset_(const tal_t *ctx,
+			       struct chain_topology *topo,
+			       const u8 *scriptpubkey TAKES,
+			       const struct bitcoin_outpoint *expected_outpoint,
+			       struct amount_sat expected_amount,
+			       const u8 *expected_asset,
+			       void (*cb)(struct lightningd *ld,
+					  const struct bitcoin_tx *tx,
+					  u32 outnum,
+					  const struct txlocator *loc,
+					  void *),
+			       void *arg)
+{
 	struct scriptpubkeywatch *w;
 
 	if (find_watchscriptpubkey(topo->scriptpubkeywatches,
@@ -403,6 +423,9 @@ bool watch_scriptpubkey_(const tal_t *ctx,
 	w->swl.len = tal_bytelen(w->swl.script);
 	w->expected_outpoint = *expected_outpoint;
 	w->expected_amount = expected_amount;
+	w->expected_asset = expected_asset
+		? tal_dup_arr(w, u8, expected_asset, ELEMENTS_ASSET_LEN, 0)
+		: NULL;
 	w->cb = cb;
 	w->arg = arg;
 	scriptpubkeywatch_hash_add(topo->scriptpubkeywatches, w);
@@ -463,10 +486,12 @@ bool watch_check_tx_outputs(const struct chain_topology *topo,
 			}
 			/* PoC: Liquid asset channel funding is in the
 			 * channel asset, not L-BTC. */
-			const u8 *chan_asset = liquid_channel_asset();
-			if (chan_asset
-			    && memeq(outasset.asset, sizeof(outasset.asset),
-				     chan_asset, sizeof(outasset.asset))) {
+			if (w->expected_asset) {
+				if (!memeq(outasset.asset, sizeof(outasset.asset),
+					   w->expected_asset, sizeof(outasset.asset))) {
+					bad_amount = true;
+					continue;
+				}
 				if (!amount_sat_eq(amount_sat(outasset.value),
 						   w->expected_amount)) {
 					bad_amount = true;

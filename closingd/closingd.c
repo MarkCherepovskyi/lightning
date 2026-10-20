@@ -944,6 +944,8 @@ int main(int argc, char *argv[])
 	struct tlv_closing_signed_tlvs_fee_range *our_feerange, **their_feerange;
 	struct bitcoin_outpoint *wrong_funding;
 	bool developer;
+	u8 *liquid_asset;
+	struct amount_sat liquid_fee_reserve;
 
 	developer = subdaemon_setup(argc, argv);
 
@@ -969,8 +971,14 @@ int main(int argc, char *argv[])
 				    &fee_negotiation_step,
 				    &fee_negotiation_step_unit,
 				    &use_quickclose,
-				    &wrong_funding))
+				    &wrong_funding,
+				    &liquid_asset,
+				    &liquid_fee_reserve))
 		master_badmsg(WIRE_CLOSINGD_INIT, msg);
+	/* PoC: Liquid asset channel (if any) for the close tx. */
+	liquid_set_channel_asset(liquid_asset_or_null(liquid_asset),
+				 liquid_fee_reserve);
+	tal_free(liquid_asset);
 
 	/* stdin == requests, 3 == peer, 4 = hsmd */
 	pps = notleak(new_per_peer_state(ctx));

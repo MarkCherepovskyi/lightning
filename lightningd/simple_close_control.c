@@ -46,7 +46,7 @@ const char *close_tx_check(const tal_t *ctx,
 	bool local_matched = false, remote_matched = false;
 	/* PoC: Liquid asset channels also spend the L-BTC fee reserve, and
 	 * the opener's L-BTC change shares the opener's shutdown script. */
-	bool asset = liquid_channel_asset() != NULL;
+	bool asset = channel->liquid_asset != NULL;
 
 	if (asset) {
 		struct bitcoin_outpoint reserve

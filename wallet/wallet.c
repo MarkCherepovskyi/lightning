@@ -2180,6 +2180,11 @@ static struct channel *wallet_stmt2channel(struct wallet *w, struct db_stmt *stm
 			   funding_psbt,
 			   db_col_int(stmt, "withheld"));
 
+	/* PoC: Liquid asset channel? */
+	if (!db_col_is_null(stmt, "liquid_asset"))
+		chan->liquid_asset = db_col_arr(chan, stmt, "liquid_asset", u8);
+	chan->liquid_fee_reserve = db_col_amount_sat(stmt, "liquid_fee_reserve");
+
 	if (!wallet_channel_load_inflights(w, chan)) {
 		tal_free(chan);
 		return NULL;
@@ -2442,6 +2447,8 @@ static bool wallet_channels_load_active(struct wallet *w)
 					", close_attempt_height"
 					", funding_psbt"
 					", withheld"
+					", liquid_asset"
+					", liquid_fee_reserve"
 					" FROM channels"
                                         " WHERE state != ?;")); //? 0
 	db_bind_int(stmt, CLOSED);
@@ -2717,7 +2724,9 @@ void wallet_channel_save(struct wallet *w, struct channel *chan)
 					"  require_confirm_inputs_remote=?,"
 					"  close_attempt_height=?,"
 					"  funding_psbt=?,"
-					"  withheld=?"
+					"  withheld=?,"
+					"  liquid_asset=?,"
+					"  liquid_fee_reserve=?"
 					" WHERE id=?"));
 	db_bind_u64(stmt, chan->their_shachain.id);
 	if (chan->scid)
@@ -2820,6 +2829,12 @@ void wallet_channel_save(struct wallet *w, struct channel *chan)
 	else
 		db_bind_null(stmt);
 	db_bind_int(stmt, chan->withheld);
+	if (chan->liquid_asset)
+		db_bind_blob(stmt, chan->liquid_asset,
+			     tal_bytelen(chan->liquid_asset));
+	else
+		db_bind_null(stmt);
+	db_bind_amount_sat(stmt, chan->liquid_fee_reserve);
 	db_bind_u64(stmt, chan->dbid);
 	db_exec_prepared_v2(take(stmt));
 

@@ -222,8 +222,8 @@ static bool closing_fee_is_acceptable(struct lightningd *ld,
 
 	/* Calculate actual fee (adds in eliminated outputs).  Liquid asset
 	 * channels pay fees from the L-BTC fee reserve, not the funding. */
-	struct amount_sat fee_input = liquid_channel_asset()
-		? liquid_fee_reserve() : channel->funding_sats;
+	struct amount_sat fee_input = channel->liquid_asset
+		? channel->liquid_fee_reserve : channel->funding_sats;
 	fee = calc_tx_fee(fee_input, tx);
 	last_fee = calc_tx_fee(fee_input, channel->last_tx);
 
@@ -413,7 +413,7 @@ void peer_start_closingd(struct channel *channel, struct peer_fd *peer_fd)
 				  | HSM_PERM_COMMITMENT_POINT
 				  /* PoC: Liquid asset channels: closingd signs
 				   * the fee reserve input with hsmd_sign_splice_tx */
-				  | (liquid_channel_asset() ? HSM_PERM_SIGN_SPLICE_TX : 0));
+				  | (channel->liquid_asset ? HSM_PERM_SIGN_SPLICE_TX : 0));
 	if (hsmfd < 0) {
 		log_broken(channel->log, "Could not get hsm fd for closing: %s",
 			   strerror(errno));
@@ -536,7 +536,9 @@ void peer_start_closingd(struct channel *channel, struct peer_fd *peer_fd)
 				       /* Always use quickclose with anchors */
 				       || option_anchor_outputs
 				       || option_anchors_zero_fee_htlc_tx,
-				       channel->shutdown_wrong_funding);
+				       channel->shutdown_wrong_funding,
+				       channel->liquid_asset,
+				       channel->liquid_fee_reserve);
 
 	/* We don't expect a response: it will give us feedback on
 	 * signatures sent and received, then closing_complete. */

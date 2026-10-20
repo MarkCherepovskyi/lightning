@@ -120,6 +120,32 @@ bool watch_scriptpubkey_(const tal_t *ctx,
 				    void *),
 			 void *arg);
 
+/* PoC: same, for an output in Liquid asset @expected_asset (NULL: L-BTC). */
+bool watch_scriptpubkey_asset_(const tal_t *ctx,
+			       struct chain_topology *topo,
+			       const u8 *scriptpubkey TAKES,
+			       const struct bitcoin_outpoint *expected_outpoint,
+			       struct amount_sat expected_amount,
+			       const u8 *expected_asset,
+			       void (*cb)(struct lightningd *ld,
+					  const struct bitcoin_tx *tx,
+					  u32 outnum,
+					  const struct txlocator *loc,
+					  void *),
+			       void *arg);
+
+#define watch_scriptpubkey_asset(ctx, topo, scriptpubkey, expected_outpoint, expected_amount, expected_asset, cb, arg) \
+	watch_scriptpubkey_asset_((ctx), (topo), (scriptpubkey),	\
+				  (expected_outpoint), (expected_amount), \
+				  (expected_asset),			\
+				  typesafe_cb_preargs(void, void *,	\
+						      (cb), (arg),	\
+						      struct lightningd *, \
+						      const struct bitcoin_tx *, \
+						      u32 outnum,	\
+						      const struct txlocator *), \
+				  (arg))
+
 #define watch_scriptpubkey(ctx, topo, scriptpubkey, expected_outpoint, expected_amount, cb, arg) \
 	watch_scriptpubkey_((ctx), (topo), (scriptpubkey),		\
 			    (expected_outpoint), (expected_amount), \

@@ -15,6 +15,7 @@
 #include <ccan/tal/str/str.h>
 #include <common/fee_states.h>
 #include <common/initial_channel.h>
+#include <common/liquid_asset.h>
 #include <common/memleak.h>
 #include <common/peer_billboard.h>
 #include <common/peer_failed.h>
@@ -344,6 +345,16 @@ static u8 *funder_channel_start(struct state *state, u8 channel_flags,
 	 */
 	open_tlvs->channel_type = state->channel_type->features;
 
+	/* PoC: Liquid asset channel: tell them the asset and the size of
+	 * the L-BTC fee reserve we'll put in. */
+	if (liquid_channel_asset()) {
+		open_tlvs->channel_asset
+			= tal_dup_arr(open_tlvs, u8, liquid_channel_asset(),
+				      ELEMENTS_ASSET_LEN, 0);
+		open_tlvs->fee_reserve = tal(open_tlvs, struct amount_sat);
+		*open_tlvs->fee_reserve = liquid_fee_reserve();
+	}
+
 	msg = towire_open_channel(NULL,
 				  &chainparams->genesis_blockhash,
 				  &state->channel_id,
@@ -419,6 +430,19 @@ static u8 *funder_channel_start(struct state *state, u8 channel_flags,
 	if (!accept_tlvs->channel_type) {
 		negotiation_failed(state,
 				   "accept_channel without a channel_type");
+	}
+
+	/* PoC: an asset channel only works if they build the same
+	 * transactions, so they must echo the asset back. */
+	if (!liquid_asset_eq(liquid_channel_asset(),
+			     liquid_asset_or_null(accept_tlvs->channel_asset))) {
+		negotiation_failed(state,
+				   "Peer did not accept Liquid asset channel"
+				   " (asset %s)",
+				   liquid_channel_asset()
+				   ? fmt_liquid_asset(tmpctx,
+						      liquid_channel_asset())
+				   : "none");
 	}
 
 	/* BOLT #2:
@@ -882,6 +906,19 @@ static u8 *fundee_channel(struct state *state, const u8 *open_channel_msg)
 				    "Parsing open_channel %s", tal_hex(tmpctx, open_channel_msg));
 	set_remote_upfront_shutdown(state, open_tlvs->upfront_shutdown_script);
 
+	/* PoC: Liquid asset channel?  Its balance is in the asset, and the
+	 * opener puts up an L-BTC fee reserve next to the funding output. */
+	if (open_tlvs->channel_asset) {
+		if (!chainparams->is_elements
+		    || !liquid_asset_or_null(open_tlvs->channel_asset)
+		    || !open_tlvs->fee_reserve)
+			negotiation_failed(state,
+					   "Bad Liquid asset channel request");
+		liquid_set_channel_asset(open_tlvs->channel_asset,
+					 *open_tlvs->fee_reserve);
+	} else
+		liquid_set_channel_asset(NULL, AMOUNT_SAT(0));
+
 	/* BOLT #2:
 	 *  - if the message doesn't include a `channel_type`:
 	 *    - fail the channel.
@@ -1085,6 +1122,11 @@ static u8 *fundee_channel(struct state *state, const u8 *open_channel_msg)
 	 *  - MUST set `channel_type` to the `channel_type` from `open_channel`
 	 */
 	accept_tlvs->channel_type = state->channel_type->features;
+	/* PoC: confirm we'll run it as an asset channel. */
+	if (liquid_channel_asset())
+		accept_tlvs->channel_asset
+			= tal_dup_arr(accept_tlvs, u8, liquid_channel_asset(),
+				      ELEMENTS_ASSET_LEN, 0);
 
 	msg = towire_accept_channel(NULL, &state->channel_id,
 				    state->localconf.dust_limit,
@@ -1307,7 +1349,11 @@ static u8 *fundee_channel(struct state *state, const u8 *open_channel_msg)
 				     state->localconf.channel_reserve,
 				     state->upfront_shutdown_script[LOCAL],
 				     state->upfront_shutdown_script[REMOTE],
-				     state->channel_type);
+				     state->channel_type,
+				     liquid_asset_dup(tmpctx,
+						      liquid_channel_asset()),
+				     liquid_channel_asset()
+				     ? liquid_fee_reserve() : AMOUNT_SAT(0));
 }
 
 /*~ Standard "peer sent a message, handle it" demuxer.  Though it really only
@@ -1374,6 +1420,8 @@ static u8 *handle_master_in(struct state *state)
 	u16 funding_txout;
 	u32 nonanchor_feerate, anchor_feerate;
 	struct channel_type *ctype;
+	u8 *liquid_asset;
+	struct amount_sat liquid_fee_reserve;
 
 	switch (t) {
 	case WIRE_OPENINGD_FUNDER_START:
@@ -1387,8 +1435,13 @@ static u8 *handle_master_in(struct state *state)
 						    &state->channel_id,
 						    &channel_flags,
 						    &state->reserve,
-						    &ctype))
+						    &ctype,
+						    &liquid_asset,
+						    &liquid_fee_reserve))
 			master_badmsg(WIRE_OPENINGD_FUNDER_START, msg);
+		liquid_set_channel_asset(liquid_asset_or_null(liquid_asset),
+					 liquid_fee_reserve);
+		tal_free(liquid_asset);
 		msg = funder_channel_start(state, channel_flags, nonanchor_feerate, anchor_feerate, ctype);
 		tal_free(ctype);
 

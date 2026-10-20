@@ -1,16 +1,18 @@
 """PoC: Lightning channels denominated in a Liquid issued asset.
 
-See common/liquid_asset.h.  With CLN_DEV_LIQUID_ASSET set, every channel's
-funding tx pays the asset to the 2-of-2 at output n and an L-BTC fee reserve to
-the same 2-of-2 at output n+1; channel transactions take on-chain fees from that
-reserve.  The funding tx is built by elementsd's wallet (CLN's wallet doesn't
-know about assets in this PoC), and only the happy path is covered: open, pay
-across a hop, cooperative close.
+See common/liquid_asset.h.  `fundchannel_start ... asset=<id> fee_reserve=<sat>`
+opens an asset channel: its funding tx pays the asset to the 2-of-2 at output n
+and an L-BTC fee reserve to the same 2-of-2 at output n+1, and channel
+transactions take on-chain fees from that reserve.  Ordinary L-BTC channels keep
+working alongside.  The asset funding tx is built by elementsd's wallet (CLN's
+wallet doesn't know about assets yet), and only the happy path is covered:
+open, pay across a hop, cooperative close.
 
     TEST_NETWORK=liquid-regtest pytest tests/test_liquid_asset_poc.py
 """
 from fixtures import *  # noqa: F401,F403
 from decimal import Decimal
+from pyln.client import RpcError
 from utils import only_one, wait_for, TEST_NETWORK
 
 import pytest
@@ -18,8 +20,9 @@ import struct
 
 
 FEE_RESERVE_SAT = 100_000
-CHANNEL_UNITS = 5_000_000   # asset base units in each channel
-PAY_UNITS = 1_000_000
+CHANNEL_UNITS = 5_000_000   # asset base units in each asset channel
+LBTC_CHANNEL_SAT = 5_000_000
+PAY_MSAT = 1_000_000_000    # 1,000,000 units (asset) or sats (L-BTC)
 
 
 def varint(n):
@@ -62,8 +65,11 @@ def explicit_utxo(bitcoind, asset, amount):
 
 
 def fund_asset_channel(bitcoind, opener, peer, asset, lbtc):
-    start = opener.rpc.fundchannel_start(peer.info['id'], CHANNEL_UNITS,
-                                         announce=False)
+    # (pyln-client's typed wrapper doesn't know the PoC parameters yet)
+    start = opener.rpc.call('fundchannel_start',
+                            {'id': peer.info['id'], 'amount': CHANNEL_UNITS,
+                             'announce': False, 'asset': asset,
+                             'fee_reserve': FEE_RESERVE_SAT})
     funding_spk = bytes.fromhex(start['scriptpubkey'])
 
     x_txid, x_n, x_amount = explicit_utxo(bitcoind, asset, 1)
@@ -84,35 +90,72 @@ def fund_asset_channel(bitcoind, opener, peer, asset, lbtc):
     return bitcoind.rpc.sendrawtransaction(signed['hex'])
 
 
-def outputs_by_asset(bitcoind, txid, asset, lbtc, blockhash=None):
+def outputs_by_asset(bitcoind, txid, blockhash=None):
     tx = (bitcoind.rpc.getrawtransaction(txid, True, blockhash) if blockhash
           else bitcoind.rpc.getrawtransaction(txid, True))
-    units = {asset: [], lbtc: []}
+    units = {}
     for v in tx['vout']:
-        units[v['asset']].append((int(Decimal(str(v['value'])) * 10**8),
-                                  v['scriptPubKey'].get('hex', '')))
+        units.setdefault(v['asset'], []).append(int(Decimal(str(v['value'])) * 10**8))
     return tx, units
+
+
+def channel_by_funding(node, txid):
+    return only_one([c for c in node.rpc.listpeerchannels()['channels']
+                     if c['funding_txid'] == txid])
+
+
+def pay_via(l1, l2, l3, funding12, funding23, inv):
+    """Pay inv from l1 to l3, forcing the l1->l2 and l2->l3 channels."""
+    ch12 = channel_by_funding(l1, funding12)
+    ch23 = channel_by_funding(l2, funding23)
+    fee = ch23['fee_base_msat'] + PAY_MSAT * ch23['fee_proportional_millionths'] // 10**6 + 1000
+    final = l3.rpc.decode(inv['bolt11'])['min_final_cltv_expiry'] + 1
+    # Private channels: l2 only forwards via its own alias for l2->l3.
+    route = [{'id': l2.info['id'], 'channel': ch12['short_channel_id'],
+              'amount_msat': PAY_MSAT + fee,
+              'delay': final + ch23['updates']['local']['cltv_expiry_delta']},
+             {'id': l3.info['id'], 'channel': ch23['alias']['local'],
+              'amount_msat': PAY_MSAT, 'delay': final}]
+    l1.rpc.sendpay(route, inv['payment_hash'],
+                   payment_secret=inv['payment_secret'],
+                   amount_msat=PAY_MSAT)
+    return l1.rpc.waitsendpay(inv['payment_hash'])
+
+
+def asset_invoice(node, label, asset):
+    return node.rpc.call('invoice', {'amount_msat': PAY_MSAT, 'label': label,
+                                     'description': label, 'asset': asset})
+
+
+def settled(*nodes):
+    for n in nodes:
+        wait_for(lambda: all(c['htlcs'] == []
+                             for c in n.rpc.listpeerchannels()['channels']))
 
 
 @pytest.mark.skipif(TEST_NETWORK != 'liquid-regtest',
                     reason="Liquid asset channels need elementsd")
-def test_liquid_asset_channel_poc(node_factory, bitcoind, monkeypatch):
+def test_liquid_asset_channel_poc(node_factory, bitcoind):
     lbtc = bitcoind.rpc.dumpassetlabels()['bitcoin']
     asset = bitcoind.rpc.issueasset(1000, 0, False)['asset']
     bitcoind.generate_block(1)
 
-    # Every node (and its subdaemons) runs asset channels in this asset.
-    monkeypatch.setenv('CLN_DEV_LIQUID_ASSET', asset)
-    monkeypatch.setenv('CLN_DEV_LIQUID_FEE_RESERVE_SAT', str(FEE_RESERVE_SAT))
     l1, l2, l3 = node_factory.get_nodes(3)
     l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
     l2.rpc.connect(l3.info['id'], 'localhost', l3.port)
 
-    # Open l1->l2 and l2->l3: asset output + L-BTC fee reserve to the same 2-of-2.
+    # Each hop gets an ordinary L-BTC channel *and* an asset channel.
+    lbtc_funding, asset_funding = {}, {}
     for opener, peer in ((l1, l2), (l2, l3)):
+        opener.fundwallet(10**7)
+        lbtc_funding[opener] = opener.rpc.fundchannel(peer.info['id'],
+                                                      LBTC_CHANNEL_SAT,
+                                                      announce=False)['txid']
         txid = fund_asset_channel(bitcoind, opener, peer, asset, lbtc)
-        tx, units = outputs_by_asset(bitcoind, txid, asset, lbtc)
-        assert (CHANNEL_UNITS, tx['vout'][0]['scriptPubKey']['hex']) in units[asset]
+        asset_funding[opener] = txid
+        tx, _ = outputs_by_asset(bitcoind, txid)
+        # Asset output and L-BTC fee reserve, both to the channel's 2-of-2.
+        assert tx['vout'][0]['asset'] == asset
         assert tx['vout'][1]['asset'] == lbtc
         assert tx['vout'][1]['scriptPubKey']['hex'] == tx['vout'][0]['scriptPubKey']['hex']
 
@@ -120,48 +163,61 @@ def test_liquid_asset_channel_poc(node_factory, bitcoind, monkeypatch):
     for n in (l1, l2, l3):
         wait_for(lambda: all(c['state'] == 'CHANNELD_NORMAL'
                              for c in n.rpc.listpeerchannels()['channels']))
-    # l3's invoice needs l2's (private) channel_update for its route hint.
-    wait_for(lambda: 'remote' in only_one(l3.rpc.listpeerchannels()['channels']).get('updates', {}))
+    funding = {'lbtc12': lbtc_funding[l1], 'lbtc23': lbtc_funding[l2],
+               'asset12': asset_funding[l1], 'asset23': asset_funding[l2]}
 
-    # Pay across the hop; amounts are in milli-units of the asset.  All
-    # channels are private, so name l3's channel to get it into the route
-    # hint (otherwise it looks like a dead end from gossip).
-    scid23 = only_one(l3.rpc.listpeerchannels()['channels'])['short_channel_id']
-    inv = l3.rpc.invoice(PAY_UNITS * 1000, 'asset-payment', 'paid in the asset',
-                         exposeprivatechannels=[scid23])
-    l1.rpc.pay(inv['bolt11'])
-    assert only_one(l3.rpc.listinvoices('asset-payment')['invoices'])['status'] == 'paid'
+    # 1. Asset invoice, paid over the asset channels.
+    inv = asset_invoice(l3, 'asset-ok', asset)
+    assert pay_via(l1, l2, l3, funding['asset12'], funding['asset23'], inv)['status'] == 'complete'
 
-    # pay returns on the preimage; wait for the HTLCs to be settled.
-    for n in (l1, l2, l3):
-        wait_for(lambda: all(c['htlcs'] == []
-                             for c in n.rpc.listpeerchannels()['channels']))
+    # 2. Ordinary invoice, paid over the L-BTC channels.
+    inv = l3.rpc.invoice(PAY_MSAT, 'lbtc-ok', 'in L-BTC')
+    assert pay_via(l1, l2, l3, funding['lbtc12'], funding['lbtc23'], inv)['status'] == 'complete'
 
-    expected_peer_units = {}
-    for opener, peer in ((l1, l2), (l2, l3)):
-        ch = only_one(opener.rpc.listpeerchannels(peer.info['id'])['channels'])
-        expected_peer_units[peer.info['id']] = (ch['total_msat'] - ch['to_us_msat']) // 1000
-    assert expected_peer_units[l2.info['id']] > PAY_UNITS     # l2 earned a routing fee
-    assert expected_peer_units[l3.info['id']] == PAY_UNITS
+    # 3. Asset invoice, paid in L-BTC: the receiver refuses.
+    inv = asset_invoice(l3, 'asset-wrong', asset)
+    with pytest.raises(RpcError, match=r'WIRE_INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS'):
+        pay_via(l1, l2, l3, funding['lbtc12'], funding['lbtc23'], inv)
+    l3.daemon.wait_for_log('arrived in the wrong Liquid asset')
 
-    # Cooperative close: spends both outputs, fee comes from the L-BTC reserve.
-    for opener, peer in ((l1, l2), (l2, l3)):
-        res = opener.rpc.close(peer.info['id'])
+    # 4. In on the asset channel, out on the L-BTC channel: l2 refuses to
+    #    swap them 1:1.
+    inv = l3.rpc.invoice(PAY_MSAT, 'cross', 'in L-BTC')
+    with pytest.raises(RpcError, match=r'WIRE_UNKNOWN_NEXT_PEER'):
+        pay_via(l1, l2, l3, funding['asset12'], funding['lbtc23'], inv)
+    l2.daemon.wait_for_log('Refusing to forward between different Liquid assets')
+
+    settled(l1, l2, l3)
+    # Only the two good payments moved funds: one on each kind of channel.
+    for name, peer in (('asset12', l2), ('asset23', l3), ('lbtc12', l2), ('lbtc23', l3)):
+        ch = channel_by_funding(peer, funding[name])
+        assert ch['to_us_msat'] >= PAY_MSAT
+        assert ch['to_us_msat'] < 2 * PAY_MSAT
+
+    # Cooperative closes.  Asset channels spend both outputs and pay the fee
+    # from the L-BTC reserve.
+    for opener, peer, name in ((l1, l2, 'asset12'), (l2, l3, 'asset23'),
+                               (l1, l2, 'lbtc12'), (l2, l3, 'lbtc23')):
+        peer_balance = channel_by_funding(peer, funding[name])['to_us_msat'] // 1000
+        res = opener.rpc.close(channel_by_funding(opener, funding[name])['channel_id'])
         assert res['type'] == 'mutual'
-        # The opener funded via fundchannel_complete and never broadcast the
-        # funding itself, so it leaves broadcasting the close to the peer.
+        # An externally-funded opener leaves broadcasting the close to the peer.
         wait_for(lambda: len(bitcoind.rpc.getrawmempool()) == 1)
         txid = only_one(bitcoind.rpc.getrawmempool())
         blockhash = bitcoind.generate_block(1, wait_for_mempool=txid)[0]
+        tx, units = outputs_by_asset(bitcoind, txid, blockhash)
 
-        tx, units = outputs_by_asset(bitcoind, txid, asset, lbtc, blockhash)
-        assert len(tx['vin']) == 2
-        assert sum(u for u, _ in units[asset]) == CHANNEL_UNITS
-        assert expected_peer_units[peer.info['id']] in [u for u, _ in units[asset]]
-        # L-BTC: the opener's change plus the fee output use up the reserve.
-        assert sum(u for u, _ in units[lbtc]) == FEE_RESERVE_SAT
+        if name.startswith('asset'):
+            assert len(tx['vin']) == 2
+            assert sum(units[asset]) == CHANNEL_UNITS
+            assert peer_balance in units[asset]
+            assert sum(units[lbtc]) == FEE_RESERVE_SAT
+        else:
+            assert len(tx['vin']) == 1
+            assert asset not in units
+            assert peer_balance in units[lbtc]
 
-    # Nobody crashed processing the closes (onchaind sees asset outputs).
+    # Nobody crashed processing the closes.
     bitcoind.generate_block(1)
     for n in (l1, l2, l3):
         n.rpc.getinfo()

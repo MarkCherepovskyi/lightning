@@ -26,6 +26,7 @@
 #include <common/ecdh_hsmd.h>
 #include <common/interactivetx.h>
 #include <common/key_derive.h>
+#include <common/liquid_asset.h>
 #include <common/memleak.h>
 #include <common/msg_queue.h>
 #include <common/onionreply.h>
@@ -6967,6 +6968,8 @@ static void init_channel(struct peer *peer)
 	struct penalty_base *pbases;
 	struct channel_type *channel_type;
 	bool found_locked_inflight;
+	u8 *liquid_asset;
+	struct amount_sat liquid_fee_reserve;
 
 	assert(!(fcntl(MASTER_FD, F_GETFL) & O_NONBLOCK));
 
@@ -7026,9 +7029,15 @@ static void init_channel(struct peer *peer)
 				    &peer->dev_disable_commit,
 				    &pbases,
 				    &peer->splice_state->inflights,
-				    &peer->local_alias)) {
+				    &peer->local_alias,
+				    &liquid_asset,
+				    &liquid_fee_reserve)) {
 		master_badmsg(WIRE_CHANNELD_INIT, msg);
 	}
+	/* PoC: Liquid asset channel (if any) for the tx builders. */
+	liquid_set_channel_asset(liquid_asset_or_null(liquid_asset),
+				 liquid_fee_reserve);
+	tal_free(liquid_asset);
 
 	peer->final_index = tal_dup(peer, u32, &final_index);
 	peer->final_ext_key = tal_dup(peer, struct ext_key, &final_ext_key);

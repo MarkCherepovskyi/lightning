@@ -5784,6 +5784,7 @@ impl From<requests::InvoiceRequest> for pb::InvoiceRequest {
     fn from(c: requests::InvoiceRequest) -> Self {
         Self {
             amount_msat: Some(c.amount_msat.into()), // Rule #2 for type msat_or_any
+            asset: c.asset.map(|v| hex::decode(v).unwrap()), // Rule #2 for type hex?
             cltv: c.cltv, // Rule #2 for type u32?
             deschashonly: c.deschashonly, // Rule #2 for type boolean?
             description: c.description, // Rule #2 for type string
@@ -6315,9 +6316,11 @@ impl From<requests::FundchannelStartRequest> for pb::FundchannelStartRequest {
         Self {
             amount: Some(c.amount.into()), // Rule #2 for type sat
             announce: c.announce, // Rule #2 for type boolean?
+            asset: c.asset.map(|v| hex::decode(v).unwrap()), // Rule #2 for type hex?
             // Field: FundChannel_Start.channel_type[]
             channel_type: c.channel_type.map(|arr| arr.into_iter().map(|i| i.into()).collect()).unwrap_or(vec![]), // Rule #3
             close_to: c.close_to, // Rule #2 for type string?
+            fee_reserve: c.fee_reserve.map(|f| f.into()), // Rule #2 for type sat?
             feerate: c.feerate.map(|o|o.into()), // Rule #2 for type feerate?
             id: c.id.serialize().to_vec(), // Rule #2 for type pubkey
             mindepth: c.mindepth, // Rule #2 for type u32?
@@ -7910,6 +7913,7 @@ impl From<pb::InvoiceRequest> for requests::InvoiceRequest {
     fn from(c: pb::InvoiceRequest) -> Self {
         Self {
             amount_msat: c.amount_msat.unwrap().into(), // Rule #1 for type msat_or_any
+            asset: c.asset.map(|v| hex::encode(v)), // Rule #1 for type hex?
             cltv: c.cltv, // Rule #1 for type u32?
             deschashonly: c.deschashonly, // Rule #1 for type boolean?
             description: c.description, // Rule #1 for type string
@@ -8407,8 +8411,10 @@ impl From<pb::FundchannelStartRequest> for requests::FundchannelStartRequest {
         Self {
             amount: c.amount.unwrap().into(), // Rule #1 for type sat
             announce: c.announce, // Rule #1 for type boolean?
+            asset: c.asset.map(|v| hex::encode(v)), // Rule #1 for type hex?
             channel_type: Some(c.channel_type.into_iter().map(|s| s).collect()), // Rule #4
             close_to: c.close_to, // Rule #1 for type string?
+            fee_reserve: c.fee_reserve.map(|a| a.into()), // Rule #1 for type sat?
             feerate: c.feerate.map(|a| a.into()), // Rule #1 for type feerate?
             id: PublicKey::from_slice(&c.id).unwrap(), // Rule #1 for type pubkey
             mindepth: c.mindepth, // Rule #1 for type u32?
