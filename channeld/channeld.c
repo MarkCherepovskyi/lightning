@@ -974,8 +974,8 @@ static void send_shutdown_complete(struct peer *peer)
 			take(towire_channeld_shutdown_complete(NULL)));
 	per_peer_state_fdpass_send(MASTER_FD, peer->pps);
 
-	/* Give master a chance to pass the fd along */
-	sleep(1);
+	/* Keep our copy of the fd until master has it */
+	per_peer_state_fdpass_wait(MASTER_FD);
 
 	close(MASTER_FD);
 }

@@ -325,8 +325,8 @@ static void dualopen_shutdown(struct state *state)
 	status_debug("Sent %s with fds",
 		     dualopend_wire_name(fromwire_peektype(msg)));
 
-	/* Give master a chance to pass the fd along */
-	sleep(1);
+	/* Keep our copy of the fd until master has it */
+	per_peer_state_fdpass_wait(REQ_FD);
 
 	/* This frees the entire tal tree. */
 	tal_free(state);
@@ -4617,8 +4617,8 @@ int main(int argc, char *argv[])
 		     dualopend_wire_name(fromwire_peektype(msg)));
 	tal_free(msg);
 
-	/* Give master a chance to pass the fd along */
-	sleep(1);
+	/* Keep our copy of the fd until master has it */
+	per_peer_state_fdpass_wait(REQ_FD);
 
 	/* This frees the entire tal tree. */
 	tal_free(state);

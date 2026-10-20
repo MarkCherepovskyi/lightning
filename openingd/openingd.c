@@ -1592,8 +1592,8 @@ int main(int argc, char *argv[])
 	status_debug("Sent %s with fd",
 		     openingd_wire_name(fromwire_peektype(msg)));
 
-	/* Give master a chance to pass the fd along */
-	sleep(1);
+	/* Keep our copy of the fd until master has it */
+	per_peer_state_fdpass_wait(REQ_FD);
 
 	/* This frees the entire tal tree. */
 	tal_free(state);

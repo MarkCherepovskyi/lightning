@@ -25,6 +25,7 @@ import random
 import re
 import statistics
 import struct
+import subprocess
 import time
 import unittest
 import websocket
@@ -5327,3 +5328,39 @@ def test_parallel_opens(node_factory, bitcoind, executor):
 
     for node in nodes:
         assert not node.daemon.is_in_log(r'Owning subdaemon channeld died \(0\)')
+
+
+def test_openingd_holds_peer_fd_for_slow_lightningd(node_factory, bitcoind, executor):
+    """openingd hands lightningd the peer fd for channeld, and must keep its
+    copy until lightningd has it, however long that takes: on macOS a socket
+    whose only reference is in flight can arrive unable to read (#5808)."""
+    l1, l2 = node_factory.line_graph(2, fundchannel=False)
+    l1.fundwallet(10**7)
+
+    funding_addr = l1.rpc.fundchannel_start(l2.info['id'], 10**6)['funding_address']
+    prep = l1.rpc.txprepare([{funding_addr: 10**6}])
+    l2.daemon.wait_for_log('openingd-chan#1: pid')
+    openingd = l2.subd_pid('openingd')
+
+    # l2's openingd doesn't need lightningd to handle funding_created, so it
+    # sends lightningd the peer fd while it's stopped.  (channeld sends
+    # funding_signed, so fundchannel_complete waits for l2 to resume.)
+    os.kill(l2.daemon.proc.pid, signal.SIGSTOP)
+    try:
+        fut = executor.submit(l1.rpc.fundchannel_complete, l2.info['id'], prep['psbt'])
+        # It used to give lightningd one second, then exit.
+        time.sleep(3)
+        # An exited openingd stays a zombie until lightningd reaps it.
+        stat = subprocess.run(['ps', '-o', 'stat=', '-p', openingd],
+                              stdout=subprocess.PIPE, text=True).stdout.strip()
+    finally:
+        os.kill(l2.daemon.proc.pid, signal.SIGCONT)
+    assert fut.result(TIMEOUT)['commitments_secured']
+    assert stat and not stat.startswith('Z')
+
+    # And channeld got a working peer connection.
+    l1.rpc.txsend(prep['txid'])
+    bitcoind.generate_block(6, wait_for_mempool=1)
+    wait_for(lambda: l1.channel_state(l2) == 'CHANNELD_NORMAL')
+    wait_for(lambda: l2.channel_state(l1) == 'CHANNELD_NORMAL')
+    l1.pay(l2, 100000)
