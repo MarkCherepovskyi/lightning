@@ -156,7 +156,8 @@ static struct io_plan *peer_init_received(struct io_conn *conn,
 			      take(features),
 			      peer->is_websocket,
 			      peer->starttime,
-			      peer->incoming);
+			      peer->incoming,
+			      tlvs->networks);
 }
 
 static struct io_plan *peer_init_hdr_received(struct io_conn *conn,
@@ -239,6 +240,9 @@ struct io_plan *peer_exchange_initmsg(struct io_conn *conn,
 	tlvs = tlv_init_tlvs_new(tmpctx);
 	tlvs->networks = tal_dup_arr(tlvs, struct bitcoin_blkid,
 				     &chainparams->genesis_blockhash, 1, 0);
+	/* PoC: and the Liquid asset gossip networks we follow */
+	for (size_t i = 0; i < tal_count(peer->daemon->liquid_networks); i++)
+		tal_arr_expand(&tlvs->networks, peer->daemon->liquid_networks[i]);
 
 	/* set optional tlv `remote_addr` on incoming IP connections */
 	tlvs->remote_addr = NULL;

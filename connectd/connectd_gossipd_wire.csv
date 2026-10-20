@@ -1,3 +1,4 @@
+#include <bitcoin/block.h>
 #include <common/node_id.h>
 
 # Communication between gossipd and connectd.
@@ -5,6 +6,9 @@ msgtype,gossipd_new_peer,4000
 msgdata,gossipd_new_peer,id,node_id,
 # Did we negotiate OPT_GOSSIP_QUERIES?
 msgdata,gossipd_new_peer,gossip_queries_feature,bool,
+# PoC: Liquid asset gossip networks we both follow
+msgdata,gossipd_new_peer,num_liquid_networks,u16,
+msgdata,gossipd_new_peer,liquid_networks,bitcoin_blkid,num_liquid_networks
 
 # peer is done
 msgtype,gossipd_peer_gone,4101
