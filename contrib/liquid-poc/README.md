@@ -41,6 +41,27 @@ cd contrib/liquid-poc
 
 Or all of it at once: `./lnpoc.py demo`.
 
+## Gossip (announced channels)
+
+`setup` also makes every node follow the asset's gossip network
+(`liquid-gossip-asset=<asset>` in its config, then a restart). Channels opened
+with `--announce` are gossiped; an asset channel goes on the asset's own
+network (the asset id where gossip messages carry the chain hash), so nodes
+that don't follow the asset ignore it.
+
+```bash
+./lnpoc.py open-lbtc  alice bob 5000000 --announce
+./lnpoc.py open-asset alice bob 5000000 --announce
+./lnpoc.py open-lbtc  bob carol 5000000 --announce
+./lnpoc.py open-asset bob carol 5000000 --announce
+./lnpoc.py graph alice                    # alice's gossip map, each channel with its asset
+./lnpoc.py xpay alice carol 1000000000    # xpay finds the path itself, in the asset
+./lnpoc.py xpay alice carol 1000000000 --lbtc
+```
+
+Or `./lnpoc.py demo-gossip`. Routing stays inside one network: `getroutes`
+and `xpay` use L-BTC channels unless given `asset=<id>`.
+
 Other commands: `mine [n]`, `invoice <node> <msat> [--lbtc]`, `down [-v]`
 (`-v` also wipes the chain, the nodes and the saved asset id).
 Any `lightning-cli` / `elements-cli` call works directly too:
@@ -64,8 +85,8 @@ transaction (`lnpoc.py open-asset` does all of this):
 
 ## Paths
 
-`route` / `pay` don't use `xpay`: it doesn't know about assets yet, and these
-channels are private. `lnpoc.py` reads `listpeerchannels` on all three nodes,
+`route` / `pay` work with private channels, so they don't use `xpay` (that
+needs announced channels, see above). `lnpoc.py` reads `listpeerchannels` on all three nodes,
 keeps only normal channels in the requested asset with enough spendable
 balance, takes the shortest path, works out fees and CLTV deltas back from the
 payee, and pays with `sendpay`. Forwarding nodes are addressed by their local
@@ -74,6 +95,7 @@ alias for the channel, as BOLT 2 requires for private channels.
 ## Limits
 
 - No unilateral close for asset channels.
-- One asset per channel; all channels private (no gossip).
+- One asset per channel. Invoices don't carry the asset yet: `xpay` is told
+  it with `asset=`.
 - Regtest has no fee estimates, so the nodes use the minimum feerate (as on
   Bitcoin regtest).

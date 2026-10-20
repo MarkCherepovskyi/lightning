@@ -8,6 +8,9 @@
     ./lnpoc.py pay alice carol 1000000000   # invoice + pay along that path
     ./lnpoc.py channels                     # every channel, per asset
     ./lnpoc.py close alice bob              # cooperative close (+ mine)
+    ./lnpoc.py open-asset alice bob 5000000 --announce   # gossiped on the asset's network
+    ./lnpoc.py graph alice                  # what alice's gossip map holds
+    ./lnpoc.py xpay alice carol 1000000000  # pay with xpay, routes found from gossip
 
 `--lbtc` switches route/pay/close/invoice from the asset to L-BTC; `--asset ID`
 picks another asset than the one `setup` issued.  Run `./lnpoc.py -h` for all
@@ -45,8 +48,10 @@ def run(cmd, check=True):
 
 
 def parse(out):
+    # lightning-cli prints notifications as '# ...' lines before the result.
+    body = '\n'.join(line for line in out.splitlines() if not line.startswith('#'))
     try:
-        return json.loads(out)
+        return json.loads(body)
     except json.JSONDecodeError:
         return out
 
@@ -195,6 +200,23 @@ def unconfidential_address():
     return ecli('getaddressinfo', ecli('getnewaddress'))['unconfidential']
 
 
+def follow_asset(asset):
+    """Have every node follow the asset's gossip network (liquid-gossip-asset
+    in its config), restarting the nodes that didn't yet."""
+    line = f'liquid-gossip-asset={asset}'
+    changed = []
+    for node in NODES:
+        conf = run(COMPOSE + ['exec', '-T', node, 'sh', '-c', 'cat /data/config 2>/dev/null; true'])
+        if line not in conf.splitlines():
+            run(COMPOSE + ['exec', '-T', node, 'sh', '-c', f'echo {line} >> /data/config'])
+            changed.append(node)
+    if changed:
+        print(f"restarting {', '.join(changed)} to follow the asset's gossip ...")
+        run(COMPOSE + ['restart'] + changed)
+        for node in changed:
+            wait_for(node, lambda: ln(node, 'getinfo'))
+
+
 # ---------------------------------------------------------------- commands
 def cmd_up(args):
     subprocess.run(COMPOSE + ['up', '-d', '--build'], check=True)
@@ -224,10 +246,11 @@ def cmd_setup(args):
         save_state(state)
         print(f"issued {args.asset_amount} of asset {state['asset']}")
     ecli('generatetoaddress', 1, ecli('getnewaddress'))
+    follow_asset(state['asset'])
 
     for node in NODES:
         wait_for(node, lambda: ln(node, 'getinfo'))
-        addr = ln(node, 'newaddr')['bech32']
+        addr = ln(node, 'newaddr', addresstype='bech32')['bech32']
         ecli('sendtoaddress', addr, coins(args.fund_sat))
         print(f"{node:6} {node_id(node)}  funded with {args.fund_sat} sat L-BTC")
     mine(1)
@@ -245,7 +268,7 @@ def cmd_mine(args):
 def cmd_open_lbtc(args):
     connect(args.frm, args.to)
     res = ln(args.frm, 'fundchannel', id=node_id(args.to), amount=args.amount,
-             announce=False)
+             announce=args.announce)
     print(f"funding tx {res['txid']}")
     mine(6)
     wait_for('channel', lambda: channel_between(args.frm, args.to, None))
@@ -261,7 +284,7 @@ def cmd_open_asset(args):
 
     # 1. Ask the opener for the channel's funding address (2-of-2).
     start = ln(args.frm, 'fundchannel_start', id=peer, amount=args.units,
-               announce=False, asset=asset, fee_reserve=args.fee_reserve)
+               announce=args.announce, asset=asset, fee_reserve=args.fee_reserve)
     addr = start['funding_address']
 
     # 2. elementsd builds the funding tx: the asset to the channel at output 0,
@@ -388,6 +411,30 @@ def cmd_pay(args):
         raise Fail(f"payment failed: {res}")
 
 
+def cmd_graph(args):
+    """What a node's gossip map (listchannels) holds: one line per direction."""
+    chans = sorted(ln(args.node, 'listchannels')['channels'],
+                   key=lambda c: (c['short_channel_id'], c['direction']))
+    print(f"{'scid':10} {'from':6} {'to':6} {'asset':16} {'public':6} {'capacity':>12}  fee base/ppm")
+    for c in chans:
+        print(f"{c['short_channel_id']:10} {node_name(c['source']):6} "
+              f"{node_name(c['destination']):6} {asset_label(c.get('liquid_asset')):16} "
+              f"{str(c['public']):6} {c['amount_msat'] // 1000:>12}  "
+              f"{c['base_fee_millisatoshi']}/{c['fee_per_millionth']}")
+
+
+def cmd_xpay(args):
+    """Invoice on `to`, paid by xpay on `frm`: routes come from gossip, so
+    the channels must be announced (open-* --announce)."""
+    asset = default_asset(args)
+    label = f"lnpoc-{int(time.time() * 1000)}"
+    inv = ln(args.to, 'invoice', amount_msat=args.amount_msat, label=label,
+             description=f"lnpoc {asset_label(asset)}", asset=asset)
+    res = ln(args.frm, 'xpay', invstring=inv['bolt11'], asset=asset)
+    print(f"xpay {args.frm} -> {args.to}: {res['amount_msat']} msat in {asset_label(asset)}, "
+          f"sent {res['amount_sent_msat']} (fees included), {res['successful_parts']} part(s)")
+
+
 def cmd_close(args):
     asset = default_asset(args)
     c = channel_between(args.frm, args.to, asset)
@@ -412,13 +459,36 @@ def cmd_demo(args):
     if not load_state().get('asset'):
         cmd_setup(argparse.Namespace(asset_amount=1000, fund_sat=10_000_000))
     for a, b in zip(NODES, NODES[1:]):
-        cmd_open_lbtc(argparse.Namespace(frm=a, to=b, amount=5_000_000))
-        cmd_open_asset(argparse.Namespace(frm=a, to=b, units=5_000_000,
-                                          fee_reserve=100_000, asset=None, lbtc=False))
+        cmd_open_lbtc(argparse.Namespace(frm=a, to=b, amount=5_000_000, announce=False))
+        cmd_open_asset(argparse.Namespace(frm=a, to=b, units=5_000_000, fee_reserve=100_000,
+                                          asset=None, lbtc=False, announce=False))
     cmd_channels(args)
     for lbtc in (False, True):
         cmd_pay(argparse.Namespace(frm='alice', to='carol', amount_msat=1_000_000_000,
                                    asset=None, lbtc=lbtc))
+    cmd_balances(args)
+    for a, b in zip(NODES, NODES[1:]):
+        for lbtc in (False, True):
+            cmd_close(argparse.Namespace(frm=a, to=b, asset=None, lbtc=lbtc))
+
+
+def cmd_demo_gossip(args):
+    """Like demo, but every channel is announced: alice learns the paths
+    from gossip (one network per asset) and pays with xpay."""
+    if not load_state().get('asset'):
+        cmd_setup(argparse.Namespace(asset_amount=1000, fund_sat=10_000_000))
+    for a, b in zip(NODES, NODES[1:]):
+        cmd_open_lbtc(argparse.Namespace(frm=a, to=b, amount=5_000_000, announce=True))
+        cmd_open_asset(argparse.Namespace(frm=a, to=b, units=5_000_000, fee_reserve=100_000,
+                                          asset=None, lbtc=False, announce=True))
+    # Both directions of all four channels, as alice's gossip has them.
+    wait_for("alice's gossip", lambda: sum(c['public'] for c in
+                                           ln('alice', 'listchannels')['channels']) >= 8,
+             timeout=300)
+    cmd_graph(argparse.Namespace(node='alice'))
+    for lbtc in (False, True):
+        cmd_xpay(argparse.Namespace(frm='alice', to='carol', amount_msat=1_000_000_000,
+                                    asset=None, lbtc=lbtc))
     cmd_balances(args)
     for a, b in zip(NODES, NODES[1:]):
         for lbtc in (False, True):
@@ -451,12 +521,15 @@ def main():
     sp.add_argument('frm', choices=NODES)
     sp.add_argument('to', choices=NODES)
     sp.add_argument('amount', type=int, help='sats')
+    sp.add_argument('--announce', action='store_true', help='announce it (gossip)')
     sp = add('open-asset', cmd_open_asset, 'open an asset channel (asset + L-BTC fee reserve)')
     sp.add_argument('frm', choices=NODES)
     sp.add_argument('to', choices=NODES)
     sp.add_argument('units', type=int, help='asset base units')
     sp.add_argument('--fee-reserve', type=int, default=100_000, help='L-BTC sats')
     sp.add_argument('--asset', help='asset id (default: the one `setup` issued)')
+    sp.add_argument('--announce', action='store_true',
+                    help="announce it, on the asset's own gossip network")
     add('channels', cmd_channels, 'list every channel on every node')
     add('balances', cmd_balances, 'on-chain and per-asset channel balances')
     sp = add('route', cmd_route, 'find a path in one asset', asset=True)
@@ -474,7 +547,15 @@ def main():
     sp = add('close', cmd_close, 'cooperatively close a channel and mine it', asset=True)
     sp.add_argument('frm', choices=NODES)
     sp.add_argument('to', choices=NODES)
+    sp = add('graph', cmd_graph, "a node's gossip map (listchannels)")
+    sp.add_argument('node', choices=NODES)
+    sp = add('xpay', cmd_xpay, 'invoice on `to`, pay it from `frm` with xpay (needs announced channels)',
+             asset=True)
+    sp.add_argument('frm', choices=NODES)
+    sp.add_argument('to', choices=NODES)
+    sp.add_argument('amount_msat', type=int)
     add('demo', cmd_demo, 'setup, open both kinds of channels, pay in both, close')
+    add('demo-gossip', cmd_demo_gossip, 'like demo, with announced channels and xpay')
 
     args = p.parse_args()
     try:
