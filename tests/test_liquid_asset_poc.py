@@ -5,15 +5,15 @@ opens an asset channel: its funding tx pays the asset to the 2-of-2 at output n
 and an L-BTC fee reserve to the same 2-of-2 at output n+1, and channel
 transactions take on-chain fees from that reserve.  Ordinary L-BTC channels keep
 working alongside.  The asset funding tx is built by elementsd's wallet (CLN's
-wallet doesn't know about assets yet), and only the happy path is covered:
-open, pay across a hop, cooperative close.
+wallet doesn't know about assets yet).  Covered: open, pay across a hop,
+cooperative close, and unilateral close without HTLCs in flight.
 
     TEST_NETWORK=liquid-regtest pytest tests/test_liquid_asset_poc.py
 """
 from fixtures import *  # noqa: F401,F403
 from decimal import Decimal
 from pyln.client import RpcError
-from utils import only_one, wait_for, TEST_NETWORK
+from utils import only_one, sync_blockheight, wait_for, TEST_NETWORK
 
 import pytest
 import struct
@@ -64,12 +64,15 @@ def explicit_utxo(bitcoind, asset, amount):
     raise ValueError("no explicit output found")
 
 
-def fund_asset_channel(bitcoind, opener, peer, asset, lbtc, announce=False):
+def fund_asset_channel(bitcoind, opener, peer, asset, lbtc, announce=False,
+                       close_to=None):
     # (pyln-client's typed wrapper doesn't know the PoC parameters yet)
-    start = opener.rpc.call('fundchannel_start',
-                            {'id': peer.info['id'], 'amount': CHANNEL_UNITS,
-                             'announce': announce, 'asset': asset,
-                             'fee_reserve': FEE_RESERVE_SAT})
+    params = {'id': peer.info['id'], 'amount': CHANNEL_UNITS,
+              'announce': announce, 'asset': asset,
+              'fee_reserve': FEE_RESERVE_SAT}
+    if close_to:
+        params['close_to'] = close_to
+    start = opener.rpc.call('fundchannel_start', params)
     funding_spk = bytes.fromhex(start['scriptpubkey'])
 
     x_txid, x_n, x_amount = explicit_utxo(bitcoind, asset, 1)
@@ -83,7 +86,9 @@ def fund_asset_channel(bitcoind, opener, peer, asset, lbtc, announce=False):
          (lbtc, l_amount - FEE_RESERVE_SAT - fee, unconfidential(bitcoind)[1]),
          (lbtc, fee, b'')])
     pset = bitcoind.rpc.utxoupdatepsbt(bitcoind.rpc.converttopsbt(raw))
-    opener.rpc.fundchannel_complete(peer.info['id'], pset)
+    # Not withheld: elementsd broadcasts it, and a withheld channel is
+    # simply forgotten on close (pyln-client's default is withhold=True).
+    opener.rpc.fundchannel_complete(peer.info['id'], pset, withhold=False)
 
     signed = bitcoind.rpc.signrawtransactionwithwallet(raw)
     assert signed['complete']
@@ -206,7 +211,6 @@ def test_liquid_asset_channel_poc(node_factory, bitcoind):
         peer_balance = channel_by_funding(peer, funding[name])['to_us_msat'] // 1000
         res = opener.rpc.close(channel_by_funding(opener, funding[name])['channel_id'])
         assert res['type'] == 'mutual'
-        # An externally-funded opener leaves broadcasting the close to the peer.
         wait_for(lambda: len(bitcoind.rpc.getrawmempool()) == 1)
         txid = only_one(bitcoind.rpc.getrawmempool())
         blockhash = bitcoind.generate_block(1, wait_for_mempool=txid)[0]
@@ -226,3 +230,142 @@ def test_liquid_asset_channel_poc(node_factory, bitcoind):
     bitcoind.generate_block(1)
     for n in (l1, l2, l3):
         n.rpc.getinfo()
+
+
+def mempool_spend_of(bitcoind, txid):
+    """The mempool tx spending an output of txid, if there is one."""
+    for t in bitcoind.rpc.getrawmempool():
+        tx = bitcoind.rpc.getrawtransaction(t, True)
+        if any(vin.get('txid') == txid for vin in tx['vin']):
+            return tx
+    return None
+
+
+def mine_spend_of(bitcoind, txid):
+    """Wait for a tx spending an output of txid, mine it, return it."""
+    wait_for(lambda: mempool_spend_of(bitcoind, txid) is not None)
+    tx = mempool_spend_of(bitcoind, txid)
+    bitcoind.generate_block(1, wait_for_mempool=tx['txid'])
+    return tx
+
+
+def units(vout):
+    return int(Decimal(str(vout['value'])) * 10**8)
+
+
+@pytest.mark.skipif(TEST_NETWORK != 'liquid-regtest',
+                    reason="Liquid asset channels need elementsd")
+@pytest.mark.parametrize("closer", ["opener", "peer"])
+def test_liquid_asset_unilateral_close(node_factory, bitcoind, closer):
+    """Force-close an asset channel (no HTLCs in flight).  The commitment
+    spends both funding outputs, the asset and the L-BTC fee reserve; then
+    each side sweeps its asset output.  Fees are L-BTC: the opener pays them
+    from its fee reserve change (same script as its asset output, so it's
+    swept along), the peer from its wallet.  Assets go where a mutual close
+    would pay them (CLN's wallet can't hold them): `close_to`/`destination`
+    if given, else the channel's default close address."""
+    lbtc = bitcoind.rpc.dumpassetlabels()['bitcoin']
+    asset = bitcoind.rpc.issueasset(1000, 0, False)['asset']
+    bitcoind.generate_block(1)
+
+    l1, l2 = node_factory.get_nodes(2)
+    l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
+    # Only l2 has L-BTC in its wallet: l1's funding comes from elementsd.
+    l2.fundwallet(10**6)
+    assert l1.rpc.listfunds()['outputs'] == []
+
+    # The opener's asset goes to elementsd (close_to, given at open).
+    opener_addr, opener_spk = unconfidential(bitcoind)
+    funding = fund_asset_channel(bitcoind, l1, l2, asset, lbtc,
+                                 close_to=opener_addr)
+    bitcoind.generate_block(6, wait_for_mempool=funding)
+    for n in (l1, l2):
+        wait_for(lambda: only_one(n.rpc.listpeerchannels()['channels'])['state'] == 'CHANNELD_NORMAL')
+
+    # Give l2 a balance, then wait until no HTLC is in flight.
+    inv = asset_invoice(l2, 'balance', asset)
+    ch = channel_by_funding(l1, funding)
+    route = [{'id': l2.info['id'], 'channel': ch['short_channel_id'],
+              'amount_msat': PAY_MSAT,
+              'delay': l2.rpc.decode(inv['bolt11'])['min_final_cltv_expiry'] + 1}]
+    l1.rpc.sendpay(route, inv['payment_hash'],
+                   payment_secret=inv['payment_secret'], amount_msat=PAY_MSAT)
+    assert l1.rpc.waitsendpay(inv['payment_hash'])['status'] == 'complete'
+    settled(l1, l2)
+    peer_units = PAY_MSAT // 1000
+    opener_units = CHANNEL_UNITS - peer_units
+    peer_wallet = sum(o['amount_msat'] for o in l2.rpc.listfunds()['outputs']) // 1000
+
+    # The closer's peer is offline, so `close` goes unilateral.  If the peer
+    # (not the opener) closes, its asset goes to elementsd too.
+    if closer == 'opener':
+        closing, other = l1, l2
+        peer_addr, peer_spk = None, None
+        close_args = {}
+    else:
+        closing, other = l2, l1
+        peer_addr, peer_spk = unconfidential(bitcoind)
+        close_args = {'destination': peer_addr}
+    other.stop()
+    res = closing.rpc.close(ch['channel_id'], unilateraltimeout=1, **close_args)
+    assert res['type'] == 'unilateral'
+
+    # The commitment tx spends both funding outputs, and elementsd takes it.
+    wait_for(lambda: len(bitcoind.rpc.getrawmempool()) == 1)
+    commit_txid = only_one(bitcoind.rpc.getrawmempool())
+    commit = bitcoind.rpc.getrawtransaction(commit_txid, True)
+    assert sorted((vin['txid'], vin['vout']) for vin in commit['vin']) == [(funding, 0), (funding, 1)]
+    bitcoind.generate_block(1, wait_for_mempool=commit_txid)
+    _, commit_units = outputs_by_asset(bitcoind, commit_txid,
+                                       bitcoind.rpc.getbestblockhash())
+    assert sorted(commit_units[asset]) == sorted([opener_units, peer_units])
+    # Fee and L-BTC change come out of the fee reserve.
+    assert sum(commit_units[lbtc]) == FEE_RESERVE_SAT
+
+    # The other side comes back and sweeps its to_remote right away.
+    other.start()
+    remote_sweep = mine_spend_of(bitcoind, commit_txid)
+
+    # The closer sweeps its to_local once the CSV delay is over.
+    bitcoind.generate_block(4)
+    local_sweep = mine_spend_of(bitcoind, commit_txid)
+
+    sweeps = {closing: local_sweep, other: remote_sweep}
+    for node, sweep in sweeps.items():
+        assert all(vin['txid'] != commit_txid or vin['sequence'] in (5, 0xfffffffd)
+                   for vin in sweep['vin'])
+        is_opener = node == l1
+        want_units = opener_units if is_opener else peer_units
+        want_spk = opener_spk if is_opener else peer_spk
+        asset_outs = [v for v in sweep['vout'] if v['asset'] == asset]
+        assert [units(v) for v in asset_outs] == [want_units]
+        if want_spk is not None:
+            assert asset_outs[0]['scriptPubKey']['hex'] == want_spk.hex()
+        commit_inputs = [vin['vout'] for vin in sweep['vin'] if vin['txid'] == commit_txid]
+        if is_opener:
+            # Asset output and the L-BTC change from the fee reserve:
+            # that pays the fee, nothing comes from the wallet.
+            assert len(sweep['vin']) == 2 and len(commit_inputs) == 2
+            assert {commit['vout'][i]['asset'] for i in commit_inputs} == {asset, lbtc}
+        else:
+            # Asset output, plus L-BTC from the wallet for the fee.
+            assert commit_inputs == [i for i in commit_inputs
+                                     if commit['vout'][i]['asset'] == asset]
+            assert len(commit_inputs) == 1 and len(sweep['vin']) >= 2
+
+    # The L-BTC ends up in each side's wallet: the opener's fee reserve
+    # change (minus fees), and what the peer didn't spend on its sweep.
+    bitcoind.generate_block(1)
+    sync_blockheight(bitcoind, [l1, l2])
+    opener_lbtc = [o for o in l1.rpc.listfunds()['outputs']
+                   if o['txid'] == sweeps[l1]['txid']]
+    reserve_change = sum(commit_units[lbtc]) - int(Decimal(str(commit['fee'][lbtc])) * 10**8)
+    assert only_one(opener_lbtc)['amount_msat'] // 1000 < reserve_change
+    assert only_one(opener_lbtc)['amount_msat'] // 1000 > reserve_change - 5000
+    peer_after = sum(o['amount_msat'] for o in l2.rpc.listfunds()['outputs']) // 1000
+    assert peer_wallet - 5000 < peer_after < peer_wallet
+
+    # Everything is resolved; nobody logged anything broken.
+    bitcoind.generate_block(100)
+    for n in (l1, l2):
+        n.daemon.wait_for_log('onchaind complete, forgetting peer')
