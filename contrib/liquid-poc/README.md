@@ -1,6 +1,7 @@
 # Liquid asset channels: local test network
 
-Proof of concept, not for real funds: asset channels can't be force-closed yet.
+Proof of concept, not for real funds: asset channels can be force-closed only
+while no HTLC is in flight, and there are no penalty transactions for them.
 
 A Liquid regtest node (`elementsd`) and three Core Lightning nodes (`alice`,
 `bob`, `carol`) built from this branch, plus `lnpoc.py` to drive them.
@@ -37,6 +38,8 @@ cd contrib/liquid-poc
 
 ./lnpoc.py close alice bob                   # cooperative close of the asset channel (+ mine)
 ./lnpoc.py close alice bob --lbtc
+./lnpoc.py force-close bob carol             # unilateral close, mine until both sides swept
+./lnpoc.py force-close bob carol --to-elements   # ... and bob's asset to an elementsd address
 ```
 
 Or all of it at once: `./lnpoc.py demo`.
@@ -92,9 +95,45 @@ balance, takes the shortest path, works out fees and CLTV deltas back from the
 payee, and pays with `sendpay`. Forwarding nodes are addressed by their local
 alias for the channel, as BOLT 2 requires for private channels.
 
+## Unilateral close
+
+`force-close` stops the peer, so the `close` goes unilateral, then mines
+until both sides have swept their outputs.
+
+- The commitment tx spends both funding outputs: the peer signs the fee
+  reserve input too (`fee_reserve_sig` in `funding_created`, `funding_signed`
+  and `commitment_signed`), so it can always be broadcast.
+- Fees on Liquid are L-BTC, so an asset output can't pay for its own sweep.
+  The opener's L-BTC change from the fee reserve goes to the same script as
+  its asset output, and is swept with it to pay the fee; the other side pays
+  from its L-BTC wallet. Leftover L-BTC returns to the node's wallet.
+- `lightningd`'s wallet can't hold assets, so a swept asset goes where a
+  cooperative close would pay it: the `close_to` address of
+  `fundchannel_start`, else the `destination` of `close`, else the
+  channel's default close address (a key of the node's HD wallet, which
+  `listfunds` doesn't show).
+
 ## Limits
 
-- No unilateral close for asset channels.
+Still missing for asset channels:
+
+- **HTLCs on-chain.** A unilateral close works only without HTLCs in flight.
+  HTLC outputs are in the asset, and HTLC-success/timeout txs are pre-signed
+  and would have to pay their L-BTC fee from somewhere (CLN runs Liquid
+  without anchors). `onchaind` logs such outputs as BROKEN and leaves them
+  unresolved, so the payment stays stuck.
+- **Penalties.** A revoked commitment's asset outputs aren't claimed (BROKEN,
+  ignored); our own to_remote output on it is still swept.
+- **Assets in the wallet.** `lightningd`'s wallet ignores non-L-BTC outputs,
+  so swept assets go to the channel's close address (see above) and don't
+  show up in `listfunds`; funding uses an external wallet (elementsd).
+- Sweeps are rebuilt (with the wallet's current L-BTC) whenever they're
+  rebroadcast, until they confirm, but there's no RBF fee bumping; and an
+  asset left at the default close address can only be spent with an external
+  wallet holding CLN's HD keys.
+- Commitments of channels opened before `fee_reserve_sig` existed can't be
+  broadcast, and both peers must run this version (an older peer doesn't send
+  the signature, and the channel fails).
 - One asset per channel. Invoices don't carry the asset yet: `xpay` is told
   it with `asset=`.
 - Regtest has no fee estimates, so the nodes use the minimum feerate (as on
