@@ -34,6 +34,26 @@ COPY --from=elements /usr/local/bin/elementsd /usr/local/bin/elements-cli /usr/l
 VOLUME /data
 ENTRYPOINT ["elementsd"]
 
+# CLN's pytest suite against elementsd (TEST_NETWORK=liquid-regtest): build
+# tools, the tests' Python packages and elementsd.  No source in the image:
+# run-tests.sh streams the tree in and builds it in a volume.
+FROM debian:bookworm-slim AS pytest
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      build-essential autoconf automake libtool gettext pkg-config git \
+      python3 python3-mako python3-venv lowdown jq ca-certificates \
+      libsodium-dev libsqlite3-dev zlib1g-dev \
+ && rm -rf /var/lib/apt/lists/*
+RUN python3 -m venv /venv \
+ && /venv/bin/pip install --no-cache-dir \
+      'pytest>=8' pytest-xdist pytest-timeout pytest-rerunfailures \
+      ephemeral-port-reserve psycopg2-binary python-bitcoinlib jsonschema \
+      Flask 'cheroot<=10' psutil requests mnemonic \
+      base58 bitstring coincurve cryptography PySocks mako
+COPY --from=elements /usr/local/bin/elementsd /usr/local/bin/elements-cli /usr/local/bin/
+ENV PATH=/venv/bin:${PATH}
+WORKDIR /build
+
 # Core Lightning from this source tree (the liquid branch).  Rust plugins are
 # left out to keep the build short.
 FROM debian:bookworm-slim AS cln-builder
