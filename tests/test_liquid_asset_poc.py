@@ -16,7 +16,9 @@ from decimal import Decimal
 from pyln.client import RpcError
 from utils import only_one, sync_blockheight, wait_for, TEST_NETWORK, TIMEOUT
 
+import os
 import pytest
+import shutil
 import struct
 import threading
 
@@ -432,18 +434,19 @@ def mine_until_forgotten(bitcoind, nodes, maxblocks=200):
     raise ValueError("onchaind not done after {} blocks".format(maxblocks))
 
 
-def open_asset_channel(node_factory, bitcoind, opts):
+def open_asset_channel(node_factory, bitcoind, opts, wallet_outputs=(2, 2)):
     """l1 opens an asset channel to l2 (when it closes, l1's asset goes to
-    elementsd).  Both get two L-BTC outputs in their wallets, for fees."""
+    elementsd).  They get wallet_outputs L-BTC outputs in their wallets, for
+    fees."""
     lbtc = bitcoind.rpc.dumpassetlabels()['bitcoin']
     asset = bitcoind.rpc.issueasset(1000, 0, False)['asset']
     bitcoind.generate_block(1)
 
     l1, l2 = node_factory.get_nodes(2, opts=opts)
     l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
-    for n in (l1, l2):
-        n.fundwallet(10**6)
-        n.fundwallet(10**6)
+    for n, num in zip((l1, l2), wallet_outputs):
+        for _ in range(num):
+            n.fundwallet(10**6)
 
     opener_addr, _ = unconfidential(bitcoind)
     funding = fund_asset_channel(bitcoind, l1, l2, asset, lbtc,
@@ -454,12 +457,14 @@ def open_asset_channel(node_factory, bitcoind, opts):
     return l1, l2, lbtc, asset
 
 
-def send_asset(l1, l2, amount_msat, payment_hash, payment_secret):
+def send_asset(l1, l2, amount_msat, payment_hash, payment_secret, delay=19,
+               total_msat=None, **kwargs):
+    """Send an HTLC from l1 to l2 (a part of total_msat, if given)."""
     ch = only_one(l1.rpc.listpeerchannels(l2.info['id'])['channels'])
     route = [{'id': l2.info['id'], 'channel': ch['short_channel_id'],
-              'amount_msat': amount_msat, 'delay': 19}]
+              'amount_msat': amount_msat, 'delay': delay}]
     l1.rpc.sendpay(route, payment_hash, payment_secret=payment_secret,
-                   amount_msat=amount_msat)
+                   amount_msat=total_msat or amount_msat, **kwargs)
 
 
 def invoice_units(node, label, asset, amount_msat):
@@ -478,6 +483,49 @@ def is_single_acp_sig(item):
 
 
 HTLC_MSAT = 1_500_000_000
+HOLD_PLUGIN = os.path.join(os.path.dirname(__file__), 'plugins',
+                           'htlc_accepted-hold-all.py')
+
+
+def log_count(node, text):
+    """How many lines of the node's log contain text."""
+    node.daemon.logs_catchup()
+    return sum(text in line for line in node.daemon.logs)
+
+
+def sendpay_statuses(node, payment_hash):
+    return sorted(p['status'] for p in
+                  node.rpc.listsendpays(payment_hash=payment_hash)['payments'])
+
+
+def htlc_spends(txs, commit_txid, asset, units_wanted):
+    """(witness, input index, tx) of the spends of the commitment's asset
+    outputs worth units_wanted."""
+    res = []
+    for v in txs[commit_txid]['vout']:
+        if v.get('asset') != asset or units(v) != units_wanted:
+            continue
+        for tx in txs.values():
+            for innum, vin in enumerate(tx['vin']):
+                if vin.get('txid') == commit_txid and vin['vout'] == v['n']:
+                    res.append((vin['txinwitness'], innum, tx))
+    return res
+
+
+def check_htlc_spend(witness, innum, tx, by_closer, fulfilled):
+    """An HTLC output of the commitment was spent: by the closer's HTLC tx
+    (pre-signed by the peer), or directly by the other side."""
+    if by_closer:
+        # `0 <remotehtlcsig> <localhtlcsig> <preimage or empty> <wscript>`,
+        # at input 0 (with output 0), and the rest is wallet L-BTC.
+        assert len(witness) == 5 and innum == 0
+        assert is_single_acp_sig(witness[1]) and is_single_acp_sig(witness[2])
+        assert len(witness[3]) == (64 if fulfilled else 0)
+    else:
+        # `<sig> <preimage or empty> <wscript>`
+        assert len(witness) == 3
+        assert len(witness[1]) == (64 if fulfilled else 0)
+    assert len(tx['vin']) >= 2
 
 
 @pytest.mark.skipif(TEST_NETWORK != 'liquid-regtest',
@@ -602,72 +650,99 @@ def test_liquid_asset_htlc_onchain(node_factory, bitcoind, outcome, closer):
 
 @pytest.mark.skipif(TEST_NETWORK != 'liquid-regtest',
                     reason="Liquid asset channels need elementsd")
-def test_liquid_asset_penalty(node_factory, bitcoind):
-    """l1 (the opener) broadcasts a revoked commitment of an asset channel,
-    with an HTLC to l2 in it.  l2 takes everything with the revocation key:
-    l1's to_local together with l1's L-BTC fee reserve change (same script,
-    and it pays that penalty's fee), and the HTLC (with L-BTC from l2's
-    wallet for the fee).  All of the asset goes to l2's close address."""
-    # Commitments stop after the first: the HTLC gets added, not fulfilled.
+@pytest.mark.parametrize("cheater", ["opener", "peer"])
+def test_liquid_asset_penalty(node_factory, bitcoind, cheater):
+    """The cheater broadcasts a revoked commitment of an asset channel, with
+    an HTLC from it to the victim in it.  The victim takes everything: the
+    cheater's to_local and the HTLC with the revocation key, and its own
+    to_remote.  The opener's L-BTC fee reserve change has the same script
+    as the opener's output, and is spent with it: if the opener cheated,
+    in its to_local penalty (and pays that fee), else in the victim's
+    to_remote sweep.  The other spends pay their fees from the victim's
+    wallet.  All of the asset goes to the victim's close address."""
     # Feerates identical so we don't get gratuitous commits to update them.
-    opts = {'dev-disable-commit-after': 1,
-            'feerates': (7500, 7500, 7500, 7500)}
+    opts = {'feerates': (7500, 7500, 7500, 7500), 'may_reconnect': True}
+    cheat_opts = {**opts, 'may_fail': True,
+                  # The cheater doesn't know its own revoked commitment.
+                  'broken_log': r"onchaind-chan#[0-9]*: Could not find resolution for output .*: did \*we\* cheat\?"}
     l1, l2, lbtc, asset = open_asset_channel(
         node_factory, bitcoind,
-        [{**opts, 'may_fail': True,
-          # l1 doesn't know its own revoked commitment.
-          'broken_log': r"onchaind-chan#[0-9]*: Could not find resolution for output .*: did \*we\* cheat\?"},
-         opts])
+        [cheat_opts, opts] if cheater == 'opener' else [opts, cheat_opts])
+    bad, victim = (l1, l2) if cheater == 'opener' else (l2, l1)
 
-    inv = invoice_units(l2, 'cheat', asset, HTLC_MSAT)
-    send_asset(l1, l2, HTLC_MSAT, inv['payment_hash'], inv['payment_secret'])
-    l1.daemon.wait_for_log('dev-disable-commit-after: disabling')
-    l2.daemon.wait_for_log('dev-disable-commit-after: disabling')
-    # l1 got l2's commitment_signed with the HTLC: keep that commitment.
-    l1.daemon.wait_for_log('got commitsig')
-    cheat = l1.rpc.dev_sign_last_tx(l2.info['id'])['tx']
-
-    l1.rpc.dev_reenable_commit(l2.info['id'])
-    l2.rpc.dev_reenable_commit(l1.info['id'])
+    # Both get a balance.
+    inv = invoice_units(l2, 'balance', asset, 2 * PAY_MSAT)
+    send_asset(l1, l2, 2 * PAY_MSAT, inv['payment_hash'], inv['payment_secret'])
     assert l1.rpc.waitsendpay(inv['payment_hash'])['status'] == 'complete'
     settled(l1, l2)
-    spk2 = close_to(l2)
-    lbtc_before = wallet_sats(l2)
+
+    # From the next commitment on, commitments stop: the cheater's HTLC
+    # gets added, not fulfilled.
+    for n in (l1, l2):
+        n.stop()
+        n.daemon.opts['dev-disable-commit-after'] = 1
+        n.start()
+    l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
+    for n in (l1, l2):
+        wait_for(lambda: only_one(n.rpc.listpeerchannels()['channels'])['peer_connected'])
+
+    inv = invoice_units(victim, 'cheat', asset, HTLC_MSAT)
+    send_asset(bad, victim, HTLC_MSAT, inv['payment_hash'], inv['payment_secret'])
+    bad.daemon.wait_for_log('dev-disable-commit-after: disabling')
+    victim.daemon.wait_for_log('dev-disable-commit-after: disabling')
+    # The cheater got the victim's commitment_signed with the HTLC: keep that
+    # commitment.
+    bad.daemon.wait_for_log('got commitsig')
+    cheat = bad.rpc.dev_sign_last_tx(victim.info['id'])['tx']
+
+    bad.rpc.dev_reenable_commit(victim.info['id'])
+    victim.rpc.dev_reenable_commit(bad.info['id'])
+    assert bad.rpc.waitsendpay(inv['payment_hash'])['status'] == 'complete'
+    settled(l1, l2)
+    spk = close_to(victim)
+    lbtc_before = wallet_sats(victim)
 
     commit_txid = bitcoind.rpc.sendrawtransaction(cheat)
     commit_height = bitcoind.rpc.getblockcount() + 1
     bitcoind.generate_block(1, wait_for_mempool=commit_txid)
-    l2.daemon.wait_for_logs(['Telling lightningd about OUR_PENALTY_TX to resolve'
-                             ' THEIR_REVOKED_UNILATERAL/DELAYED_CHEAT_OUTPUT_TO_THEM',
-                             'Telling lightningd about OUR_PENALTY_TX to resolve'
-                             ' THEIR_REVOKED_UNILATERAL/THEIR_HTLC'])
-    mine_until_forgotten(bitcoind, [l2])
+    victim.daemon.wait_for_logs(['Telling lightningd about OUR_PENALTY_TX to resolve'
+                                 ' THEIR_REVOKED_UNILATERAL/DELAYED_CHEAT_OUTPUT_TO_THEM',
+                                 'Telling lightningd about OUR_PENALTY_TX to resolve'
+                                 ' THEIR_REVOKED_UNILATERAL/THEIR_HTLC'])
+    mine_until_forgotten(bitcoind, [victim])
 
     txs = chain_txs(bitcoind, commit_height)
     commit = txs[commit_txid]
-    # l1's to_local, its L-BTC change and the HTLC: all of them penalized.
+    # The cheater's to_local, the HTLC, the victim's to_remote, and the
+    # opener's L-BTC change: every one of them went to the victim.
     outs = [v for v in commit['vout'] if v['scriptPubKey']['type'] != 'fee']
-    assert sorted(v['asset'] for v in outs) == sorted([asset, asset, lbtc])
-    penalties = {spend_of(txs, commit_txid, v['n'])[0]['txid'] for v in outs}
-    assert len(penalties) == 2
-    for txid in penalties:
-        p = txs[txid]
-        from_commit = [vin for vin in p['vin'] if vin.get('txid') == commit_txid]
-        # `<revocation_sig> <1 or revocationpubkey> <wscript>`
-        assert all(len(vin['txinwitness']) == 3 for vin in from_commit)
-        if len(from_commit) == 2:
-            # to_local and the change, which pays the fee.
-            assert {commit['vout'][vin['vout']]['asset'] for vin in from_commit} == {asset, lbtc}
-            assert len(p['vin']) == 2
+    assert sorted(v['asset'] for v in outs) == sorted([asset, asset, asset, lbtc])
+    spends = {spend_of(txs, commit_txid, v['n'])[0]['txid'] for v in outs}
+    penalties = 0
+    for txid in spends:
+        tx = txs[txid]
+        from_commit = [vin for vin in tx['vin'] if vin.get('txid') == commit_txid]
+        assets = sorted(commit['vout'][vin['vout']]['asset'] for vin in from_commit)
+        if len(from_commit[0]['txinwitness']) == 3:
+            # A penalty: `<revocation_sig> <1 or revocationpubkey> <wscript>`
+            penalties += 1
         else:
-            # The HTLC, and L-BTC from l2's wallet.
-            assert commit['vout'][from_commit[0]['vout']]['asset'] == asset
-            assert len(p['vin']) >= 2
+            # The victim's to_remote (P2WPKH)
+            assert len(from_commit[0]['txinwitness']) == 2
+            assert asset in assets
+        if lbtc in assets:
+            # The opener's output and its change: that pays the fee.
+            assert assets == sorted([asset, lbtc])
+            assert len(tx['vin']) == 2
+        else:
+            # L-BTC from the victim's wallet.
+            assert len(tx['vin']) >= 2
+    assert penalties == 2 and len(spends) == 3
 
-    assert unspent_asset(txs, asset) == {spk2: CHANNEL_UNITS}
-    # l2 also keeps what the penalties' fees left of l1's L-BTC change.
-    assert (wallet_sats(l2) == lbtc_before + lbtc_change(commit, lbtc)
-            - lbtc_fees(txs, lbtc, [t for t in txs if t not in penalties]))
+    assert unspent_asset(txs, asset) == {spk: CHANNEL_UNITS}
+    # The victim also got the opener's L-BTC change, less its txs' fees.
+    assert (wallet_sats(victim)
+            == lbtc_before + lbtc_change(commit, lbtc) - lbtc_fees(txs, lbtc, [commit_txid]))
 
 
 @pytest.mark.skipif(TEST_NETWORK != 'liquid-regtest',
@@ -766,3 +841,455 @@ def test_liquid_asset_htlc_onchain_upstream(node_factory, bitcoind, outcome):
     if l3_units:
         want[spk[l3]] = l3_units
     assert unspent_asset(txs, asset) == want
+
+
+@pytest.mark.skipif(TEST_NETWORK != 'liquid-regtest',
+                    reason="Liquid asset channels need elementsd")
+@pytest.mark.parametrize("closer", ["opener", "peer"])
+def test_liquid_asset_multihtlc(node_factory, bitcoind, closer):
+    """Force-close an asset channel with HTLCs in flight both ways, which
+    both nodes hold (htlc_accepted) until the commitment is mined:
+
+    - l1->l2: two parts of one payment l2 fulfills (same payment hash, amount
+      and CLTV, so their outputs are identical), one l2 fails, and one so
+      small it's trimmed (no output);
+    - l2->l1: one l1 fulfills, and one it fails.
+
+    Each is resolved the way it should be for whose commitment it is (HTLC
+    txs of the closer, direct spends of the other side), all of them at the
+    same time, with L-BTC from both wallets."""
+    l1, l2, lbtc, asset = open_asset_channel(node_factory, bitcoind, [{}, {}],
+                                             wallet_outputs=(4, 4))
+    # l2 gets a balance, so it can pay l1 too.
+    inv = invoice_units(l2, 'balance', asset, 2 * PAY_MSAT)
+    send_asset(l1, l2, 2 * PAY_MSAT, inv['payment_hash'], inv['payment_secret'])
+    assert l1.rpc.waitsendpay(inv['payment_hash'])['status'] == 'complete'
+    settled(l1, l2)
+    spk = {l1: close_to(l1), l2: close_to(l2)}
+    lbtc_before = {n: wallet_sats(n) for n in (l1, l2)}
+
+    for n in (l1, l2):
+        n.rpc.plugin_start(HOLD_PLUGIN)
+
+    # In asset units; l2 doesn't know B's and D's payment hash, l1 not E's.
+    A, B, C, D, E = 600_000, 700_000, 800_000, 100, 900_000
+    hash_b, hash_d, hash_e = '03' * 32, '04' * 32, '05' * 32
+    inv_a = invoice_units(l2, 'a', asset, 2 * A * 1000)
+    for partid in (1, 2):
+        send_asset(l1, l2, A * 1000, inv_a['payment_hash'], inv_a['payment_secret'],
+                   total_msat=2 * A * 1000, partid=partid, groupid=1)
+    send_asset(l1, l2, B * 1000, hash_b, hash_b, delay=25)
+    send_asset(l1, l2, D * 1000, hash_d, hash_d, delay=21)
+    inv_c = invoice_units(l1, 'c', asset, C * 1000)
+    send_asset(l2, l1, C * 1000, inv_c['payment_hash'], inv_c['payment_secret'],
+               delay=23)
+    send_asset(l2, l1, E * 1000, hash_e, hash_e, delay=27)
+    for n, num in ((l1, 2), (l2, 4)):
+        wait_for(lambda: log_count(n, 'holding htlc') == num)
+
+    closing, other = (l1, l2) if closer == 'opener' else (l2, l1)
+    assert closing.rpc.close(other.info['id'], unilateraltimeout=1)['type'] == 'unilateral'
+    wait_for(lambda: len(bitcoind.rpc.getrawmempool()) == 1)
+    commit_txid = only_one(bitcoind.rpc.getrawmempool())
+    commit_height = bitcoind.rpc.getblockcount() + 1
+    bitcoind.generate_block(1, wait_for_mempool=commit_txid)
+
+    # Now they decide: fulfill what they have invoices for, fail the rest.
+    for n in (l1, l2):
+        n.rpc.releasehtlcs()
+    mine_until_forgotten(bitcoind, [l1, l2])
+
+    assert sendpay_statuses(l1, inv_a['payment_hash']) == ['complete', 'complete']
+    assert sendpay_statuses(l1, hash_b) == ['failed']
+    assert sendpay_statuses(l1, hash_d) == ['failed']
+    assert sendpay_statuses(l2, inv_c['payment_hash']) == ['complete']
+    assert sendpay_statuses(l2, hash_e) == ['failed']
+
+    txs = chain_txs(bitcoind, commit_height)
+    # Who gets each HTLC, and whether it's with the preimage.
+    for amount, winner, fulfilled, num in ((A, l2, True, 2), (B, l1, False, 1),
+                                           (C, l1, True, 1), (E, l2, False, 1)):
+        spends = htlc_spends(txs, commit_txid, asset, amount)
+        assert len(spends) == num
+        for witness, innum, tx in spends:
+            check_htlc_spend(witness, innum, tx, winner == closing, fulfilled)
+    # The trimmed HTLC has no output (its asset is in the opener's).
+    assert htlc_spends(txs, commit_txid, asset, D) == []
+
+    l1_units = CHANNEL_UNITS - 2 * PAY_MSAT // 1000 - 2 * A + C
+    assert unspent_asset(txs, asset) == {spk[l1]: l1_units,
+                                         spk[l2]: CHANNEL_UNITS - l1_units}
+    commit = txs[commit_txid]
+    lbtc_after = {n: wallet_sats(n) for n in (l1, l2)}
+    assert (sum(lbtc_after.values()) == sum(lbtc_before.values())
+            + lbtc_change(commit, lbtc) - lbtc_fees(txs, lbtc, [commit_txid]))
+
+
+@pytest.mark.skipif(TEST_NETWORK != 'liquid-regtest',
+                    reason="Liquid asset channels need elementsd")
+def test_liquid_asset_htlc_onchain_restart(node_factory, bitcoind):
+    """The timeout path (l1 closes: its HTLC-timeout tx, then that tx's
+    delayed output), with restarts on the way: l1 once its commitment is
+    mined, while its HTLC-timeout tx is in the mempool, and once that's
+    mined; l2 while its to_remote sweep is in the mempool.  onchaind replays
+    the close and lightningd rebuilds the same txs: l1 has a single L-BTC
+    output in its wallet, and uses it again."""
+    l1, l2, lbtc, asset = open_asset_channel(
+        node_factory, bitcoind, [{}, {'disconnect': ['-WIRE_UPDATE_FAIL_HTLC']}],
+        wallet_outputs=(1, 2))
+    inv = invoice_units(l2, 'balance', asset, PAY_MSAT)
+    send_asset(l1, l2, PAY_MSAT, inv['payment_hash'], inv['payment_secret'])
+    assert l1.rpc.waitsendpay(inv['payment_hash'])['status'] == 'complete'
+    settled(l1, l2)
+    spk = {l1: close_to(l1), l2: close_to(l2)}
+    lbtc_before = {n: wallet_sats(n) for n in (l1, l2)}
+
+    # l2 doesn't know this payment, and hangs up instead of failing it.
+    payment_hash = '01' * 32
+    send_asset(l1, l2, HTLC_MSAT, payment_hash, payment_hash)
+    l2.daemon.wait_for_log('dev_disconnect: -WIRE_UPDATE_FAIL_HTLC')
+    wait_for(lambda: not only_one(l1.rpc.listpeerchannels()['channels'])['peer_connected'])
+    expiry = only_one(only_one(l1.rpc.listpeerchannels()['channels'])['htlcs'])['expiry']
+    assert l1.rpc.close(l2.info['id'], unilateraltimeout=1)['type'] == 'unilateral'
+    wait_for(lambda: len(bitcoind.rpc.getrawmempool()) == 1)
+    commit_txid = only_one(bitcoind.rpc.getrawmempool())
+    commit_height = bitcoind.rpc.getblockcount() + 1
+    bitcoind.generate_block(1, wait_for_mempool=commit_txid)
+    commit = bitcoind.rpc.getrawtransaction(commit_txid, True,
+                                            bitcoind.rpc.getbestblockhash())
+    htlc_n = only_one([v['n'] for v in commit['vout'] if v.get('asset') == asset
+                       and units(v) == HTLC_MSAT // 1000])
+
+    def mempool_spend(n):
+        for txid in bitcoind.rpc.getrawmempool():
+            tx = bitcoind.rpc.getrawtransaction(txid, True)
+            if any(vin.get('txid') == commit_txid and vin['vout'] == n
+                   for vin in tx['vin']):
+                return tx
+        return None
+
+    l1.daemon.wait_for_log('Telling lightningd about OUR_HTLC_TIMEOUT_TX')
+    l1.restart()
+    l1.daemon.wait_for_log('Telling lightningd about OUR_HTLC_TIMEOUT_TX')
+
+    # l2 sweeps its to_remote right away: restart it while that's waiting.
+    wait_for(lambda: mempool_spend_of(bitcoind, commit_txid) is not None)
+    l2.restart()
+
+    # Once the HTLC expires, l1 broadcasts its HTLC-timeout tx: restart it
+    # while that's in the mempool.
+    sync_blockheight(bitcoind, [l1, l2])
+    bitcoind.generate_block(expiry - bitcoind.rpc.getblockcount())
+    wait_for(lambda: mempool_spend(htlc_n) is not None)
+    htlc_timeout = mempool_spend(htlc_n)
+    l1.restart()
+    # It builds the very same tx again (same wallet L-BTC, same change).
+    l1.daemon.wait_for_log('Liquid asset spend {}'.format(htlc_timeout['hex']))
+    bitcoind.generate_block(1, wait_for_mempool=htlc_timeout['txid'])
+
+    # Its output is swept after the CSV delay, after this restart too.
+    sync_blockheight(bitcoind, [l1, l2])
+    l1.restart()
+    mine_until_forgotten(bitcoind, [l1, l2])
+
+    assert sendpay_statuses(l1, payment_hash) == ['failed']
+    txs = chain_txs(bitcoind, commit_height)
+    witness, innum, tx = only_one(htlc_spends(txs, commit_txid, asset, HTLC_MSAT // 1000))
+    assert tx['txid'] == htlc_timeout['txid']
+    check_htlc_spend(witness, innum, tx, True, False)
+    assert unspent_asset(txs, asset) == {spk[l1]: CHANNEL_UNITS - PAY_MSAT // 1000,
+                                         spk[l2]: PAY_MSAT // 1000}
+    lbtc_after = {n: wallet_sats(n) for n in (l1, l2)}
+    assert (sum(lbtc_after.values()) == sum(lbtc_before.values())
+            + lbtc_change(txs[commit_txid], lbtc) - lbtc_fees(txs, lbtc, [commit_txid]))
+
+
+@pytest.mark.skipif(TEST_NETWORK != 'liquid-regtest',
+                    reason="Liquid asset channels need elementsd")
+def test_liquid_asset_htlc_onchain_no_lbtc(node_factory, bitcoind):
+    """l2 (not the opener) has no L-BTC when it closes with l1's HTLC in
+    flight, so it can't pay for its HTLC-success tx: it retries every block,
+    and gets it in once its wallet has L-BTC.  l1 learns the preimage from
+    it."""
+    l1, l2, lbtc, asset = open_asset_channel(
+        node_factory, bitcoind,
+        [{}, {'disconnect': ['-WIRE_UPDATE_FULFILL_HTLC*2']}],
+        wallet_outputs=(2, 0))
+    inv = invoice_units(l2, 'balance', asset, PAY_MSAT)
+    send_asset(l1, l2, PAY_MSAT, inv['payment_hash'], inv['payment_secret'])
+    assert l1.rpc.waitsendpay(inv['payment_hash'])['status'] == 'complete'
+    settled(l1, l2)
+    spk = {l1: close_to(l1), l2: close_to(l2)}
+    assert wallet_sats(l2) == 0
+    lbtc_before = wallet_sats(l1)
+
+    inv = invoice_units(l2, 'in-flight', asset, HTLC_MSAT)
+    send_asset(l1, l2, HTLC_MSAT, inv['payment_hash'], inv['payment_secret'])
+    l2.daemon.wait_for_log('dev_disconnect: -WIRE_UPDATE_FULFILL_HTLC')
+    wait_for(lambda: not only_one(l2.rpc.listpeerchannels()['channels'])['peer_connected'])
+    assert l2.rpc.close(l1.info['id'], unilateraltimeout=1)['type'] == 'unilateral'
+    wait_for(lambda: len(bitcoind.rpc.getrawmempool()) == 1)
+    commit_txid = only_one(bitcoind.rpc.getrawmempool())
+    commit_height = bitcoind.rpc.getblockcount() + 1
+    bitcoind.generate_block(1, wait_for_mempool=commit_txid)
+
+    # Nothing to pay the fee with: it can't spend the HTLC (l1 sweeps its
+    # to_remote meanwhile).
+    l2.daemon.wait_for_log(r'Liquid asset spend of .*: only 0sat L-BTC .* Will retry')
+    for _ in range(3):
+        sync_blockheight(bitcoind, [l1, l2])
+        bitcoind.generate_block(1)
+    sync_blockheight(bitcoind, [l1, l2])
+    l2.daemon.wait_for_log(r'Liquid asset spend of .*: only 0sat L-BTC .* Will retry')
+    txs = chain_txs(bitcoind, commit_height)
+    assert htlc_spends(txs, commit_txid, asset, HTLC_MSAT // 1000) == []
+    assert sendpay_statuses(l1, inv['payment_hash']) == ['pending']
+
+    # Now it has some.
+    _, fund_txid = l2.fundwallet(10**6)
+    mine_until_forgotten(bitcoind, [l1, l2])
+
+    assert sendpay_statuses(l1, inv['payment_hash']) == ['complete']
+    txs = chain_txs(bitcoind, commit_height)
+    witness, innum, tx = only_one(htlc_spends(txs, commit_txid, asset, HTLC_MSAT // 1000))
+    check_htlc_spend(witness, innum, tx, True, True)
+    l2_units = (PAY_MSAT + HTLC_MSAT) // 1000
+    assert unspent_asset(txs, asset) == {spk[l1]: CHANNEL_UNITS - l2_units,
+                                         spk[l2]: l2_units}
+    assert (wallet_sats(l1) + wallet_sats(l2)
+            == lbtc_before + 10**6 + lbtc_change(txs[commit_txid], lbtc)
+            - lbtc_fees(txs, lbtc, [commit_txid, fund_txid]))
+
+
+@pytest.mark.skipif(TEST_NETWORK != 'liquid-regtest',
+                    reason="Liquid asset channels need elementsd")
+@pytest.mark.skipif(os.getenv('TEST_DB_PROVIDER', 'sqlite3') != 'sqlite3',
+                    reason="Makes use of the sqlite3 db")
+def test_liquid_asset_penalty_htlc_tx(node_factory, bitcoind):
+    """l1 (the opener) cheats from an old database: its revoked commitment
+    has an HTLC from l2 in it, which l1 claims with its HTLC-success tx
+    (it has the preimage) while l2 is offline.  When l2 is back, it takes
+    that tx's output with the revocation key, and l1's to_local with its
+    fee reserve change; it sweeps its own to_remote, and its payment
+    completes (it saw the preimage)."""
+    opts = {'may_reconnect': True, 'dev-no-reconnect': None}
+    l1, l2, lbtc, asset = open_asset_channel(
+        node_factory, bitcoind,
+        [{**opts, 'plugin': HOLD_PLUGIN, 'may_fail': True,
+          # Its outputs get taken
+          'broken_log': 'onchaind.*: Unknown spend'},
+         opts])
+    # l2 gets a balance (l1 holds incoming HTLCs, l2 doesn't).
+    inv = invoice_units(l2, 'balance', asset, 2 * PAY_MSAT)
+    send_asset(l1, l2, 2 * PAY_MSAT, inv['payment_hash'], inv['payment_secret'])
+    assert l1.rpc.waitsendpay(inv['payment_hash'])['status'] == 'complete'
+    settled(l1, l2)
+
+    # l2 pays l1, which holds the HTLC.
+    sticky = invoice_units(l1, 'sticky', asset, HTLC_MSAT)
+    send_asset(l2, l1, HTLC_MSAT, sticky['payment_hash'], sticky['payment_secret'])
+    l1.daemon.wait_for_log('holding htlc')
+
+    # Keep l1's database as it is now.
+    db = os.path.join(l1.daemon.lightning_dir, TEST_NETWORK, 'lightningd.sqlite3')
+    l1.stop()
+    shutil.copyfile(db, db + '.bak')
+    l1.start()
+    l1.daemon.wait_for_log('holding htlc')
+
+    # More payments: that commitment gets revoked.
+    l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
+    push = invoice_units(l2, 'push', asset, PAY_MSAT // 10)
+    send_asset(l1, l2, PAY_MSAT // 10, push['payment_hash'], push['payment_secret'])
+    assert l1.rpc.waitsendpay(push['payment_hash'])['status'] == 'complete'
+    spk = close_to(l2)
+    lbtc_before = wallet_sats(l2)
+
+    # l1 goes back to the old database, and closes while l2 is offline.
+    l1.stop()
+    l2.stop()
+    shutil.copyfile(db + '.bak', db)
+    l1.start()
+    l1.daemon.wait_for_log('holding htlc')
+    assert l1.rpc.close(l2.info['id'], unilateraltimeout=1)['type'] == 'unilateral'
+    wait_for(lambda: len(bitcoind.rpc.getrawmempool()) == 1)
+    commit_txid = only_one(bitcoind.rpc.getrawmempool())
+    commit_height = bitcoind.rpc.getblockcount() + 1
+    bitcoind.generate_block(1, wait_for_mempool=commit_txid)
+
+    # It fulfills the HTLC on-chain, with its HTLC-success tx.
+    l1.rpc.releasehtlcs()
+    l1.daemon.wait_for_log('Telling lightningd about OUR_HTLC_SUCCESS_TX')
+    wait_for(lambda: mempool_spend_of(bitcoind, commit_txid) is not None)
+    htlc_success = mempool_spend_of(bitcoind, commit_txid)
+    bitcoind.generate_block(1, wait_for_mempool=htlc_success['txid'])
+
+    l2.start()
+    l2.daemon.wait_for_logs(['Telling lightningd about OUR_PENALTY_TX to resolve'
+                             ' THEIR_REVOKED_UNILATERAL/DELAYED_CHEAT_OUTPUT_TO_THEM',
+                             'Telling lightningd about OUR_PENALTY_TX to resolve'
+                             ' OUR_HTLC_FULFILL_TO_THEM/DELAYED_CHEAT_OUTPUT_TO_THEM'])
+    mine_until_forgotten(bitcoind, [l2])
+
+    assert sendpay_statuses(l2, sticky['payment_hash']) == ['complete']
+    txs = chain_txs(bitcoind, commit_height)
+    witness, innum, tx = only_one(htlc_spends(txs, commit_txid, asset, HTLC_MSAT // 1000))
+    assert tx['txid'] == htlc_success['txid']
+    check_htlc_spend(witness, innum, tx, True, True)
+    # Its output 0 went to l2, with the revocation key.
+    steal, _ = spend_of(txs, tx['txid'], 0)
+    assert len(steal['vin'][0]['txinwitness']) == 3
+    assert unspent_asset(txs, asset) == {spk: CHANNEL_UNITS}
+    assert (wallet_sats(l2) == lbtc_before + lbtc_change(txs[commit_txid], lbtc)
+            - lbtc_fees(txs, lbtc, [commit_txid, htlc_success['txid']]))
+
+
+@pytest.mark.skipif(TEST_NETWORK != 'liquid-regtest',
+                    reason="Liquid asset channels need elementsd")
+def test_liquid_asset_htlc_onchain_reorg(node_factory, bitcoind):
+    """l1 closes with its HTLC in flight and times it out with its HTLC-timeout
+    tx; then the block with that tx is reorged out.  onchaind restarts, and
+    the asset spends that stopped once that tx spent their input (the
+    HTLC-timeout tx itself) are built and broadcast again, so it all still
+    resolves."""
+    l1, l2, lbtc, asset = open_asset_channel(
+        node_factory, bitcoind, [{}, {'disconnect': ['-WIRE_UPDATE_FAIL_HTLC']}])
+    inv = invoice_units(l2, 'balance', asset, PAY_MSAT)
+    send_asset(l1, l2, PAY_MSAT, inv['payment_hash'], inv['payment_secret'])
+    assert l1.rpc.waitsendpay(inv['payment_hash'])['status'] == 'complete'
+    settled(l1, l2)
+    spk = {l1: close_to(l1), l2: close_to(l2)}
+    lbtc_before = {n: wallet_sats(n) for n in (l1, l2)}
+
+    payment_hash = '06' * 32
+    send_asset(l1, l2, HTLC_MSAT, payment_hash, payment_hash)
+    l2.daemon.wait_for_log('dev_disconnect: -WIRE_UPDATE_FAIL_HTLC')
+    wait_for(lambda: not only_one(l1.rpc.listpeerchannels()['channels'])['peer_connected'])
+    expiry = only_one(only_one(l1.rpc.listpeerchannels()['channels'])['htlcs'])['expiry']
+    assert l1.rpc.close(l2.info['id'], unilateraltimeout=1)['type'] == 'unilateral'
+    wait_for(lambda: len(bitcoind.rpc.getrawmempool()) == 1)
+    commit_txid = only_one(bitcoind.rpc.getrawmempool())
+    commit_height = bitcoind.rpc.getblockcount() + 1
+    bitcoind.generate_block(1, wait_for_mempool=commit_txid)
+
+    # Mine until the HTLC-timeout tx is in a block.
+    sync_blockheight(bitcoind, [l1, l2])
+    bitcoind.generate_block(expiry - bitcoind.rpc.getblockcount())
+    sync_blockheight(bitcoind, [l1, l2])
+    txs = chain_txs(bitcoind, commit_height)
+    htlc_n = only_one([v['n'] for v in txs[commit_txid]['vout'] if v.get('asset') == asset
+                       and units(v) == HTLC_MSAT // 1000])
+    wait_for(lambda: any(vin.get('txid') == commit_txid and vin['vout'] == htlc_n
+                         for t in bitcoind.rpc.getrawmempool()
+                         for vin in bitcoind.rpc.getrawtransaction(t, True)['vin']))
+    htlc_block = bitcoind.generate_block(1)[0]
+    htlc_height = bitcoind.rpc.getblock(htlc_block)['height']
+    sync_blockheight(bitcoind, [l1, l2])
+    l1.daemon.wait_for_log('Telling lightningd about OUR_DELAYED_RETURN_TO_WALLET'
+                           ' to resolve OUR_HTLC_TIMEOUT_TX/DELAYED_OUTPUT_TO_US')
+
+    # Take that block (only) out: the commitment stays confirmed.
+    bitcoind.rpc.invalidateblock(htlc_block)
+    bitcoind.wait_for_log(r'InvalidChainFound: invalid block=.*  height={}'
+                          .format(htlc_height))
+    addr = bitcoind.rpc.getnewaddress()
+    for _ in range(2):
+        bitcoind.rpc.generateblock(addr, [])
+    sync_blockheight(bitcoind, [l1, l2])
+    l1.daemon.wait_for_log('Chain reorganization!')
+    l1.daemon.wait_for_log('Restarting onchaind')
+    l1.daemon.wait_for_log('Telling lightningd about OUR_HTLC_TIMEOUT_TX'
+                           ' to resolve OUR_UNILATERAL/OUR_HTLC')
+    mine_until_forgotten(bitcoind, [l1, l2])
+
+    assert sendpay_statuses(l1, payment_hash) == ['failed']
+    txs = chain_txs(bitcoind, commit_height)
+    witness, innum, tx = only_one(htlc_spends(txs, commit_txid, asset, HTLC_MSAT // 1000))
+    check_htlc_spend(witness, innum, tx, True, False)
+    assert unspent_asset(txs, asset) == {spk[l1]: CHANNEL_UNITS - PAY_MSAT // 1000,
+                                         spk[l2]: PAY_MSAT // 1000}
+    lbtc_after = {n: wallet_sats(n) for n in (l1, l2)}
+    assert (sum(lbtc_after.values()) == sum(lbtc_before.values())
+            + lbtc_change(txs[commit_txid], lbtc) - lbtc_fees(txs, lbtc, [commit_txid]))
+
+
+@pytest.mark.skipif(TEST_NETWORK != 'liquid-regtest',
+                    reason="Liquid asset channels need elementsd")
+@pytest.mark.skipif(os.getenv('TEST_DB_PROVIDER', 'sqlite3') != 'sqlite3',
+                    reason="Makes use of the sqlite3 db")
+def test_liquid_asset_penalty_htlc_timeout_tx(node_factory, bitcoind):
+    """l1 (the opener) cheats from an old database: its revoked commitment
+    has an HTLC from it to l2 (which l2 holds), and l1 times it out with
+    its HTLC-timeout tx while l2 is offline.  When l2 is back, it takes
+    that tx's output with the revocation key, and l1's to_local with its
+    fee reserve change, and sweeps its own to_remote.  (l2 makes l1 wait
+    long enough before it could sweep any of them.)"""
+    opts = {'may_reconnect': True, 'dev-no-reconnect': None}
+    l1, l2, lbtc, asset = open_asset_channel(
+        node_factory, bitcoind,
+        [{**opts, 'may_fail': True,
+          # Its outputs get taken
+          'broken_log': 'onchaind.*: Unknown spend'},
+         {**opts, 'watchtime-blocks': 30}])
+    inv = invoice_units(l2, 'balance', asset, 2 * PAY_MSAT)
+    send_asset(l1, l2, 2 * PAY_MSAT, inv['payment_hash'], inv['payment_secret'])
+    assert l1.rpc.waitsendpay(inv['payment_hash'])['status'] == 'complete'
+    settled(l1, l2)
+
+    # l1 pays l2, which holds the HTLC.  (Not HTLC_MSAT: that's what l1 has
+    # left, and we tell outputs apart by their amount.)
+    htlc_msat = HTLC_MSAT - 100_000_000
+    l2.rpc.plugin_start(HOLD_PLUGIN)
+    send_asset(l1, l2, htlc_msat, '07' * 32, '07' * 32, delay=10)
+    l2.daemon.wait_for_log('holding htlc')
+    expiry = only_one(only_one(l1.rpc.listpeerchannels()['channels'])['htlcs'])['expiry']
+
+    # Keep l1's database as it is now.
+    db = os.path.join(l1.daemon.lightning_dir, TEST_NETWORK, 'lightningd.sqlite3')
+    l1.stop()
+    shutil.copyfile(db, db + '.bak')
+    l1.start()
+
+    # Another HTLC: that commitment gets revoked.
+    l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
+    send_asset(l1, l2, PAY_MSAT // 10, '08' * 32, '08' * 32, delay=40)
+    wait_for(lambda: log_count(l2, 'holding htlc') == 2)
+    spk = close_to(l2)
+    lbtc_before = wallet_sats(l2)
+
+    # l1 goes back to the old database, and closes while l2 is offline.
+    l1.stop()
+    l2.stop()
+    shutil.copyfile(db + '.bak', db)
+    l1.start()
+    assert l1.rpc.close(l2.info['id'], unilateraltimeout=1)['type'] == 'unilateral'
+    wait_for(lambda: len(bitcoind.rpc.getrawmempool()) == 1)
+    commit_txid = only_one(bitcoind.rpc.getrawmempool())
+    commit_height = bitcoind.rpc.getblockcount() + 1
+    bitcoind.generate_block(1, wait_for_mempool=commit_txid)
+
+    # Once the HTLC expires, it times it out with its HTLC-timeout tx.
+    sync_blockheight(bitcoind, [l1])
+    bitcoind.generate_block(expiry - bitcoind.rpc.getblockcount())
+    l1.daemon.wait_for_log('Telling lightningd about OUR_HTLC_TIMEOUT_TX')
+    wait_for(lambda: mempool_spend_of(bitcoind, commit_txid) is not None)
+    htlc_timeout = mempool_spend_of(bitcoind, commit_txid)
+    bitcoind.generate_block(1, wait_for_mempool=htlc_timeout['txid'])
+
+    l2.start()
+    l2.daemon.wait_for_logs(['Telling lightningd about OUR_PENALTY_TX to resolve'
+                             ' THEIR_REVOKED_UNILATERAL/DELAYED_CHEAT_OUTPUT_TO_THEM',
+                             'Telling lightningd about OUR_PENALTY_TX to resolve'
+                             ' THEIR_HTLC_TIMEOUT_TO_THEM/DELAYED_CHEAT_OUTPUT_TO_THEM'])
+    mine_until_forgotten(bitcoind, [l2])
+
+    txs = chain_txs(bitcoind, commit_height)
+    witness, innum, tx = only_one(htlc_spends(txs, commit_txid, asset, htlc_msat // 1000))
+    assert tx['txid'] == htlc_timeout['txid']
+    check_htlc_spend(witness, innum, tx, True, False)
+    # Its output 0 went to l2, with the revocation key.
+    steal, _ = spend_of(txs, tx['txid'], 0)
+    assert len(steal['vin'][0]['txinwitness']) == 3
+    assert unspent_asset(txs, asset) == {spk: CHANNEL_UNITS}
+    assert (wallet_sats(l2) == lbtc_before + lbtc_change(txs[commit_txid], lbtc)
+            - lbtc_fees(txs, lbtc, [commit_txid, htlc_timeout['txid']]))
