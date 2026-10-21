@@ -279,7 +279,8 @@ out:
 }
 
 static void asset_sweeps_input_spent(const struct channel *channel,
-				     const struct bitcoin_outpoint *outpoint);
+				     const struct bitcoin_tx *tx,
+				     size_t input_num);
 
 /**
  * Notify onchaind that an output was spent and register new watches.
@@ -288,7 +289,6 @@ static void onchain_txo_spent(struct channel *channel, const struct bitcoin_tx *
 {
 	u8 *msg;
 	struct bitcoin_txid *txid;
-	struct bitcoin_outpoint spent;
 	/* Onchaind needs all inputs, since it uses those to compare
 	 * with existing spends (which can vary, with feerate changes). */
 	struct tx_parts *parts = tx_parts_from_wally_tx(tmpctx, tx->wtx,
@@ -297,8 +297,7 @@ static void onchain_txo_spent(struct channel *channel, const struct bitcoin_tx *
 	watch_tx_and_outputs(channel, tx);
 
 	/* PoC: Liquid asset channels */
-	wally_tx_input_get_outpoint(&tx->wtx->inputs[input_num], &spent);
-	asset_sweeps_input_spent(channel, &spent);
+	asset_sweeps_input_spent(channel, tx, input_num);
 
 	/* Reply will need this if we want to unwatch */
 	txid = tal(NULL, struct bitcoin_txid);
@@ -1482,6 +1481,8 @@ struct asset_sweep {
 	struct bitcoin_outpoint *wallet_ins;
 	/* Our asset input got spent (by this or another tx): we're done */
 	bool done;
+	/* We said we capped its fee */
+	bool fee_capped;
 	/* In asset_sweeps */
 	struct list_node list;
 };
@@ -1524,24 +1525,54 @@ static struct asset_sweep *new_asset_sweep(struct channel *channel,
 	sweep->htlc_tx_out = NULL;
 	sweep->wallet_ins = tal_arr(sweep, struct bitcoin_outpoint, 0);
 	sweep->done = false;
+	sweep->fee_capped = false;
 	list_add_tail(&asset_sweeps, &sweep->list);
 	tal_add_destructor(sweep, destroy_asset_sweep);
 	return sweep;
 }
 
-/* Once an asset output is spent, by our tx or someone else's, stop
- * broadcasting spends of it, and let go of the wallet L-BTC they used. */
-static void asset_sweeps_input_spent(const struct channel *channel,
-				     const struct bitcoin_outpoint *outpoint)
+static bool tx_spends(const struct bitcoin_tx *tx,
+		      const struct bitcoin_outpoint *outpoint)
 {
+	for (size_t i = 0; i < tx->wtx->num_inputs; i++) {
+		struct bitcoin_outpoint o;
+		wally_tx_input_get_outpoint(&tx->wtx->inputs[i], &o);
+		if (bitcoin_outpoint_eq(&o, outpoint))
+			return true;
+	}
+	return false;
+}
+
+/* Input @input_num of @tx spent a channel output.  If that's an asset
+ * spend's asset input (by our tx or someone else's), stop broadcasting it,
+ * and let go of the wallet L-BTC it used.  If it's only its fee input (the
+ * L-BTC with the same script), e.g. a cheater's once its CSV delay is over,
+ * pay the fee from our wallet instead. */
+static void asset_sweeps_input_spent(const struct channel *channel,
+				     const struct bitcoin_tx *tx,
+				     size_t input_num)
+{
+	struct bitcoin_outpoint spent;
 	struct asset_sweep *sweep;
 
+	wally_tx_input_get_outpoint(&tx->wtx->inputs[input_num], &spent);
 	list_for_each(&asset_sweeps, sweep, list) {
-		if (sweep->channel != channel
-		    || !bitcoin_outpoint_eq(&sweep->out, outpoint))
+		if (sweep->channel != channel)
 			continue;
-		sweep->done = true;
-		tal_resize(&sweep->wallet_ins, 0);
+		if (tx_spends(tx, &sweep->out)) {
+			sweep->done = true;
+			tal_resize(&sweep->wallet_ins, 0);
+		} else if (sweep->fee_in
+			   && bitcoin_outpoint_eq(sweep->fee_in, &spent)) {
+			log_unusual(channel->log,
+				    "Liquid asset spend of %s: its L-BTC input"
+				    " %s was spent elsewhere, paying the fee"
+				    " from our wallet",
+				    fmt_bitcoin_outpoint(tmpctx, &sweep->out),
+				    fmt_bitcoin_outpoint(tmpctx, &spent));
+			sweep->fee_in = tal_free(sweep->fee_in);
+			sweep->fee_in_sats = AMOUNT_SAT(0);
+		}
 	}
 }
 
@@ -1713,6 +1744,19 @@ static bool used_by_other_sweep(const struct asset_sweep *sweep,
 	return false;
 }
 
+/* The fee at @feerate, but no more than the channel's fee reserve: that's
+ * what its opener set aside for on-chain fees, and we can't tell what an
+ * HTLC in the asset is worth in L-BTC. */
+static struct amount_sat asset_sweep_fee(const struct asset_sweep *sweep,
+					 u32 feerate, size_t weight)
+{
+	struct amount_sat fee = amount_tx_fee(feerate, weight);
+
+	if (amount_sat_greater(fee, sweep->channel->liquid_fee_reserve))
+		return sweep->channel->liquid_fee_reserve;
+	return fee;
+}
+
 /* Build and sign the tx.  Without enough L-BTC it pays what it can, and
  * gets rejected: we rebuild it every block until it works. */
 static struct bitcoin_tx *asset_sweep_tx(const tal_t *ctx,
@@ -1721,10 +1765,14 @@ static struct bitcoin_tx *asset_sweep_tx(const tal_t *ctx,
 	struct channel *channel = sweep->channel;
 	struct lightningd *ld = channel->peer->ld;
 	u32 height = get_block_height(ld->topology);
-	u32 feerate = feerate_for_target(ld->topology, sweep->deadline_block);
+	/* (feerate_for_target() gives FEERATE_FLOOR for far deadlines, even
+	 * if that's below what the node relays) */
+	u32 feerate = max_unsigned(feerate_for_target(ld->topology,
+						      sweep->deadline_block),
+				   get_feerate_floor(ld->topology));
 	const struct hsm_utxo **hsm_utxos;
 	struct utxo **all_utxos, **wallet_utxos;
-	struct amount_sat lbtc_in, needed, fee, excess, change;
+	struct amount_sat lbtc_in, needed, fee, change;
 	struct bitcoin_tx *tx;
 	struct wally_psbt *psbt;
 	struct pubkey final_key;
@@ -1766,8 +1814,8 @@ static struct bitcoin_tx *asset_sweep_tx(const tal_t *ctx,
 		struct utxo *utxo = all_utxos[i];
 
 		if (!amount_sat_add(&needed,
-				    amount_tx_fee(feerate,
-						  weight + change_weight()),
+				    asset_sweep_fee(sweep, feerate,
+						    weight + change_weight()),
 				    chainparams->dust_limit))
 			abort();
 		if (amount_sat_greater_eq(lbtc_in, needed))
@@ -1787,9 +1835,20 @@ static struct bitcoin_tx *asset_sweep_tx(const tal_t *ctx,
 		tal_arr_expand(&wallet_utxos, utxo);
 	}
 
-	/* Pay the fee, and the rest back to our wallet. */
-	fee = amount_tx_fee(feerate, weight);
-	if (!amount_sat_sub(&excess, lbtc_in, fee)) {
+	/* Pay the fee (counting a change output), and the rest back to our
+	 * wallet, unless that's dust. */
+	fee = asset_sweep_fee(sweep, feerate, weight + change_weight());
+	if (!sweep->fee_capped
+	    && amount_sat_less(fee, amount_tx_fee(feerate,
+						  weight + change_weight()))) {
+		log_unusual(channel->log,
+			    "Liquid asset spend of %s: capping its fee at the"
+			    " channel's fee reserve, %s (feerate %u)",
+			    fmt_bitcoin_outpoint(tmpctx, &sweep->out),
+			    fmt_amount_sat(tmpctx, fee), feerate);
+		sweep->fee_capped = true;
+	}
+	if (!amount_sat_sub(&change, lbtc_in, fee)) {
 		log_unusual(channel->log,
 			    "Liquid asset spend of %s: only %s L-BTC for a fee"
 			    " of %s (from our wallet: %zu outputs).  Will"
@@ -1798,9 +1857,9 @@ static struct bitcoin_tx *asset_sweep_tx(const tal_t *ctx,
 			    fmt_amount_sat(tmpctx, lbtc_in),
 			    fmt_amount_sat(tmpctx, fee),
 			    tal_count(wallet_utxos));
-		excess = AMOUNT_SAT(0);
-	}
-	change = change_amount(excess, feerate, weight);
+		change = AMOUNT_SAT(0);
+	} else if (amount_sat_less(change, chainparams->dust_limit))
+		change = AMOUNT_SAT(0);
 	if (!amount_sat_is_zero(change)) {
 		/* Same key as onchaind_tx_unsigned() sweeps to. */
 		if (ld->bip86_base)
@@ -1829,8 +1888,15 @@ static struct bitcoin_tx *asset_sweep_tx(const tal_t *ctx,
 	/* Elements fee output: whatever L-BTC isn't paid out */
 	bitcoin_tx_finalize(tx);
 
-	/* Once it's broadcast, other asset spends leave its L-BTC alone. */
-	if (height + 1 >= sweep->minblock) {
+	/* Once it's broadcast, other asset spends leave its L-BTC alone,
+	 * unless it pays too little to be relayed at all: then that L-BTC is
+	 * better used by them. */
+	if (!amount_sat_is_zero(change))
+		weight += change_weight();
+	if (height + 1 >= sweep->minblock
+	    && amount_sat_greater_eq(bitcoin_tx_compute_fee(tx),
+				     amount_tx_fee(get_feerate_floor(ld->topology),
+						   weight))) {
 		tal_resize(&sweep->wallet_ins, tal_count(wallet_utxos));
 		for (size_t i = 0; i < tal_count(wallet_utxos); i++)
 			sweep->wallet_ins[i] = wallet_utxos[i]->outpoint;

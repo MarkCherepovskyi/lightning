@@ -758,8 +758,9 @@ static bool resolved_by_proposal(struct tracked_output *out,
 {
 	const struct wally_tx_input *input;
 
-	/* If there's no TX associated, it's not us. */
-	if (!out->proposal->welements)
+	/* If there's no TX associated, it's not us.  (PoC: an HTLC of a Liquid
+	 * asset channel we can't resolve has no proposal at all.) */
+	if (!out->proposal || !out->proposal->welements)
 		return false;
 
 	input = which_input_spends(tx_parts, &out->outpoint);
@@ -1286,6 +1287,18 @@ static bool output_spent(struct tracked_output ***outs,
 				onchain_annotate_txout(
 				    &htlc_outpoint,
 				    TX_CHANNEL_HTLC_TIMEOUT | TX_THEIRS);
+				/* Unless we were taking it with the preimage
+				 * (handle_preimage() replaced that proposal),
+				 * and they timed it out first: e.g. a Liquid
+				 * asset channel's HTLC-success tx without the
+				 * L-BTC to pay for it. */
+				if (out->proposal && out->proposal->welements) {
+					resolved_by_other(out, &tx_parts->txid,
+							  THEIR_HTLC_TIMEOUT_TO_THEM);
+					record_external_deposit(out,
+								out->tx_blockheight,
+								mk_mvt_tags(MVT_HTLC_TIMEOUT));
+				}
 			}
 			break;
 
@@ -1494,6 +1507,23 @@ static void tx_new_depth(struct tracked_output **outs,
  *     - if the remote node is NOT irrevocably committed to the HTLC:
  *       - MUST NOT *resolve* the output by spending it.
  */
+/* PoC: does their signature for our HTLC-success tx fit (see
+ * resolve_our_htlc_ourcommit)?  Liquid asset channels don't grind a fee. */
+static bool asset_htlc_success_sig_ok(const struct tracked_output *out)
+{
+	struct amount_msat htlc_amount;
+	struct bitcoin_tx *tx;
+
+	if (!amount_sat_to_msat(&htlc_amount, out->sat))
+		return false;
+	tx = htlc_success_tx(tmpctx, chainparams, &out->outpoint, out->wscript,
+			     htlc_amount, to_self_delay[LOCAL], 0, keyset,
+			     option_anchor_outputs,
+			     option_anchors_zero_fee_htlc_tx);
+	return check_tx_sig(tx, 0, NULL, out->wscript,
+			    &keyset->other_htlc_key, out->remote_htlc_sig);
+}
+
 /* Master makes sure we only get told preimages once other node is committed. */
 static void handle_preimage(struct tracked_output **outs,
 			    const struct preimage *preimage)
@@ -1524,6 +1554,18 @@ static void handle_preimage(struct tracked_output **outs,
 					      tx_type_name(outs[i]->resolved->tx_type));
 				return;
 			}
+		}
+
+		/* PoC: we can't use a signature from an older version; leave
+		 * it to time out. */
+		if (outs[i]->remote_htlc_sig && liquid_channel_asset()
+		    && !asset_htlc_success_sig_ok(outs[i])) {
+			status_broken("Liquid asset channel: no valid signature"
+				      " for the HTLC-success tx of %s (signed"
+				      " by an older version?): can't claim it",
+				      fmt_bitcoin_outpoint(tmpctx,
+							   &outs[i]->outpoint));
+			continue;
 		}
 
 		/* stash the payment_hash so we can track this coin movement */
@@ -1913,6 +1955,21 @@ static size_t resolve_our_htlc_ourcommit(struct tracked_output *out,
 	 * to give details here! */
 	if (i == tal_count(matches)) {
 		char *cltvs, *wscripts;
+
+		/* PoC: Liquid asset channels' HTLC txs are zero-fee and signed
+		 * SIGHASH_SINGLE|SIGHASH_ANYONECANPAY, so the signature for a
+		 * commitment signed by an older version doesn't fit.  We can't
+		 * time this HTLC out, but we keep watching it: if they take it
+		 * with the preimage, we still learn it. */
+		if (liquid_channel_asset()) {
+			status_broken("Liquid asset channel: no valid signature"
+				      " for the HTLC-timeout tx of %s (signed"
+				      " by an older version?): can't time it"
+				      " out",
+				      fmt_bitcoin_outpoint(tmpctx,
+							   &out->outpoint));
+			return matches[0];
+		}
 
 		cltvs = tal_fmt(tmpctx, "%u", htlcs[matches[0]].cltv_expiry);
 		wscripts = tal_hex(tmpctx, htlc_scripts[matches[0]]);
