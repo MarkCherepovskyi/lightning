@@ -1565,7 +1565,10 @@ static u8 *do_sign_local_htlc_tx(struct hsmd_client *c,
 		return hsmd_status_bad_request_fmt(c, msg_in,
 						   "bad pubkey_from_privkey");
 
-	if (tx->wtx->num_inputs != 1)
+	/* PoC: on Liquid, asset channel HTLC txs also spend L-BTC from the
+	 * wallet, to pay the fee (we sign with SIGHASH_SINGLE|ANYONECANPAY). */
+	if (tx->wtx->num_inputs != 1
+	    && !(is_elements(chainparams) && option_anchor_outputs))
 		return hsmd_status_bad_request_fmt(c, msg_in,
 						   "bad txinput count");
 

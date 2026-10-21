@@ -137,6 +137,11 @@ bool liquid_check_fee_reserve_sig(struct bitcoin_tx *tx,
 					&bsig);
 }
 
+struct amount_sat liquid_htlc_tx_fee(struct amount_sat fee)
+{
+	return liquid_channel_asset() ? AMOUNT_SAT(0) : fee;
+}
+
 int liquid_finish_channel_tx(struct bitcoin_tx *tx,
 			     struct amount_sat funding_sats,
 			     int opener_outnum,

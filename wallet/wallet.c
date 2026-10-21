@@ -2140,9 +2140,12 @@ static struct channel *wallet_stmt2channel(struct wallet *w, struct db_stmt *stm
 			   msat_to_us_max, /* msatoshi_to_us_max */
 			   last_tx,
 			   last_sig,
+			   /* PoC: Liquid asset channels sign HTLC txs
+			    * like anchors (see liquid_htlc_tx_fee()) */
 			   wallet_htlc_sigs_load(tmpctx, w,
 						 db_col_u64(stmt, "id"),
-						 channel_type_has_anchors(type)),
+						 channel_type_has_anchors(type)
+						 || !db_col_is_null(stmt, "liquid_asset")),
 			   &channel_info,
 			   take(fee_states),
 			   remote_shutdown_scriptpubkey,

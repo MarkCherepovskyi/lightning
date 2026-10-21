@@ -75,6 +75,13 @@ bool liquid_check_fee_reserve_sig(struct bitcoin_tx *tx,
 				  const struct pubkey *their_funding_pubkey,
 				  const secp256k1_ecdsa_signature *sig);
 
+/* HTLC txs of asset channels pay no fee (as with
+ * option_anchors_zero_fee_htlc_tx): the asset can't pay it, so whoever
+ * broadcasts one adds L-BTC inputs, and both sides sign it with
+ * SIGHASH_SINGLE|SIGHASH_ANYONECANPAY to allow that.  Returns @fee, or zero
+ * in an asset channel. */
+struct amount_sat liquid_htlc_tx_fee(struct amount_sat fee);
+
 /* Finish an asset channel transaction before it gets sorted:
  *  - asset outputs must add up to the asset funding amount, so whatever
  *    isn't paid out (trimmed HTLCs, rounding) tops up the opener's output;

@@ -9,6 +9,7 @@
 #include <common/initial_commit_tx.h>
 #include <common/keyset.h>
 #include <common/lease_rates.h>
+#include <common/liquid_asset.h>
 #include <common/memleak.h>
 #include <common/peer_billboard.h>
 #include <common/status.h>
@@ -446,8 +447,9 @@ static bool set_htlc_timeout_fee(struct bitcoin_tx *tx,
 	struct amount_asset asset = bitcoin_tx_output_get_amount(tx, 0);
 	size_t weight;
 
-	amount = amount_asset_to_sat(&asset);
-	assert(amount_asset_is_main(&asset));
+	/* PoC: Liquid asset channel HTLCs are in the asset (and pay no fee) */
+	amount = amount_sat(asset.value);
+	assert(amount_asset_is_main(&asset) || liquid_channel_asset());
 
 	/* BOLT #3:
 	 *
@@ -457,7 +459,7 @@ static bool set_htlc_timeout_fee(struct bitcoin_tx *tx,
 	 *  - Otherwise, MUST be calculated to match:
 	 *    1. Multiply `feerate_per_kw` by 663 and divide by 1000 (rounding down).
 	 */
-	if (option_anchors_zero_fee_htlc_tx) {
+	if (option_anchors_zero_fee_htlc_tx || liquid_channel_asset()) {
 		fee = AMOUNT_SAT(0);
 		goto set_amount;
 	}
@@ -505,7 +507,8 @@ static struct amount_sat get_htlc_success_fee(struct tracked_output *out)
 	if (!amount_sat_eq(fee, AMOUNT_SAT(UINT64_MAX)))
 		return fee;
 
-	if (option_anchors_zero_fee_htlc_tx) {
+	/* PoC: so do Liquid asset channels' (see liquid_htlc_tx_fee()) */
+	if (option_anchors_zero_fee_htlc_tx || liquid_channel_asset()) {
 		fee = AMOUNT_SAT(0);
 		return fee;
 	}
@@ -1076,6 +1079,17 @@ static void handle_htlc_onchain_fulfill(struct tracked_output *out,
 							       &preimage)));
 }
 
+/* PoC: Liquid asset channels: see below */
+static void propose_asset_to_us(struct tracked_output ***outs,
+				const struct tx_parts *tx,
+				struct tracked_output *out,
+				u32 sequence,
+				u32 block_required,
+				bool to_remote,
+				const struct pubkey *per_commit_point,
+				const u8 *scriptpubkey,
+				const u8 *wscript);
+
 static void resolve_htlc_tx(struct tracked_output ***outs,
 			    size_t out_index,
 			    const struct tx_parts *htlc_tx,
@@ -1105,14 +1119,23 @@ static void resolve_htlc_tx(struct tracked_output ***outs,
 	outpoint.n = input_num;
 
 	asset = wally_tx_output_get_amount(htlc_tx->outputs[outpoint.n]);
-	assert(amount_asset_is_main(&asset));
-	amt = amount_asset_to_sat(&asset);
+	/* PoC: Liquid asset channel HTLC txs pay out the asset */
+	amt = amount_sat(asset.value);
 	out = new_tracked_output(outs, &outpoint,
  				 tx_blockheight,
  				 (*outs)[out_index]->resolved->tx_type,
 				 amt,
  				 DELAYED_OUTPUT_TO_US,
  				 NULL, NULL, NULL);
+
+	if (!amount_asset_is_main(&asset)) {
+		propose_asset_to_us(outs, htlc_tx, out, to_self_delay[LOCAL],
+				    rel_blockheight(out, to_self_delay[LOCAL]),
+				    false, NULL,
+				    scriptpubkey_p2wsh(tmpctx, wscript),
+				    wscript);
+		return;
+	}
 
 	msg = towire_onchaind_spend_to_us(NULL,
 					  &outpoint, amt,
@@ -1148,9 +1171,10 @@ static void steal_htlc_tx(struct tracked_output *out,
 					      &keyset->self_revocation_key,
 					      &keyset->self_delayed_payment_key);
 
+	/* PoC: in Liquid asset channels it's in the asset (and lightningd
+	 * pays the penalty's fee from our wallet) */
 	asset = wally_tx_output_get_amount(htlc_tx->outputs[htlc_outpoint->n]);
-	assert(amount_asset_is_main(&asset));
-	htlc_out_amt = amount_asset_to_sat(&asset);
+	htlc_out_amt = amount_sat(asset.value);
 
 	htlc_out = new_tracked_output(outs,
 				      htlc_outpoint, htlc_tx_blockheight,
@@ -1171,7 +1195,8 @@ static void steal_htlc_tx(struct tracked_output *out,
 					    htlc_outpoint, htlc_out_amt,
 					    remote_per_commitment_secret,
 					    tal_dup(tmpctx, u8, &ONE),
-					    htlc_out->wscript);
+					    htlc_out->wscript,
+					    NULL, AMOUNT_SAT(0));
 
 	/* Spend this immediately. */
 	propose_immediate_resolution(htlc_out, take(msg), OUR_PENALTY_TX);
@@ -2229,26 +2254,6 @@ static void propose_asset_to_us(struct tracked_output ***outs,
 	}
 }
 
-/* We can't resolve this asset output (HTLC or revoked) yet: say so, and
- * don't wait for it. */
-static void ignore_asset_output(struct tracked_output ***outs,
-				const struct bitcoin_outpoint *outpoint,
-				u32 tx_blockheight,
-				enum tx_type tx_type,
-				struct amount_sat amt,
-				enum output_type output_type)
-{
-	struct tracked_output *out;
-
-	status_broken("Liquid asset channel: can't resolve %s/%s output %u"
-		      " on-chain yet, ignoring it",
-		      tx_type_name(tx_type), output_type_name(output_type),
-		      outpoint->n);
-	out = new_tracked_output(outs, outpoint, tx_blockheight, tx_type, amt,
-				 output_type, NULL, NULL, NULL);
-	ignore_output(out);
-}
-
 static void our_unilateral_to_us(struct tracked_output ***outs,
 				 const struct bitcoin_outpoint *outpoint,
 				 u32 tx_blockheight,
@@ -2511,17 +2516,6 @@ static void handle_our_unilateral(const struct tx_parts *tx,
 		}
 
 		matches = match_htlc_output(tmpctx, tx->outputs[i], htlc_scripts);
-		/* PoC: no HTLC resolution for Liquid asset channels yet. */
-		if (tal_count(matches) && is_asset_output(tx->outputs[i])) {
-			ignore_asset_output(&outs, &outpoint, tx_blockheight,
-					    OUR_UNILATERAL, amt,
-					    matches_direction(matches,
-							      htlcs_info->htlcs)
-					    == LOCAL ? OUR_HTLC : THEIR_HTLC);
-			remote_htlc_sigs++;
-			htlc_scripts[matches[0]] = NULL;
-			continue;
-		}
 		/* FIXME: limp along when this happens! */
 		if (tal_count(matches) == 0) {
 			bool found = false;
@@ -2666,9 +2660,14 @@ static void handle_our_unilateral(const struct tx_parts *tx,
 /* We produce individual penalty txs.  It's less efficient, but avoids them
  * using HTLC txs to block our penalties for long enough to pass the CSV
  * delay */
-static void steal_to_them_output(struct tracked_output *out, u32 csv)
+static void steal_to_them_output(struct tracked_output ***outs,
+				 const struct tx_parts *tx,
+				 struct tracked_output *out, u32 csv)
 {
 	const u8 *wscript, *msg;
+	struct tracked_output *change = NULL;
+	int j = is_asset_output(tx->outputs[out->outpoint.n])
+		? fee_reserve_change(tx, out->outpoint.n) : -1;
 
 	/* BOLT #3:
 	 *
@@ -2681,14 +2680,41 @@ static void steal_to_them_output(struct tracked_output *out, u32 csv)
 					   &keyset->self_revocation_key,
 					   &keyset->self_delayed_payment_key);
 
+	/* PoC: in a Liquid asset channel opened by the cheater, its L-BTC
+	 * change from the fee reserve has this script too: we take it in the
+	 * same tx, and it pays the fee.  That output gets the same proposal,
+	 * so the penalty resolves it too. */
+	if (j >= 0) {
+		struct bitcoin_outpoint outpoint;
+		outpoint.txid = tx->txid;
+		outpoint.n = j;
+		change = new_tracked_output(outs, &outpoint,
+					    out->tx_blockheight,
+					    out->tx_type,
+					    output_value(tx->outputs[j]),
+					    out->output_type,
+					    NULL, NULL, NULL);
+	}
+
 	msg = towire_onchaind_spend_penalty(NULL,
 					    &out->outpoint, out->sat,
 					    remote_per_commitment_secret,
 					    tal_dup(tmpctx, u8, &ONE),
-					    wscript);
+					    wscript,
+					    change ? &change->outpoint : NULL,
+					    change ? change->sat : AMOUNT_SAT(0));
 
 	/* Spend this immediately. */
 	propose_immediate_resolution(out, take(msg), OUR_PENALTY_TX);
+
+	if (change) {
+		change->proposal = new_proposed_resolution(change,
+							   out->tx_blockheight + 1,
+							   OUR_PENALTY_TX);
+		change->proposal->welements = out->proposal->welements;
+		if (out->resolved)
+			ignore_output(change);
+	}
 }
 
 static void steal_htlc(struct tracked_output *out)
@@ -2709,7 +2735,8 @@ static void steal_htlc(struct tracked_output *out)
 					    &out->outpoint, out->sat,
 					    remote_per_commitment_secret,
 					    tal_dup_arr(tmpctx, u8, der, ARRAY_SIZE(der), 0),
-					    out->wscript);
+					    out->wscript,
+					    NULL, AMOUNT_SAT(0));
 
 	/* Spend this immediately. */
 	propose_immediate_resolution(out, take(msg), OUR_PENALTY_TX);
@@ -3006,17 +3033,6 @@ static void handle_their_cheat(const struct tx_parts *tx,
 			script[LOCAL] = NULL;
 			continue;
 		}
-		/* PoC: no penalties for Liquid asset channels yet. */
-		if (script[REMOTE]
-		    && wally_tx_output_scripteq(tx->outputs[i],
-						script[REMOTE])
-		    && is_asset_output(tx->outputs[i])) {
-			ignore_asset_output(&outs, &outpoint, tx_blockheight,
-					    THEIR_REVOKED_UNILATERAL, amt,
-					    DELAYED_CHEAT_OUTPUT_TO_THEM);
-			script[REMOTE] = NULL;
-			continue;
-		}
 		if (script[REMOTE]
 		    && wally_tx_output_scripteq(tx->outputs[i],
 						script[REMOTE])) {
@@ -3031,7 +3047,7 @@ static void handle_their_cheat(const struct tx_parts *tx,
 						 amt,
 						 DELAYED_CHEAT_OUTPUT_TO_THEM,
 						 NULL, NULL, NULL);
-			steal_to_them_output(out, 1);
+			steal_to_them_output(&outs, tx, out, 1);
 			script[REMOTE] = NULL;
 			continue;
 		}
@@ -3120,7 +3136,7 @@ static void handle_their_cheat(const struct tx_parts *tx,
 								 amt,
 								 DELAYED_CHEAT_OUTPUT_TO_THEM,
 								 NULL, NULL, NULL);
-					steal_to_them_output(out, csv);
+					steal_to_them_output(&outs, tx, out, csv);
 					script[REMOTE] = NULL;
 					found = true;
 					break;
@@ -3141,16 +3157,6 @@ static void handle_their_cheat(const struct tx_parts *tx,
 		/* In this case, we don't care which HTLC we choose; so pick
 		   first one */
 		which_htlc = matches[0];
-		/* PoC: no penalties for Liquid asset channels yet. */
-		if (is_asset_output(tx->outputs[i])) {
-			ignore_asset_output(&outs, &outpoint, tx_blockheight,
-					    THEIR_REVOKED_UNILATERAL, amt,
-					    matches_direction(matches,
-							      htlcs_info->htlcs)
-					    == LOCAL ? OUR_HTLC : THEIR_HTLC);
-			htlc_scripts[which_htlc] = NULL;
-			continue;
-		}
 		if (matches_direction(matches, htlcs_info->htlcs) == LOCAL) {
 			/* BOLT #5:
 			 *
@@ -3412,16 +3418,6 @@ static void handle_their_unilateral(const struct tx_parts *tx,
 		}
 
 		matches = match_htlc_output(tmpctx, tx->outputs[i], htlc_scripts);
-		/* PoC: no HTLC resolution for Liquid asset channels yet. */
-		if (tal_count(matches) && is_asset_output(tx->outputs[i])) {
-			ignore_asset_output(&outs, &outpoint, tx_blockheight,
-					    THEIR_UNILATERAL, amt,
-					    matches_direction(matches,
-							      htlcs_info->htlcs)
-					    == LOCAL ? OUR_HTLC : THEIR_HTLC);
-			htlc_scripts[matches[0]] = NULL;
-			continue;
-		}
 		if (tal_count(matches) == 0) {
 			bool found = false;
 
@@ -3686,6 +3682,7 @@ int main(int argc, char *argv[])
 	struct amount_sat funding_sats;
 	u8 *scriptpubkey[NUM_SIDES];
 	u32 locktime, tx_blockheight;
+	u8 *liquid_asset;
 
 	subdaemon_setup(argc, argv);
 
@@ -3724,9 +3721,16 @@ int main(int argc, char *argv[])
 				   &static_remotekey_start[REMOTE],
 				   &option_anchor_outputs,
 				   &option_anchors_zero_fee_htlc_tx,
-				   &min_relay_feerate)) {
+				   &min_relay_feerate,
+				   &liquid_asset)) {
 		master_badmsg(WIRE_ONCHAIND_INIT, msg);
 	}
+
+	/* PoC: Liquid asset channel (if any) for the HTLC tx builders.  We
+	 * don't need the fee reserve amount. */
+	liquid_set_channel_asset(liquid_asset_or_null(liquid_asset),
+				 AMOUNT_SAT(0));
+	tal_free(liquid_asset);
 
 	/* We need to keep tx around, but there's only one: not really a leak */
 	tal_steal(ctx, notleak(tx));

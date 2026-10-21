@@ -131,7 +131,8 @@ u8 *htlc_offered_wscript(const tal_t *ctx,
 			 bool option_anchor_outputs,
 			 bool option_anchors_zero_fee_htlc_tx);
 
-/* Low-level HTLC tx creator */
+/* Low-level HTLC tx creator.  @asset is the HTLC's Liquid asset (NULL for
+ * L-BTC, see common/liquid_asset.h). */
 struct bitcoin_tx *htlc_tx(const tal_t *ctx,
 			   const struct chainparams *chainparams,
 			   const struct bitcoin_outpoint *commit,
@@ -141,5 +142,6 @@ struct bitcoin_tx *htlc_tx(const tal_t *ctx,
 			   struct amount_sat htlc_fee,
 			   u32 locktime,
 			   bool option_anchor_outputs,
-			   bool option_anchors_zero_fee_htlc_tx);
+			   bool option_anchors_zero_fee_htlc_tx,
+			   const u8 *asset);
 #endif /* LIGHTNING_COMMON_HTLC_TX_H */

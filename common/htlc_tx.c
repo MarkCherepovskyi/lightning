@@ -3,6 +3,7 @@
 #include <bitcoin/script.h>
 #include <common/htlc_tx.h>
 #include <common/keyset.h>
+#include <common/liquid_asset.h>
 
 /* Low-level tx creator: used when onchaind has done most of the work! */
 struct bitcoin_tx *htlc_tx(const tal_t *ctx,
@@ -14,7 +15,8 @@ struct bitcoin_tx *htlc_tx(const tal_t *ctx,
 			   struct amount_sat htlc_fee,
 			   u32 locktime,
 			   bool option_anchor_outputs,
-			   bool option_anchors_zero_fee_htlc_tx)
+			   bool option_anchors_zero_fee_htlc_tx,
+			   const u8 *asset)
 {
 	/* BOLT #3:
 	 * * locktime: `0` for HTLC-success, `cltv_expiry` for HTLC-timeout
@@ -43,9 +45,9 @@ struct bitcoin_tx *htlc_tx(const tal_t *ctx,
 	 *      transaction
 	 *    * `txin[0]` sequence: `0` (set to `1` for `option_anchors`)
 	 */
-	bitcoin_tx_add_input(tx, commit,
-			     (option_anchor_outputs || option_anchors_zero_fee_htlc_tx) ? 1 : 0,
-			     NULL, amount, NULL, commit_wscript);
+	bitcoin_tx_add_asset_input(tx, commit,
+				   (option_anchor_outputs || option_anchors_zero_fee_htlc_tx) ? 1 : 0,
+				   NULL, amount, NULL, commit_wscript, asset);
 
 	/* BOLT #3:
 	 * * txout count: 1
@@ -55,12 +57,13 @@ struct bitcoin_tx *htlc_tx(const tal_t *ctx,
 	 *    * `txout[0]` script: version-0 P2WSH with witness script as shown
 	 *       below
 	 */
-	/* Note: for option_anchors_zero_fee_htlc_tx, htlc_fee is 0 */
+	/* Note: for option_anchors_zero_fee_htlc_tx, htlc_fee is 0 (and for
+	 * Liquid asset channels) */
 	if (!amount_sat_sub(&amount, amount, htlc_fee))
 		return tal_free(tx);
 
-	bitcoin_tx_add_output(tx, scriptpubkey_p2wsh(tmpctx, htlc_tx_wscript),
-			      htlc_tx_wscript, amount);
+	bitcoin_tx_add_asset_output(tx, scriptpubkey_p2wsh(tmpctx, htlc_tx_wscript),
+				    htlc_tx_wscript, amount, asset);
 
 	bitcoin_tx_finalize(tx);
 	assert(bitcoin_tx_check(tx));
@@ -92,12 +95,13 @@ struct bitcoin_tx *htlc_success_tx(const tal_t *ctx,
 		       commit_wscript,
 		       amount_msat_to_sat_round_down(htlc_msatoshi),
 		       htlc_wscript,
-		       htlc_success_fee(feerate_per_kw,
-					option_anchor_outputs,
-					option_anchors_zero_fee_htlc_tx),
+		       liquid_htlc_tx_fee(htlc_success_fee(feerate_per_kw,
+							   option_anchor_outputs,
+							   option_anchors_zero_fee_htlc_tx)),
 		       0,
 		       option_anchor_outputs,
-		       option_anchors_zero_fee_htlc_tx);
+		       option_anchors_zero_fee_htlc_tx,
+		       liquid_channel_asset());
 }
 
 /* Fill in the witness for HTLC-success tx produced above. */
@@ -155,12 +159,13 @@ struct bitcoin_tx *htlc_timeout_tx(const tal_t *ctx,
 		       commit_wscript,
 		       amount_msat_to_sat_round_down(htlc_msatoshi),
 		       htlc_wscript,
-		       htlc_timeout_fee(feerate_per_kw,
-					option_anchor_outputs,
-					option_anchors_zero_fee_htlc_tx),
+		       liquid_htlc_tx_fee(htlc_timeout_fee(feerate_per_kw,
+							   option_anchor_outputs,
+							   option_anchors_zero_fee_htlc_tx)),
 		       cltv_expiry,
 		       option_anchor_outputs,
-		       option_anchors_zero_fee_htlc_tx);
+		       option_anchors_zero_fee_htlc_tx,
+		       liquid_channel_asset());
 }
 
 /* Fill in the witness for HTLC-timeout tx produced above. */

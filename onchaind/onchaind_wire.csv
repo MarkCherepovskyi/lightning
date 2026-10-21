@@ -48,6 +48,9 @@ msgdata,onchaind_init,option_anchor_outputs,bool,
 msgdata,onchaind_init,option_anchors_zero_fee_htlc_tx,bool,
 # We need this for BIP125 rule 4
 msgdata,onchaind_init,min_relay_feerate,u32,
+# PoC: Liquid asset channel's asset (empty for L-BTC channels)
+msgdata,onchaind_init,liquid_asset_len,u16,
+msgdata,onchaind_init,liquid_asset,u8,liquid_asset_len
 
 # This says we're ready; give us htlcs and preimages.
 msgtype,onchaind_init_reply,5101
@@ -148,6 +151,11 @@ msgdata,onchaind_spend_penalty,stack_elem_len,u16,
 msgdata,onchaind_spend_penalty,stack_elem,u8,stack_elem_len
 msgdata,onchaind_spend_penalty,wscript_len,u32,
 msgdata,onchaind_spend_penalty,wscript,u8,wscript_len
+# PoC: in Liquid asset channels, outpoint is in the asset.  fee_input (the
+# cheater's L-BTC change from the fee reserve, with the same script) is
+# spent too, and pays the fee; without one, L-BTC from our wallet does.
+msgdata,onchaind_spend_penalty,fee_input,?bitcoin_outpoint,
+msgdata,onchaind_spend_penalty,fee_input_amount,amount_sat,
 
 # We tell lightningd to create, sign and broadcast this htlc_success tx: 
 msgtype,onchaind_spend_htlc_success,5042

@@ -1,7 +1,6 @@
 # Liquid asset channels: local test network
 
-Proof of concept, not for real funds: asset channels can be force-closed only
-while no HTLC is in flight, and there are no penalty transactions for them.
+Proof of concept, not for real funds (see [Limits](#limits)).
 
 A Liquid regtest node (`elementsd`) and three Core Lightning nodes (`alice`,
 `bob`, `carol`) built from this branch, plus `lnpoc.py` to drive them.
@@ -113,27 +112,75 @@ until both sides have swept their outputs.
   channel's default close address (a key of the node's HD wallet, which
   `listfunds` doesn't show).
 
+### HTLCs on-chain
+
+HTLC outputs are in the asset too, so an HTLC transaction can't take its
+fee out of the HTLC the way it does on L-BTC channels. Asset channels work
+like `option_anchors_zero_fee_htlc_tx` here, but without anchor outputs,
+and the commitment and HTLC scripts are the ones for channels without
+anchors:
+
+- HTLC-success and HTLC-timeout transactions pay no fee: output 0 is the
+  whole HTLC, in the asset. The peer signs them with
+  `SIGHASH_SINGLE|SIGHASH_ANYONECANPAY` (only input 0 and output 0), and so do
+  we.
+- Whoever broadcasts one adds L-BTC inputs from its wallet, its L-BTC change
+  and the fee output. It rebuilds the tx with what its wallet holds before
+  each rebroadcast.
+- Direct spends from the peer's commitment (fulfilling their HTLC with the
+  preimage, or taking back our timed-out HTLC) are sweeps like the ones
+  above: the asset goes to the close address, and wallet L-BTC pays the fee.
+- The HTLC transaction's output (to the delayed key, after `to_self_delay`)
+  is swept like `to_local`, also with wallet L-BTC.
+
+The other choice was to pre-sign HTLC transactions that also spend an L-BTC
+output of the commitment, paid from the fee reserve. That would need an extra
+commitment output per HTLC and would fix the fee when the commitment is
+signed. With `SIGHASH_SINGLE|SIGHASH_ANYONECANPAY` the commitments stay as
+they are, and the fee is whatever is needed at broadcast time.
+
+So a node needs some L-BTC in its wallet to resolve HTLCs on-chain, the
+peer that didn't open the channel included. Trimmed HTLCs (below dust plus
+what the HTLC tx would have paid as fee on an L-BTC channel) get no output.
+Their asset goes to the opener's output, because the asset can't go to
+miners.
+
+### Penalties
+
+If the peer broadcasts a revoked commitment, we take all of its asset outputs
+with the revocation key: its `to_local`, its HTLC outputs, and the outputs
+of any HTLC transactions it builds on them. Each one gets its own penalty
+tx, sending the asset to the close address. The opener's L-BTC change from the
+fee reserve has the same script as its `to_local`. When the cheater is the
+opener, we take that change in the `to_local` penalty, and it pays the fee.
+Every other penalty gets its fee from our wallet.
+
 ## Limits
 
 Still missing for asset channels:
 
-- **HTLCs on-chain.** A unilateral close works only without HTLCs in flight.
-  HTLC outputs are in the asset, and HTLC-success/timeout txs are pre-signed
-  and would have to pay their L-BTC fee from somewhere (CLN runs Liquid
-  without anchors). `onchaind` logs such outputs as BROKEN and leaves them
-  unresolved, so the payment stays stuck.
-- **Penalties.** A revoked commitment's asset outputs aren't claimed (BROKEN,
-  ignored); our own to_remote output on it is still swept.
+- **L-BTC to resolve HTLCs.** HTLC transactions, and spends of HTLC outputs
+  and penalties (except the one that takes the cheater's fee reserve
+  change), pay their fees with L-BTC from the node's wallet. A node with no
+  L-BTC can't resolve HTLCs on-chain until it gets some (it keeps
+  retrying every block), and its peer can then time them out or claim them.
+  Wallet L-BTC is reserved for each such tx, so concurrent ones don't
+  conflict. The commitment itself has no anchors, so it can't be
+  fee-bumped: its fee comes from the fee reserve when it's signed.
 - **Assets in the wallet.** `lightningd`'s wallet ignores non-L-BTC outputs,
   so swept assets go to the channel's close address (see above) and don't
   show up in `listfunds`; funding uses an external wallet (elementsd).
-- Sweeps are rebuilt (with the wallet's current L-BTC) whenever they're
-  rebroadcast, until they confirm, but there's no RBF fee bumping; and an
-  asset left at the default close address can only be spent with an external
+- Sweeps, HTLC transactions and penalties are rebuilt (with the wallet's
+  current L-BTC) whenever they're rebroadcast, until they confirm, but
+  there's no RBF fee bumping, and no batching (one tx per output). An asset
+  left at the default close address can only be spent with an external
   wallet holding CLN's HD keys.
+- Asset outputs of a commitment we can't identify (neither ours, theirs nor
+  revoked, e.g. after restoring an old database) aren't recovered (BROKEN).
 - Commitments of channels opened before `fee_reserve_sig` existed can't be
   broadcast, and both peers must run this version (an older peer doesn't send
-  the signature, and the channel fails).
+  the signature, or signs HTLC txs that pay fees in the asset, and the
+  channel fails).
 - One asset per channel. Invoices don't carry the asset yet: `xpay` is told
   it with `asset=`.
 - Regtest has no fee estimates, so the nodes use the minimum feerate (as on
