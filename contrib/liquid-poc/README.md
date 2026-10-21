@@ -106,6 +106,10 @@ works without Docker.
 | `test_liquid_asset_htlc_onchain_reorg` | The block with the HTLC-timeout tx is reorged out |
 | `test_liquid_asset_penalty[opener\|peer]` | A revoked commitment with an HTLC: either side cheats, the other takes it all |
 | `test_liquid_asset_penalty_htlc_tx`, `..._htlc_timeout_tx` | The cheater (from an old database) uses its own HTLC tx; the victim takes its output |
+| `test_liquid_asset_penalty_fee_input_spent` | The cheater spends only its fee reserve change; the `to_local` penalty pays from the wallet |
+| `test_liquid_asset_htlc_onchain_unusable_sig` | An HTLC signature we can't use (as from an older version): no crash, and the peer's preimage spend is still seen |
+| `test_liquid_asset_htlc_fee_cap` | An urgent HTLC tx pays no more than the channel's fee reserve |
+| `test_liquid_asset_wallet_lbtc_not_held` | A tx too poor to relay doesn't hold the wallet L-BTC another spend can use |
 
 `tests/test_liquid_asset_gossip.py` covers announced asset channels.
 The tests check what ends up on-chain: each side's asset at its close
@@ -203,12 +207,18 @@ Still missing for asset channels:
   L-BTC can't resolve HTLCs on-chain until it gets some (it keeps
   retrying every block), and its peer can then time them out or claim them.
   Concurrent asset spends don't pick the same wallet L-BTC (`lightningd`
-  remembers which one each broadcast tx uses), but other wallet spends
-  (`withdraw`, `fundchannel`) don't know about it. A wallet with fewer
-  outputs than there are spends to make resolves them one after another,
-  using the change of the previous one. The commitment itself has no
-  anchors, so it can't be fee-bumped: its fee comes from the fee reserve
-  when it's signed.
+  remembers which one each broadcast tx uses, unless that tx pays too
+  little to be relayed), but other wallet spends (`withdraw`,
+  `fundchannel`) don't know about it. A wallet with fewer outputs than there
+  are spends to make resolves them one after another, using the change of
+  the previous one. If a cheater spends its fee reserve change on its own,
+  the `to_local` penalty pays from the wallet instead. The commitment itself
+  has no anchors, so it can't be fee-bumped: its fee comes from the fee
+  reserve when it's signed.
+- **Fee cap.** No asset spend pays more L-BTC in fees than the channel's fee
+  reserve, even when the deadline calls for more: we can't tell what an
+  HTLC in the asset is worth in L-BTC. A cap that low can make an urgent
+  HTLC tx too slow.
 - **Assets in the wallet.** `lightningd`'s wallet ignores non-L-BTC outputs,
   so swept assets go to the channel's close address (see above) and don't
   show up in `listfunds`; funding uses an external wallet (elementsd).
@@ -222,7 +232,10 @@ Still missing for asset channels:
 - Commitments of channels opened before `fee_reserve_sig` existed can't be
   broadcast, and both peers must run this version (an older peer doesn't send
   the signature, or signs HTLC txs that pay fees in the asset, and the
-  channel fails).
+  channel fails). A commitment signed before HTLC txs became zero-fee has
+  HTLC signatures we can't use: onchaind logs BROKEN for those HTLCs and
+  can't time them out or claim them itself, but still sees the peer take one
+  with the preimage.
 - One asset per channel. Invoices don't carry the asset yet: `xpay` is told
   it with `asset=`.
 - Regtest has no fee estimates, so the nodes use the minimum feerate (as on
