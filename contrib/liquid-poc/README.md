@@ -73,6 +73,44 @@ docker compose exec alice lightning-cli --network=liquid-regtest --lightning-dir
 docker compose exec elementsd elements-cli -chain=liquid-regtest -rpcport=18884 -rpcuser=poc -rpcpassword=poc getblockchaininfo
 ```
 
+## Tests
+
+The pytest suite runs against elementsd with `TEST_NETWORK=liquid-regtest`.
+`run-tests.sh` does it in Docker (on macOS too). It builds this tree for
+Linux in a Docker volume, one per checkout, which is kept between runs, so
+only the first build is slow:
+
+```bash
+contrib/liquid-poc/run-tests.sh                       # the Liquid asset tests, -n 4
+contrib/liquid-poc/run-tests.sh -k "penalty or restart"
+contrib/liquid-poc/run-tests.sh tests/test_closing.py -n 8
+contrib/liquid-poc/run-tests.sh logs /tmp/lnpoc-logs  # test directories of the last run
+contrib/liquid-poc/run-tests.sh clean                 # remove the build volume
+```
+
+Arguments go to pytest. `TEST_DEBUG=1` prints the nodes' logs of failed
+tests, and `LNPOC_TEST_KEEP_ALL=1` keeps the directories of passed tests too
+(by default only failed ones are kept). On Linux with `elementsd` on the
+`PATH`, `TEST_NETWORK=liquid-regtest pytest tests/test_liquid_asset_poc.py`
+works without Docker.
+
+| Test (`tests/test_liquid_asset_poc.py`) | What it covers |
+| --- | --- |
+| `test_liquid_asset_channel_poc` | Asset and L-BTC channels side by side across three nodes, asset checks on forwarding and invoices, cooperative closes |
+| `test_liquid_asset_unilateral_close[opener\|peer]` | Force close without HTLCs; each side sweeps its asset output |
+| `test_liquid_asset_htlc_onchain[outcome-closer]` | Force close with an HTLC in flight: HTLC-timeout and HTLC-success txs, and direct spends from the peer's commitment |
+| `test_liquid_asset_htlc_onchain_upstream[timeout\|success]` | A forwarding node fails or fulfills its incoming HTLC as the outgoing one resolves on-chain |
+| `test_liquid_asset_multihtlc[opener\|peer]` | Several HTLCs both ways: identical outputs (two parts of one payment), a dust (trimmed) one, fulfilled and failed ones |
+| `test_liquid_asset_htlc_onchain_restart` | Restarts at every step; the rebuilt txs are the same ones |
+| `test_liquid_asset_htlc_onchain_no_lbtc` | A node with no L-BTC resolves its HTLC once its wallet is funded |
+| `test_liquid_asset_htlc_onchain_reorg` | The block with the HTLC-timeout tx is reorged out |
+| `test_liquid_asset_penalty[opener\|peer]` | A revoked commitment with an HTLC: either side cheats, the other takes it all |
+| `test_liquid_asset_penalty_htlc_tx`, `..._htlc_timeout_tx` | The cheater (from an old database) uses its own HTLC tx; the victim takes its output |
+
+`tests/test_liquid_asset_gossip.py` covers announced asset channels.
+The tests check what ends up on-chain: each side's asset at its close
+address, and L-BTC that only paid fees.
+
 ## How an asset channel is opened
 
 `lightningd` can't hold assets yet, so elementsd's wallet builds the funding
