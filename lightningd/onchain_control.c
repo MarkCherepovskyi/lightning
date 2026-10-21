@@ -1477,10 +1477,9 @@ struct asset_sweep {
 	/* Our HTLC txs: their output (else the asset goes to our close
 	 * address) */
 	u8 *htlc_tx_out;
-	/* L-BTC from our wallet we used (and reserved) last time, and when
-	 * that reservation runs out */
+	/* L-BTC from our wallet the tx we broadcast uses: other asset spends
+	 * leave it alone */
 	struct bitcoin_outpoint *wallet_ins;
-	u32 reserved_til;
 	/* Our asset input got spent (by this or another tx): we're done */
 	bool done;
 	/* In asset_sweeps */
@@ -1489,9 +1488,6 @@ struct asset_sweep {
 
 /* The asset spends we're broadcasting */
 static struct list_head asset_sweeps = LIST_HEAD_INIT(asset_sweeps);
-
-/* Blocks we reserve wallet L-BTC for, as reserveinputs does */
-#define ASSET_SWEEP_RESERVATION (6 * 12)
 
 static void destroy_asset_sweep(struct asset_sweep *sweep)
 {
@@ -1527,7 +1523,6 @@ static struct asset_sweep *new_asset_sweep(struct channel *channel,
 	sweep->scriptpubkey = wscript ? scriptpubkey_p2wsh(sweep, wscript) : NULL;
 	sweep->htlc_tx_out = NULL;
 	sweep->wallet_ins = tal_arr(sweep, struct bitcoin_outpoint, 0);
-	sweep->reserved_til = 0;
 	sweep->done = false;
 	list_add_tail(&asset_sweeps, &sweep->list);
 	tal_add_destructor(sweep, destroy_asset_sweep);
@@ -1535,26 +1530,18 @@ static struct asset_sweep *new_asset_sweep(struct channel *channel,
 }
 
 /* Once an asset output is spent, by our tx or someone else's, stop
- * broadcasting spends of it, and give back the wallet L-BTC they had. */
+ * broadcasting spends of it, and let go of the wallet L-BTC they used. */
 static void asset_sweeps_input_spent(const struct channel *channel,
 				     const struct bitcoin_outpoint *outpoint)
 {
-	struct lightningd *ld = channel->peer->ld;
-	u32 height = get_block_height(ld->topology);
 	struct asset_sweep *sweep;
 
 	list_for_each(&asset_sweeps, sweep, list) {
-		if (sweep->channel != channel || sweep->done
+		if (sweep->channel != channel
 		    || !bitcoin_outpoint_eq(&sweep->out, outpoint))
 			continue;
 		sweep->done = true;
-		for (size_t i = 0; i < tal_count(sweep->wallet_ins); i++) {
-			struct utxo *utxo = wallet_utxo_get(tmpctx, ld->wallet,
-							    &sweep->wallet_ins[i]);
-			if (utxo && utxo_is_reserved(utxo, height))
-				wallet_unreserve_utxo(ld->wallet, utxo, height,
-						      ASSET_SWEEP_RESERVATION);
-		}
+		tal_resize(&sweep->wallet_ins, 0);
 	}
 }
 
@@ -1713,6 +1700,19 @@ static bool outpoint_in(const struct bitcoin_outpoint *outpoints,
 	return false;
 }
 
+/* Is another asset spend we're broadcasting using this wallet output? */
+static bool used_by_other_sweep(const struct asset_sweep *sweep,
+				const struct bitcoin_outpoint *outpoint)
+{
+	const struct asset_sweep *s;
+
+	list_for_each(&asset_sweeps, s, list) {
+		if (s != sweep && outpoint_in(s->wallet_ins, outpoint))
+			return true;
+	}
+	return false;
+}
+
 /* Build and sign the tx.  Without enough L-BTC it pays what it can, and
  * gets rejected: we rebuild it every block until it works. */
 static struct bitcoin_tx *asset_sweep_tx(const tal_t *ctx,
@@ -1757,43 +1757,34 @@ static struct bitcoin_tx *asset_sweep_tx(const tal_t *ctx,
 		+ elements_tx_overhead(chainparams, num_channel_inputs, 2);
 
 	/* Not enough L-BTC?  Add some from our wallet (it only uses native
-	 * segwit outputs on Liquid): what we used last time first, while we
-	 * have it reserved, then outputs nobody reserved, so other spends
-	 * don't take the same ones.  Same order every time, so if nothing
-	 * changed the rebuilt tx is the same one. */
-	if (height >= sweep->reserved_til)
-		tal_resize(&sweep->wallet_ins, 0);
+	 * segwit outputs on Liquid), but not what's reserved or what our other
+	 * asset spends use.  Same order every time, so if nothing changed the
+	 * rebuilt tx is the same one (even after a restart). */
 	wallet_utxos = tal_arr(tmpctx, struct utxo *, 0);
 	all_utxos = wallet_get_unspent_utxos(tmpctx, ld->wallet);
-	for (size_t pass = 0; pass < 2; pass++) {
-		for (size_t i = 0; i < tal_count(all_utxos); i++) {
-			struct utxo *utxo = all_utxos[i];
-			bool used_before = outpoint_in(sweep->wallet_ins,
-						       &utxo->outpoint);
+	for (size_t i = 0; i < tal_count(all_utxos); i++) {
+		struct utxo *utxo = all_utxos[i];
 
-			if (!amount_sat_add(&needed,
-					    amount_tx_fee(feerate,
-							  weight + change_weight()),
-					    chainparams->dust_limit))
-				abort();
-			if (amount_sat_greater_eq(lbtc_in, needed))
-				break;
-			if (used_before != (pass == 0))
-				continue;
-			if (utxo->utxotype != UTXO_P2WPKH
-			    || (!used_before && utxo_is_reserved(utxo, height))
-			    || utxo_is_csv_locked(utxo, height)
-			    || utxo_is_immature(utxo, height))
-				continue;
-			bitcoin_tx_add_input(tx, &utxo->outpoint,
-					     BITCOIN_TX_RBF_SEQUENCE, NULL,
-					     utxo->amount, utxo->scriptPubkey,
-					     NULL);
-			weight += utxo_spend_weight(utxo, 0);
-			if (!amount_sat_add(&lbtc_in, lbtc_in, utxo->amount))
-				abort();
-			tal_arr_expand(&wallet_utxos, utxo);
-		}
+		if (!amount_sat_add(&needed,
+				    amount_tx_fee(feerate,
+						  weight + change_weight()),
+				    chainparams->dust_limit))
+			abort();
+		if (amount_sat_greater_eq(lbtc_in, needed))
+			break;
+		if (utxo->utxotype != UTXO_P2WPKH
+		    || utxo_is_reserved(utxo, height)
+		    || utxo_is_csv_locked(utxo, height)
+		    || utxo_is_immature(utxo, height)
+		    || used_by_other_sweep(sweep, &utxo->outpoint))
+			continue;
+		bitcoin_tx_add_input(tx, &utxo->outpoint,
+				     BITCOIN_TX_RBF_SEQUENCE, NULL,
+				     utxo->amount, utxo->scriptPubkey, NULL);
+		weight += utxo_spend_weight(utxo, 0);
+		if (!amount_sat_add(&lbtc_in, lbtc_in, utxo->amount))
+			abort();
+		tal_arr_expand(&wallet_utxos, utxo);
 	}
 
 	/* Pay the fee, and the rest back to our wallet. */
@@ -1838,17 +1829,8 @@ static struct bitcoin_tx *asset_sweep_tx(const tal_t *ctx,
 	/* Elements fee output: whatever L-BTC isn't paid out */
 	bitcoin_tx_finalize(tx);
 
-	/* Once we broadcast it, keep the wallet L-BTC it uses for it. */
+	/* Once it's broadcast, other asset spends leave its L-BTC alone. */
 	if (height + 1 >= sweep->minblock) {
-		if (tal_count(sweep->wallet_ins) == 0)
-			sweep->reserved_til = height + ASSET_SWEEP_RESERVATION;
-		for (size_t i = 0; i < tal_count(wallet_utxos); i++) {
-			if (!outpoint_in(sweep->wallet_ins,
-					 &wallet_utxos[i]->outpoint))
-				wallet_reserve_utxo(ld->wallet, wallet_utxos[i],
-						    height,
-						    ASSET_SWEEP_RESERVATION);
-		}
 		tal_resize(&sweep->wallet_ins, tal_count(wallet_utxos));
 		for (size_t i = 0; i < tal_count(wallet_utxos); i++)
 			sweep->wallet_ins[i] = wallet_utxos[i]->outpoint;
@@ -1997,6 +1979,7 @@ static void handle_onchaind_spend_asset_to_us(struct channel *channel,
 	sweep->commit_num = commit_num;
 	sweep->per_commit_point = tal_dup_or_null(sweep, struct pubkey,
 						  per_commit_point);
+	tal_free(sweep->scriptpubkey);
 	sweep->scriptpubkey = tal_steal(sweep, scriptpubkey);
 	asset_sweep_start(sweep);
 }

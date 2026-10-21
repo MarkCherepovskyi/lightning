@@ -164,9 +164,13 @@ Still missing for asset channels:
   change), pay their fees with L-BTC from the node's wallet. A node with no
   L-BTC can't resolve HTLCs on-chain until it gets some (it keeps
   retrying every block), and its peer can then time them out or claim them.
-  Wallet L-BTC is reserved for each such tx, so concurrent ones don't
-  conflict. The commitment itself has no anchors, so it can't be
-  fee-bumped: its fee comes from the fee reserve when it's signed.
+  Concurrent asset spends don't pick the same wallet L-BTC (`lightningd`
+  remembers which one each broadcast tx uses), but other wallet spends
+  (`withdraw`, `fundchannel`) don't know about it. A wallet with fewer
+  outputs than there are spends to make resolves them one after another,
+  using the change of the previous one. The commitment itself has no
+  anchors, so it can't be fee-bumped: its fee comes from the fee reserve
+  when it's signed.
 - **Assets in the wallet.** `lightningd`'s wallet ignores non-L-BTC outputs,
   so swept assets go to the channel's close address (see above) and don't
   show up in `listfunds`; funding uses an external wallet (elementsd).
