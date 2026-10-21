@@ -8,6 +8,7 @@
     ./lnpoc.py pay alice carol 1000000000   # invoice + pay along that path
     ./lnpoc.py channels                     # every channel, per asset
     ./lnpoc.py close alice bob              # cooperative close (+ mine)
+    ./lnpoc.py force-close alice bob        # unilateral close, mine until both swept
     ./lnpoc.py open-asset alice bob 5000000 --announce   # gossiped on the asset's network
     ./lnpoc.py graph alice                  # what alice's gossip map holds
     ./lnpoc.py xpay alice carol 1000000000  # pay with xpay, routes found from gossip
@@ -155,11 +156,11 @@ def node_name(nid):
     return nid[:12]
 
 
-def mine(n=1):
+def mine(n=1, nodes=NODES):
     addr = ecli('getnewaddress')
     ecli('generatetoaddress', n, addr)
     height = ecli('getblockcount', wallet=False)
-    for node in NODES:
+    for node in nodes:
         wait_for(f"{node} to sync to block {height}",
                  lambda: ln(node, 'getinfo')['blockheight'] >= height)
     return height
@@ -453,6 +454,61 @@ def cmd_close(args):
         print(f"  {asset_label(asset_out):16} {int(Decimal(str(v['value'])) * COIN):>12}  {dest}")
 
 
+def print_outputs(tx, lbtc):
+    for v in tx['vout']:
+        dest = v['scriptPubKey'].get('address') or v['scriptPubKey'].get('type')
+        asset_out = None if v.get('asset') == lbtc else v.get('asset')
+        print(f"  {asset_label(asset_out):16} {int(Decimal(str(v['value'])) * COIN):>12}  {dest}")
+
+
+def mempool_spend_of(txid):
+    for t in ecli('getrawmempool', wallet=False):
+        tx = ecli('getrawtransaction', t, True, wallet=False)
+        if any(vin.get('txid') == txid for vin in tx['vin']):
+            return tx
+    return None
+
+
+def cmd_force_close(args):
+    """Unilateral close by `frm` while `to` is offline, then both sides sweep
+    their outputs: `to` right away (its to_remote), `frm` after its CSV delay
+    (to_local).  In an asset channel, assets go where a mutual close would
+    pay them (`--to-elements`: an elementsd address for `frm`); fees are
+    L-BTC, from the opener's fee reserve change or the sweeper's wallet."""
+    asset = default_asset(args)
+    lbtc = lbtc_asset()
+    c = channel_between(args.frm, args.to, asset)
+    others = [n for n in NODES if n != args.to]
+    params = {'id': c['channel_id'], 'unilateraltimeout': 1}
+    if args.to_elements:
+        params['destination'] = unconfidential_address()
+
+    print(f"stopping {args.to}, so {args.frm}'s close goes unilateral ...")
+    run(COMPOSE + ['stop', args.to])
+    ln(args.frm, 'close', **params)
+    commit = wait_for('commitment tx', lambda: mempool_spend_of(c['funding_txid']))
+    mine(1, others)
+    spends = ', '.join('%s:%d' % (i['txid'][:8], i['vout']) for i in commit['vin'])
+    print(f"{args.frm}'s commitment tx {commit['txid']} (spends {spends}):")
+    print_outputs(commit, lbtc)
+
+    print(f"starting {args.to}: it sweeps its to_remote now ...")
+    run(COMPOSE + ['start', args.to])
+    wait_for(args.to, lambda: ln(args.to, 'getinfo'))
+    sweep = wait_for(f"{args.to}'s sweep", lambda: mempool_spend_of(commit['txid']))
+    mine(1)
+    print(f"{args.to}'s sweep {sweep['txid']}:")
+    print_outputs(sweep, lbtc)
+
+    delay = c['their_to_self_delay']
+    print(f"mining {delay} blocks for {args.frm}'s to_local CSV delay ...")
+    mine(delay - 1)
+    sweep = wait_for(f"{args.frm}'s sweep", lambda: mempool_spend_of(commit['txid']))
+    mine(1)
+    print(f"{args.frm}'s sweep {sweep['txid']}:")
+    print_outputs(sweep, lbtc)
+
+
 def cmd_demo(args):
     """Whole story in one go: two kinds of channels on each hop, a payment in
     each asset, then cooperative closes."""
@@ -547,6 +603,13 @@ def main():
     sp = add('close', cmd_close, 'cooperatively close a channel and mine it', asset=True)
     sp.add_argument('frm', choices=NODES)
     sp.add_argument('to', choices=NODES)
+    sp = add('force-close', cmd_force_close,
+             'unilaterally close a channel (peer offline), mine until both sides swept',
+             asset=True)
+    sp.add_argument('frm', choices=NODES)
+    sp.add_argument('to', choices=NODES)
+    sp.add_argument('--to-elements', action='store_true',
+                    help="send frm's swept asset to an elementsd address")
     sp = add('graph', cmd_graph, "a node's gossip map (listchannels)")
     sp.add_argument('node', choices=NODES)
     sp = add('xpay', cmd_xpay, 'invoice on `to`, pay it from `frm` with xpay (needs announced channels)',
