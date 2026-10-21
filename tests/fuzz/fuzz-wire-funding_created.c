@@ -1,4 +1,5 @@
 #include "config.h"
+#include <assert.h>
 #include <stdint.h>
 #include <tests/fuzz/libfuzz.h>
 #include <tests/fuzz/wire.h>
@@ -9,22 +10,23 @@ struct funding_created {
 	struct bitcoin_txid funding_txid;
 	secp256k1_ecdsa_signature signature;
 	u16 funding_output_index;
+	struct tlv_funding_created_tlvs *tlvs;
 };
 
 static void *encode(const tal_t *ctx, const struct funding_created *s)
 {
 	return towire_funding_created(ctx, &s->temporary_channel_id,
 				      &s->funding_txid, s->funding_output_index,
-				      &s->signature);
+				      &s->signature, s->tlvs);
 }
 
 static struct funding_created *decode(const tal_t *ctx, const void *p)
 {
 	struct funding_created *s = tal(ctx, struct funding_created);
 
-	if (fromwire_funding_created(p, &s->temporary_channel_id,
+	if (fromwire_funding_created(s, p, &s->temporary_channel_id,
 				     &s->funding_txid, &s->funding_output_index,
-				     &s->signature))
+				     &s->signature, &s->tlvs))
 		return s;
 	return tal_free(s);
 }
@@ -37,7 +39,14 @@ static bool equal(const struct funding_created *x,
 	if (memcmp(x, y, upto_funding_output_index) != 0)
 		return false;
 
-	return x->funding_output_index == y->funding_output_index;
+	if (x->funding_output_index != y->funding_output_index)
+		return false;
+
+	assert(x->tlvs && y->tlvs);
+	if (!x->tlvs->fee_reserve_sig || !y->tlvs->fee_reserve_sig)
+		return x->tlvs->fee_reserve_sig == y->tlvs->fee_reserve_sig;
+	return memcmp(x->tlvs->fee_reserve_sig, y->tlvs->fee_reserve_sig,
+		      sizeof(*x->tlvs->fee_reserve_sig)) == 0;
 }
 
 void run(const u8 *data, size_t size)

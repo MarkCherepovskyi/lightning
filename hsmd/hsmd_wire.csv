@@ -246,6 +246,13 @@ msgdata,hsmd_sign_commitment_tx,commit_num,u64,
 msgtype,hsmd_sign_commitment_tx_reply,105
 msgdata,hsmd_sign_commitment_tx_reply,sig,bitcoin_signature,
 
+# PoC: Liquid asset channel commitments also spend the L-BTC fee reserve
+# (input 1, same 2-of-2 as the funding input): hsmd_sign_commitment_tx and
+# hsmd_sign_remote_commitment_tx then sign both inputs and reply with this.
+msgtype,hsmd_sign_asset_commitment_tx_reply,153
+msgdata,hsmd_sign_asset_commitment_tx_reply,sig,bitcoin_signature,
+msgdata,hsmd_sign_asset_commitment_tx_reply,fee_reserve_sig,bitcoin_signature,
+
 #include <common/htlc_wire.h> // For enum side and towire_side
 subtype,hsm_htlc
 subtypedata,hsm_htlc,side,enum side,

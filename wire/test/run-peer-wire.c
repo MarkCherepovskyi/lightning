@@ -584,16 +584,19 @@ static void *towire_struct_funding_signed(const tal_t *ctx,
 {
 	return towire_funding_signed(ctx,
 				     &s->temporary_channel_id,
-				     &s->signature);
+				     &s->signature,
+				     tlv_funding_signed_tlvs_new(ctx));
 }
 
 static struct msg_funding_signed *fromwire_struct_funding_signed(const tal_t *ctx, const void *p)
 {
 	struct msg_funding_signed *s = tal(ctx, struct msg_funding_signed);
+	struct tlv_funding_signed_tlvs *tlvs;
 
-	if (fromwire_funding_signed(p,
+	if (fromwire_funding_signed(ctx, p,
 				    &s->temporary_channel_id,
-				    &s->signature))
+				    &s->signature,
+				    &tlvs))
 		return s;
 	return tal_free(s);
 }
@@ -653,18 +656,21 @@ static void *towire_struct_funding_created(const tal_t *ctx,
 				      &s->temporary_channel_id,
 				      &s->txid,
 				      s->output_index,
-				      &s->signature);
+				      &s->signature,
+				      tlv_funding_created_tlvs_new(ctx));
 }
 
 static struct msg_funding_created *fromwire_struct_funding_created(const tal_t *ctx, const void *p)
 {
 	struct msg_funding_created *s = tal(ctx, struct msg_funding_created);
+	struct tlv_funding_created_tlvs *tlvs;
 
-	if (fromwire_funding_created(p,
+	if (fromwire_funding_created(ctx, p,
 				     &s->temporary_channel_id,
 				     &s->txid,
 				     &s->output_index,
-				     &s->signature))
+				     &s->signature,
+				     &tlvs))
 		return s;
 	return tal_free(s);
 }

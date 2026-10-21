@@ -251,7 +251,7 @@ static struct bitcoin_tx *sign_last_tx(const tal_t *ctx,
 				       const struct bitcoin_signature *last_sig)
 {
 	struct lightningd *ld = channel->peer->ld;
-	struct bitcoin_signature sig;
+	struct bitcoin_signature sig, reserve_sig, *their_reserve_sig;
 	const u8 *msg;
 	u8 **witness;
 	u64 commit_index = channel->next_index[LOCAL] - 1;
@@ -267,7 +267,38 @@ static struct bitcoin_tx *sign_last_tx(const tal_t *ctx,
 					     commit_index);
 
 	msg = hsm_sync_req(tmpctx, ld, take(msg));
-	if (!fromwire_hsmd_sign_commitment_tx_reply(msg, &sig))
+	/* PoC: Liquid asset channel txs also spend the fee reserve, and
+	 * hsmd signs that too. */
+	if (fromwire_hsmd_sign_asset_commitment_tx_reply(msg, &sig,
+							 &reserve_sig)) {
+		/* A mutual close tx comes with input 1 complete (closingd
+		 * does it, and from the db it's only in the PSBT); a
+		 * commitment tx has their sig in the PSBT. */
+		if (tx->psbt->inputs[1].final_witness
+		    && !tx->wtx->inputs[1].witness) {
+			tal_wally_start();
+			wally_tx_set_input_witness(tx->wtx, 1,
+						   tx->psbt->inputs[1].final_witness);
+			tal_wally_end(tx->wtx);
+		} else if (!tx->wtx->inputs[1].witness) {
+			if (!psbt_input_get_ecdsa_sig(tmpctx, tx->psbt, 1,
+						      &channel->channel_info.remote_fundingkey,
+						      &their_reserve_sig)
+			    || !their_reserve_sig)
+				log_broken(channel->log,
+					   "No peer signature for the fee"
+					   " reserve input of %s: it won't"
+					   " be accepted!",
+					   fmt_bitcoin_tx(tmpctx, tx));
+			else
+				bitcoin_tx_input_set_witness(tx, 1,
+					take(bitcoin_witness_2of2(NULL,
+								  their_reserve_sig,
+								  &reserve_sig,
+								  &channel->channel_info.remote_fundingkey,
+								  &channel->local_funding_pubkey)));
+		}
+	} else if (!fromwire_hsmd_sign_commitment_tx_reply(msg, &sig))
 		fatal("HSM gave bad sign_commitment_tx_reply %s",
 		      tal_hex(tmpctx, msg));
 

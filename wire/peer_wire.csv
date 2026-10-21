@@ -154,9 +154,15 @@ msgdata,funding_created,temporary_channel_id,byte,32
 msgdata,funding_created,funding_txid,sha256,
 msgdata,funding_created,funding_output_index,u16,
 msgdata,funding_created,signature,signature,
+msgdata,funding_created,tlvs,funding_created_tlvs,
+tlvtype,funding_created_tlvs,fee_reserve_sig,4241
+tlvdata,funding_created_tlvs,fee_reserve_sig,sig,signature,
 msgtype,funding_signed,35
 msgdata,funding_signed,channel_id,channel_id,
 msgdata,funding_signed,signature,signature,
+msgdata,funding_signed,tlvs,funding_signed_tlvs,
+tlvtype,funding_signed_tlvs,fee_reserve_sig,4241
+tlvdata,funding_signed_tlvs,fee_reserve_sig,sig,signature,
 msgtype,channel_ready,36
 msgdata,channel_ready,channel_id,channel_id,
 msgdata,channel_ready,second_per_commitment_point,point,
@@ -322,6 +328,8 @@ msgdata,commitment_signed,htlc_signature,signature,num_htlcs
 msgdata,commitment_signed,tlvs,commitment_signed_tlvs,
 tlvtype,commitment_signed_tlvs,funding_txid,1
 tlvdata,commitment_signed_tlvs,funding_txid,funding_txid,sha256,
+tlvtype,commitment_signed_tlvs,fee_reserve_sig,4241
+tlvdata,commitment_signed_tlvs,fee_reserve_sig,sig,signature,
 msgtype,revoke_and_ack,133
 msgdata,revoke_and_ack,channel_id,channel_id,
 msgdata,revoke_and_ack,per_commitment_secret,byte,32

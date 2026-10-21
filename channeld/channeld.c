@@ -1049,13 +1049,14 @@ static struct bitcoin_signature *calc_commitsigs(const tal_t *ctx,
 						  u64 commit_index,
 						  const struct pubkey *remote_per_commit,
 						  struct bitcoin_signature *commit_sig,
+						  secp256k1_ecdsa_signature **fee_reserve_sig,
 						  struct pubkey remote_funding_pubkey)
 {
 	struct hsm_htlc *htlcs;
 	size_t i;
 	struct pubkey local_htlckey;
 	const u8 *msg;
-	struct bitcoin_signature *htlc_sigs;
+	struct bitcoin_signature *htlc_sigs, reserve_sig;
 
 	status_debug("calc_commitsigs(%p, %p, %p, %p, %p, %d, %p, %p)",
 		     ctx, peer, txs, funding_wscript, htlc_map,
@@ -1072,7 +1073,19 @@ static struct bitcoin_signature *calc_commitsigs(const tal_t *ctx,
 						    channel_feerate(peer->channel, REMOTE));
 
 	msg = hsm_req(tmpctx, take(msg));
-	if (!fromwire_hsmd_sign_tx_reply(msg, commit_sig))
+	/* PoC: for Liquid asset channels hsmd also signs the fee reserve
+	 * input, and that signature goes to the peer in a TLV. */
+	*fee_reserve_sig = NULL;
+	if (liquid_channel_asset()) {
+		if (!fromwire_hsmd_sign_asset_commitment_tx_reply(msg,
+								  commit_sig,
+								  &reserve_sig))
+			status_failed(STATUS_FAIL_HSM_IO,
+				      "Reading sign_remote_commitment_tx reply: %s",
+				      tal_hex(tmpctx, msg));
+		*fee_reserve_sig = tal_dup(ctx, secp256k1_ecdsa_signature,
+					   &reserve_sig.s);
+	} else if (!fromwire_hsmd_sign_tx_reply(msg, commit_sig))
 		status_failed(STATUS_FAIL_HSM_IO,
 			      "Reading sign_remote_commitment_tx reply: %s",
 			      tal_hex(tmpctx, msg));
@@ -1287,6 +1300,7 @@ static u8 *send_commit_part(const tal_t *ctx,
 	htlc_sigs =
 	    calc_commitsigs(tmpctx, peer, txs, funding_wscript, htlc_map,
 			    remote_index, remote_per_commit, &commit_sig,
+			    &cs_tlv->fee_reserve_sig,
 			    remote_funding_pubkey);
 
 	if (direct_outputs[LOCAL] != NULL) {
@@ -2207,6 +2221,16 @@ static struct commitsig_info *handle_peer_commit_sig(struct peer *peer,
 				      &commit_sig))
 		status_failed(STATUS_FAIL_INTERNAL_ERROR,
 			      "Unable to set signature internally");
+
+	/* PoC: Liquid asset channel: and their sig for the fee reserve. */
+	if (liquid_channel_asset()
+	    && !liquid_check_fee_reserve_sig(txs[0], funding_wscript,
+					     &remote_funding,
+					     cs_tlv->fee_reserve_sig))
+		peer_failed_warn(peer->pps, &peer->channel_id,
+				 "Bad or missing fee_reserve_sig %"PRIu64
+				 " for tx %s",
+				 local_index, fmt_bitcoin_tx(msg, txs[0]));
 
 	if (!derive_simple_key(&peer->channel->basepoints[REMOTE].htlc,
 			       local_per_commit, &remote_htlckey))

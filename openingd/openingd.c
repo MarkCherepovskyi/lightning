@@ -570,6 +570,33 @@ static u8 *funder_channel_start(struct state *state, u8 channel_flags,
 						  state->channel_type);
 }
 
+/* Read hsmd's reply to hsmd_sign_remote_commitment_tx.  PoC: for Liquid
+ * asset channels hsmd also signs the fee reserve input; that signature goes
+ * to the peer in a TLV. */
+static void read_remote_commitment_sigs(const tal_t *ctx,
+					struct bitcoin_signature *sig,
+					secp256k1_ecdsa_signature **fee_reserve_sig)
+{
+	const u8 *msg = wire_sync_read(tmpctx, HSM_FD);
+	struct bitcoin_signature reserve_sig;
+
+	*fee_reserve_sig = NULL;
+	if (!liquid_channel_asset()) {
+		if (!fromwire_hsmd_sign_tx_reply(msg, sig))
+			status_failed(STATUS_FAIL_HSM_IO, "Bad sign_tx_reply %s",
+				      tal_hex(tmpctx, msg));
+		return;
+	}
+
+	if (!fromwire_hsmd_sign_asset_commitment_tx_reply(msg, sig,
+							  &reserve_sig))
+		status_failed(STATUS_FAIL_HSM_IO,
+			      "Bad sign_asset_commitment_tx_reply %s",
+			      tal_hex(tmpctx, msg));
+	*fee_reserve_sig = tal_dup(ctx, secp256k1_ecdsa_signature,
+				   &reserve_sig.s);
+}
+
 static bool funder_finalize_channel_setup(struct state *state,
 					  struct amount_msat local_msat,
 					  struct bitcoin_signature *sig,
@@ -582,6 +609,9 @@ static bool funder_finalize_channel_setup(struct state *state,
 	struct channel_id cid;
 	char *err_reason;
 	struct wally_tx_output *direct_outputs[NUM_SIDES];
+	struct tlv_funding_created_tlvs *created_tlvs
+		= tlv_funding_created_tlvs_new(tmpctx);
+	struct tlv_funding_signed_tlvs *signed_tlvs;
 
 	/*~ Channel is ready; Report the channel parameters to the signer. */
 	msg = towire_hsmd_setup_channel(NULL,
@@ -685,10 +715,8 @@ static bool funder_finalize_channel_setup(struct state *state,
 						    feerate);
 
 	wire_sync_write(HSM_FD, take(msg));
-	msg = wire_sync_read(tmpctx, HSM_FD);
-	if (!fromwire_hsmd_sign_tx_reply(msg, sig))
-		status_failed(STATUS_FAIL_HSM_IO, "Bad sign_tx_reply %s",
-			      tal_hex(tmpctx, msg));
+	read_remote_commitment_sigs(created_tlvs, sig,
+				    &created_tlvs->fee_reserve_sig);
 
 	/* You can tell this has been a problem before, since there's a debug
 	 * message here: */
@@ -703,7 +731,8 @@ static bool funder_finalize_channel_setup(struct state *state,
 	msg = towire_funding_created(state, &state->channel_id,
 				     &state->funding.txid,
 				     state->funding.n,
-				     &sig->s);
+				     &sig->s,
+				     created_tlvs);
 	peer_write(state->pps, msg);
 
 	/* BOLT #2:
@@ -726,7 +755,8 @@ static bool funder_finalize_channel_setup(struct state *state,
 		goto fail;
 
 	sig->sighash_type = SIGHASH_ALL;
-	if (!fromwire_funding_signed(msg, &id_in, &sig->s))
+	if (!fromwire_funding_signed(tmpctx, msg, &id_in, &sig->s,
+				     &signed_tlvs))
 		peer_failed_err(state->pps, &state->channel_id,
 				"Parsing funding_signed: %s", tal_hex(msg, msg));
 	/* BOLT #2:
@@ -800,6 +830,15 @@ static bool funder_finalize_channel_setup(struct state *state,
 		status_failed(STATUS_FAIL_INTERNAL_ERROR,
 			      "Unable to set signature internally");
 
+	/* PoC: Liquid asset channel: and their sig for the fee reserve. */
+	if (liquid_channel_asset()
+	    && !liquid_check_fee_reserve_sig(*tx, wscript,
+					     &state->their_funding_pubkey,
+					     signed_tlvs->fee_reserve_sig))
+		peer_failed_err(state->pps, &state->channel_id,
+				"Bad or missing fee_reserve_sig on tx %s",
+				fmt_bitcoin_tx(tmpctx, *tx));
+
 	peer_billboard(false, "Funding channel: opening negotiation succeeded");
 
 	return true;
@@ -871,6 +910,8 @@ static u8 *fundee_channel(struct state *state, const u8 *open_channel_msg)
 	struct penalty_base *pbase;
 	struct tlv_accept_channel_tlvs *accept_tlvs;
 	struct tlv_open_channel_tlvs *open_tlvs;
+	struct tlv_funding_created_tlvs *created_tlvs;
+	struct tlv_funding_signed_tlvs *signed_tlvs;
 	struct amount_sat *reserve;
 	u32 min_feerate, max_feerate;
 
@@ -1157,10 +1198,11 @@ static u8 *fundee_channel(struct state *state, const u8 *open_channel_msg)
 	/* The message should be "funding_created" which tells us what funding
 	 * tx they generated; the sighash type is implied, so we set it here. */
 	theirsig.sighash_type = SIGHASH_ALL;
-	if (!fromwire_funding_created(msg, &id_in,
+	if (!fromwire_funding_created(tmpctx, msg, &id_in,
 				      &state->funding.txid,
 				      &funding_txout,
-				      &theirsig.s))
+				      &theirsig.s,
+				      &created_tlvs))
 		peer_failed_err(state->pps, &state->channel_id,
 			    "Parsing funding_created");
 	/* We only allow 16 bits for this on the wire. */
@@ -1266,6 +1308,16 @@ static u8 *fundee_channel(struct state *state, const u8 *open_channel_msg)
 					       &their_funding_pubkey));
 	}
 
+	/* PoC: Liquid asset channel: check their sig for the fee reserve too,
+	 * and keep it with our first commitment tx. */
+	if (liquid_channel_asset()
+	    && !liquid_check_fee_reserve_sig(local_commit, wscript,
+					     &their_funding_pubkey,
+					     created_tlvs->fee_reserve_sig))
+		peer_failed_err(state->pps, &state->channel_id,
+				"Bad or missing fee_reserve_sig on tx %s",
+				fmt_bitcoin_tx(tmpctx, local_commit));
+
 	/* BOLT #2:
 	 *
 	 * This message introduces the `channel_id` to identify the
@@ -1313,15 +1365,15 @@ static u8 *fundee_channel(struct state *state, const u8 *open_channel_msg)
 						   feerate);
 
 	wire_sync_write(HSM_FD, take(msg));
-	msg = wire_sync_read(tmpctx, HSM_FD);
-	if (!fromwire_hsmd_sign_tx_reply(msg, &sig))
-		status_failed(STATUS_FAIL_HSM_IO,
-			      "Bad sign_tx_reply %s", tal_hex(tmpctx, msg));
+	signed_tlvs = tlv_funding_signed_tlvs_new(tmpctx);
+	read_remote_commitment_sigs(signed_tlvs, &sig,
+				    &signed_tlvs->fee_reserve_sig);
 
 	/* We don't send this ourselves: channeld does, because master needs
 	 * to save state to disk before doing so. */
 	assert(sig.sighash_type == SIGHASH_ALL);
-	msg = towire_funding_signed(state, &state->channel_id, &sig.s);
+	msg = towire_funding_signed(state, &state->channel_id, &sig.s,
+				    signed_tlvs);
 
 	if (direct_outputs[LOCAL] != NULL)
 		pbase = penalty_base_new(tmpctx, 0, remote_commit,

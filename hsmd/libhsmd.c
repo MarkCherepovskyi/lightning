@@ -187,6 +187,7 @@ bool hsmd_check_client_capabilities(struct hsmd_client *client,
 	case WIRE_HSMD_INIT_REPLY_FAILURE:
 	case WIRE_HSMSTATUS_CLIENT_BAD_REQUEST:
 	case WIRE_HSMD_SIGN_COMMITMENT_TX_REPLY:
+	case WIRE_HSMD_SIGN_ASSET_COMMITMENT_TX_REPLY:
 	case WIRE_HSMD_VALIDATE_COMMITMENT_TX_REPLY:
 	case WIRE_HSMD_REVOKE_COMMITMENT_TX_REPLY:
 	case WIRE_HSMD_VALIDATE_REVOCATION_REPLY:
@@ -642,6 +643,21 @@ static void check_overgrind(const struct bitcoin_signature *sig)
 /*~ This covers several cases where onchaind is creating a transaction which
  * sends funds to our internal wallet. */
 /* FIXME: Derive output address for this client, and check it here! */
+/* PoC: Liquid asset channels.  Their commitment txs also spend the L-BTC
+ * fee reserve, which directly follows the funding output and is locked by
+ * the same 2-of-2: is input 1 of @tx that? */
+static bool spends_fee_reserve(const struct bitcoin_tx *tx)
+{
+	struct bitcoin_outpoint funding, reserve;
+
+	if (!is_elements(chainparams) || tx->wtx->num_inputs != 2)
+		return false;
+	bitcoin_tx_input_get_outpoint(tx, 0, &funding);
+	bitcoin_tx_input_get_outpoint(tx, 1, &reserve);
+	return bitcoin_txid_eq(&funding.txid, &reserve.txid)
+		&& reserve.n == funding.n + 1;
+}
+
 static u8 *handle_sign_to_us_tx(struct hsmd_client *c, const u8 *msg_in,
 				u32 input_num,
 				struct bitcoin_tx *tx,
@@ -1666,8 +1682,7 @@ static u8 *handle_sign_remote_commitment_tx(struct hsmd_client *c, const u8 *msg
 
 	/* Basic sanity checks. */
 	/* PoC: Liquid asset channels also spend the L-BTC fee reserve. */
-	if (tx->wtx->num_inputs != 1
-	    && !(is_elements(chainparams) && tx->wtx->num_inputs == 2))
+	if (tx->wtx->num_inputs != 1 && !spends_fee_reserve(tx))
 		return hsmd_status_bad_request_fmt(c, msg_in,
 						   "tx must have 1 input");
 
@@ -1688,6 +1703,18 @@ static u8 *handle_sign_remote_commitment_tx(struct hsmd_client *c, const u8 *msg
 		      SIGHASH_ALL,
 		      &sig);
 	check_overgrind(&sig);
+
+	if (spends_fee_reserve(tx)) {
+		struct bitcoin_signature reserve_sig;
+		sign_tx_input(tx, 1, NULL, funding_wscript,
+			      &secrets.funding_privkey,
+			      &local_funding_pubkey,
+			      SIGHASH_ALL,
+			      &reserve_sig);
+		check_overgrind(&reserve_sig);
+		return towire_hsmd_sign_asset_commitment_tx_reply(NULL, &sig,
+								  &reserve_sig);
+	}
 
 	return towire_hsmd_sign_tx_reply(NULL, &sig);
 }
@@ -1870,8 +1897,7 @@ static u8 *handle_sign_commitment_tx(struct hsmd_client *c, const u8 *msg_in)
 
 	/* Basic sanity checks. */
 	/* PoC: Liquid asset channels also spend the L-BTC fee reserve. */
-	if (tx->wtx->num_inputs != 1
-	    && !(is_elements(chainparams) && tx->wtx->num_inputs == 2))
+	if (tx->wtx->num_inputs != 1 && !spends_fee_reserve(tx))
 		return hsmd_status_bad_request(c, msg_in,
 					       "tx must have 1 input");
 
@@ -1895,6 +1921,18 @@ static u8 *handle_sign_commitment_tx(struct hsmd_client *c, const u8 *msg_in)
 		      SIGHASH_ALL,
 		      &sig);
 	check_overgrind(&sig);
+
+	if (spends_fee_reserve(tx)) {
+		struct bitcoin_signature reserve_sig;
+		sign_tx_input(tx, 1, NULL, funding_wscript,
+			      &secrets.funding_privkey,
+			      &local_funding_pubkey,
+			      SIGHASH_ALL,
+			      &reserve_sig);
+		check_overgrind(&reserve_sig);
+		return towire_hsmd_sign_asset_commitment_tx_reply(NULL, &sig,
+								  &reserve_sig);
+	}
 
 	return towire_hsmd_sign_commitment_tx_reply(NULL, &sig);
 }
@@ -2331,6 +2369,7 @@ u8 *hsmd_handle_client_message(const tal_t *ctx, struct hsmd_client *client,
 	case WIRE_HSMD_INIT_REPLY_FAILURE:
 	case WIRE_HSMSTATUS_CLIENT_BAD_REQUEST:
 	case WIRE_HSMD_SIGN_COMMITMENT_TX_REPLY:
+	case WIRE_HSMD_SIGN_ASSET_COMMITMENT_TX_REPLY:
 	case WIRE_HSMD_VALIDATE_COMMITMENT_TX_REPLY:
 	case WIRE_HSMD_REVOKE_COMMITMENT_TX_REPLY:
 	case WIRE_HSMD_VALIDATE_REVOCATION_REPLY:
