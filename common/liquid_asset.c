@@ -1,6 +1,8 @@
 #include "config.h"
 #include <assert.h>
 #include <bitcoin/chainparams.h>
+#include <bitcoin/psbt.h>
+#include <bitcoin/signature.h>
 #include <ccan/build_assert/build_assert.h>
 #include <ccan/str/hex/hex.h>
 #include <common/liquid_asset.h>
@@ -115,6 +117,24 @@ void liquid_add_fee_reserve_input(struct bitcoin_tx *tx,
 
 	bitcoin_tx_add_input(tx, &reserve, sequence, NULL,
 			     liquid_fee_reserve(), NULL, funding_wscript);
+}
+
+bool liquid_check_fee_reserve_sig(struct bitcoin_tx *tx,
+				  const u8 *funding_wscript,
+				  const struct pubkey *their_funding_pubkey,
+				  const secp256k1_ecdsa_signature *sig)
+{
+	struct bitcoin_signature bsig;
+
+	if (!sig || tx->wtx->num_inputs != 2)
+		return false;
+	bsig.s = *sig;
+	bsig.sighash_type = SIGHASH_ALL;
+	if (!check_tx_sig(tx, 1, NULL, funding_wscript,
+			  their_funding_pubkey, &bsig))
+		return false;
+	return psbt_input_set_signature(tx->psbt, 1, their_funding_pubkey,
+					&bsig);
 }
 
 int liquid_finish_channel_tx(struct bitcoin_tx *tx,

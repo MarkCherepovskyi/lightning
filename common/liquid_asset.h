@@ -2,6 +2,8 @@
 #define LIGHTNING_COMMON_LIQUID_ASSET_H
 #include "config.h"
 #include <bitcoin/block.h>
+#include <bitcoin/pubkey.h>
+#include <bitcoin/signature.h>
 #include <bitcoin/tx.h>
 
 /* PROOF OF CONCEPT: Liquid issued-asset channels.
@@ -63,6 +65,15 @@ void liquid_add_fee_reserve_input(struct bitcoin_tx *tx,
 				  const struct bitcoin_outpoint *funding,
 				  u32 sequence,
 				  const u8 *funding_wscript);
+
+/* Asset channel commitments spend the fee reserve as input 1, with the same
+ * 2-of-2 as the funding input.  Check the peer's signature @sig (NULL if
+ * they didn't send one) for it, and keep it in the PSBT as we do theirs for
+ * input 0: that's how lightningd completes input 1 when it broadcasts. */
+bool liquid_check_fee_reserve_sig(struct bitcoin_tx *tx,
+				  const u8 *funding_wscript,
+				  const struct pubkey *their_funding_pubkey,
+				  const secp256k1_ecdsa_signature *sig);
 
 /* Finish an asset channel transaction before it gets sorted:
  *  - asset outputs must add up to the asset funding amount, so whatever
