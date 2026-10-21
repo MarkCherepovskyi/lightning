@@ -172,6 +172,8 @@ def test_liquid_asset_channel_poc(node_factory, bitcoind):
     for n in (l1, l2, l3):
         wait_for(lambda: all(c['state'] == 'CHANNELD_NORMAL'
                              for c in n.rpc.listpeerchannels()['channels']))
+    # Routes' CLTVs count from l1's height: l3 mustn't be ahead of it.
+    sync_blockheight(bitcoind, [l1, l2, l3])
     funding = {'lbtc12': lbtc_funding[l1], 'lbtc23': lbtc_funding[l2],
                'asset12': asset_funding[l1], 'asset23': asset_funding[l2]}
     # listpeerchannels says which channels are asset channels.
@@ -775,6 +777,7 @@ def test_liquid_asset_htlc_onchain_upstream(node_factory, bitcoind, outcome):
     for n in (l1, l2, l3):
         wait_for(lambda: all(c['state'] == 'CHANNELD_NORMAL'
                              for c in n.rpc.listpeerchannels()['channels']))
+    sync_blockheight(bitcoind, [l1, l2, l3])
 
     if outcome == 'timeout':
         # l3 doesn't know this payment.
