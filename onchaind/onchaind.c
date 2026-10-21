@@ -1695,6 +1695,7 @@ static void wait_for_resolved(struct tracked_output **outs)
 		case WIRE_ONCHAIND_NOTIFY_COIN_MVT:
 		case WIRE_ONCHAIND_NOTIFY_PENALTY_ADJ:
 		case WIRE_ONCHAIND_SPEND_TO_US:
+		case WIRE_ONCHAIND_SPEND_ASSET_TO_US:
 		case WIRE_ONCHAIND_SPEND_PENALTY:
 		case WIRE_ONCHAIND_SPEND_HTLC_SUCCESS:
 		case WIRE_ONCHAIND_SPEND_HTLC_TIMEOUT:
@@ -2129,6 +2130,125 @@ static u8 *scriptpubkey_to_remote(const tal_t *ctx,
 	}
 }
 
+/* PoC: Liquid asset channels (see common/liquid_asset.h).  The channel
+ * balance is in an issued asset, so most commitment outputs aren't L-BTC,
+ * and the opener's L-BTC change from the fee reserve goes to the same script
+ * as the opener's asset output.  On-chain fees are L-BTC only. */
+static bool is_asset_output(const struct wally_tx_output *out)
+{
+	struct amount_asset amt;
+
+	if (!chainparams->is_elements || !out || out->script_len == 0)
+		return false;
+	amt = wally_tx_output_get_amount(out);
+	return !amount_asset_is_main(&amt);
+}
+
+/* The output's value (in asset units, for an asset output) */
+static struct amount_sat output_value(const struct wally_tx_output *out)
+{
+	struct amount_asset amt = wally_tx_output_get_amount(out);
+	return amount_sat(amt.value);
+}
+
+/* The L-BTC output paying to the same script as asset output @i, or -1. */
+static int fee_reserve_change(const struct tx_parts *tx, size_t i)
+{
+	for (size_t j = 0; j < tal_count(tx->outputs); j++) {
+		if (j == i || !tx->outputs[j]
+		    || tx->outputs[j]->script_len == 0
+		    || is_asset_output(tx->outputs[j]))
+			continue;
+		if (memeq(tx->outputs[j]->script, tx->outputs[j]->script_len,
+			  tx->outputs[i]->script, tx->outputs[i]->script_len))
+			return j;
+	}
+	return -1;
+}
+
+/* Is output @j the fee reserve change of an asset output?  Then it's dealt
+ * with together with that output. */
+static bool is_fee_reserve_change(const struct tx_parts *tx, size_t j)
+{
+	for (size_t i = 0; i < tal_count(tx->outputs); i++) {
+		if (is_asset_output(tx->outputs[i])
+		    && fee_reserve_change(tx, i) == (int)j)
+			return true;
+	}
+	return false;
+}
+
+/* Ask lightningd to sweep our asset output @out.  If we opened the channel,
+ * our fee reserve change shares its script: it's spent in the same tx, and
+ * pays the fee (else lightningd uses L-BTC from our wallet).  That output
+ * gets the same proposal, so the sweep resolves it too. */
+static void propose_asset_to_us(struct tracked_output ***outs,
+				const struct tx_parts *tx,
+				struct tracked_output *out,
+				u32 sequence,
+				u32 block_required,
+				bool to_remote,
+				const struct pubkey *per_commit_point,
+				const u8 *scriptpubkey,
+				const u8 *wscript)
+{
+	struct tracked_output *change = NULL;
+	int j = fee_reserve_change(tx, out->outpoint.n);
+	const u8 *msg;
+
+	if (j >= 0) {
+		struct bitcoin_outpoint outpoint;
+		outpoint.txid = tx->txid;
+		outpoint.n = j;
+		change = new_tracked_output(outs, &outpoint,
+					    out->tx_blockheight,
+					    out->tx_type,
+					    output_value(tx->outputs[j]),
+					    out->output_type,
+					    NULL, NULL, NULL);
+	}
+
+	msg = towire_onchaind_spend_asset_to_us(NULL, &out->outpoint, out->sat,
+						change ? &change->outpoint : NULL,
+						change ? change->sat : AMOUNT_SAT(0),
+						sequence, block_required,
+						to_remote, commit_num,
+						per_commit_point,
+						scriptpubkey, wscript);
+	propose_resolution_to_master(out, take(msg), block_required,
+				     OUR_DELAYED_RETURN_TO_WALLET);
+
+	if (change) {
+		change->proposal = new_proposed_resolution(change,
+							   block_required,
+							   OUR_DELAYED_RETURN_TO_WALLET);
+		change->proposal->welements = out->proposal->welements;
+		/* lightningd said not to wait for it */
+		if (out->resolved)
+			ignore_output(change);
+	}
+}
+
+/* We can't resolve this asset output (HTLC or revoked) yet: say so, and
+ * don't wait for it. */
+static void ignore_asset_output(struct tracked_output ***outs,
+				const struct bitcoin_outpoint *outpoint,
+				u32 tx_blockheight,
+				enum tx_type tx_type,
+				struct amount_sat amt,
+				enum output_type output_type)
+{
+	struct tracked_output *out;
+
+	status_broken("Liquid asset channel: can't resolve %s/%s output %u"
+		      " on-chain yet, ignoring it",
+		      tx_type_name(tx_type), output_type_name(output_type),
+		      outpoint->n);
+	out = new_tracked_output(outs, outpoint, tx_blockheight, tx_type, amt,
+				 output_type, NULL, NULL, NULL);
+	ignore_output(out);
+}
+
 static void our_unilateral_to_us(struct tracked_output ***outs,
 				 const struct bitcoin_outpoint *outpoint,
 				 u32 tx_blockheight,
@@ -2173,6 +2293,29 @@ static void our_unilateral_to_us(struct tracked_output ***outs,
 	propose_resolution_to_master(out, take(msg),
 				     rel_blockheight(out, sequence),
 				     OUR_DELAYED_RETURN_TO_WALLET);
+}
+
+/* PoC: our to_local output in a Liquid asset channel */
+static void our_unilateral_asset_to_us(struct tracked_output ***outs,
+				       const struct tx_parts *tx,
+				       const struct bitcoin_outpoint *outpoint,
+				       u32 tx_blockheight,
+				       struct amount_sat amt,
+				       u32 sequence,
+				       const u8 *local_scriptpubkey,
+				       const u8 *local_wscript)
+{
+	struct tracked_output *out;
+
+	out = new_tracked_output(outs, outpoint, tx_blockheight,
+				 OUR_UNILATERAL,
+				 amt,
+				 DELAYED_OUTPUT_TO_US,
+				 NULL, NULL, NULL);
+	propose_asset_to_us(outs, tx, out, sequence,
+			    rel_blockheight(out, sequence),
+			    false, NULL,
+			    local_scriptpubkey, local_wscript);
 }
 
 static void handle_our_unilateral(const struct tx_parts *tx,
@@ -2271,15 +2414,17 @@ static void handle_our_unilateral(const struct tx_parts *tx,
 		struct tracked_output *out;
 		const size_t *matches;
 		size_t which_htlc;
-		struct amount_asset asset = wally_tx_output_get_amount(tx->outputs[i]);
 		struct amount_sat amt;
 		struct bitcoin_outpoint outpoint;
 
 		outpoint.txid = tx->txid;
 		outpoint.n = i;
 
-		assert(amount_asset_is_main(&asset));
-		amt = amount_asset_to_sat(&asset);
+		/* PoC: Liquid asset channel outputs are in the asset, and
+		 * fee reserve change goes with its asset output. */
+		amt = output_value(tx->outputs[i]);
+		if (is_fee_reserve_change(tx, i))
+			continue;
 
 		if (chainparams->is_elements
 		    && tx->outputs[i]->script_len == 0) {
@@ -2297,10 +2442,19 @@ static void handle_our_unilateral(const struct tx_parts *tx,
 		} else if (script[LOCAL]
 			   && wally_tx_output_scripteq(tx->outputs[i],
 						       script[LOCAL])) {
-			our_unilateral_to_us(&outs, &outpoint, tx_blockheight,
-					     amt, to_self_delay[LOCAL],
-					     script[LOCAL],
-					     local_wscript);
+			if (is_asset_output(tx->outputs[i]))
+				our_unilateral_asset_to_us(&outs, tx, &outpoint,
+							   tx_blockheight,
+							   amt,
+							   to_self_delay[LOCAL],
+							   script[LOCAL],
+							   local_wscript);
+			else
+				our_unilateral_to_us(&outs, &outpoint,
+						     tx_blockheight,
+						     amt, to_self_delay[LOCAL],
+						     script[LOCAL],
+						     local_wscript);
 
 			script[LOCAL] = NULL;
 			continue;
@@ -2357,6 +2511,17 @@ static void handle_our_unilateral(const struct tx_parts *tx,
 		}
 
 		matches = match_htlc_output(tmpctx, tx->outputs[i], htlc_scripts);
+		/* PoC: no HTLC resolution for Liquid asset channels yet. */
+		if (tal_count(matches) && is_asset_output(tx->outputs[i])) {
+			ignore_asset_output(&outs, &outpoint, tx_blockheight,
+					    OUR_UNILATERAL, amt,
+					    matches_direction(matches,
+							      htlcs_info->htlcs)
+					    == LOCAL ? OUR_HTLC : THEIR_HTLC);
+			remote_htlc_sigs++;
+			htlc_scripts[matches[0]] = NULL;
+			continue;
+		}
 		/* FIXME: limp along when this happens! */
 		if (tal_count(matches) == 0) {
 			bool found = false;
@@ -2617,6 +2782,45 @@ static void their_unilateral_local(struct tracked_output ***outs,
 }
 
 
+/* PoC: our to_remote output in a Liquid asset channel: the wallet can't hold
+ * the asset, so we sweep it instead of telling the wallet about it. */
+static void their_unilateral_asset_local(struct tracked_output ***outs,
+					 const struct tx_parts *tx,
+					 const struct bitcoin_outpoint *outpoint,
+					 u32 tx_blockheight,
+					 struct amount_sat amt,
+					 const u8 *local_scriptpubkey,
+					 enum tx_type tx_type,
+					 u32 csv_lock)
+{
+	struct tracked_output *out;
+	const u8 *wscript;
+	u32 sequence;
+
+	out = new_tracked_output(outs, outpoint, tx_blockheight, tx_type, amt,
+				 OUTPUT_TO_US, NULL, NULL, NULL);
+
+	/* With anchors, to_remote is a P2WSH with a CSV lock (see
+	 * scriptpubkey_to_remote), otherwise a P2WPKH. */
+	if (option_anchor_outputs || option_anchors_zero_fee_htlc_tx) {
+		wscript = bitcoin_wscript_to_remote_anchored(tmpctx,
+							     &keyset->other_payment_key,
+							     csv_lock);
+		sequence = csv_lock;
+	} else {
+		wscript = NULL;
+		sequence = BITCOIN_TX_RBF_SEQUENCE;
+		csv_lock = 1;
+	}
+
+	/* A NULL per_commit_point means the key doesn't need tweaking. */
+	propose_asset_to_us(outs, tx, out, sequence,
+			    rel_blockheight(out, csv_lock), true,
+			    commit_num >= static_remotekey_start[REMOTE]
+			    ? NULL : remote_per_commitment_point,
+			    local_scriptpubkey, wscript);
+}
+
 /* BOLT #5:
  *
  * If any node tries to cheat by broadcasting an outdated commitment
@@ -2757,15 +2961,17 @@ static void handle_their_cheat(const struct tx_parts *tx,
 		struct tracked_output *out;
 		const size_t *matches;
 		size_t which_htlc;
-		struct amount_asset asset = wally_tx_output_get_amount(tx->outputs[i]);
 		struct amount_sat amt;
 		struct bitcoin_outpoint outpoint;
 
 		outpoint.txid = tx->txid;
 		outpoint.n = i;
 
-		assert(amount_asset_is_main(&asset));
-		amt = amount_asset_to_sat(&asset);
+		/* PoC: Liquid asset channel outputs are in the asset, and
+		 * fee reserve change goes with its asset output. */
+		amt = output_value(tx->outputs[i]);
+		if (is_fee_reserve_change(tx, i))
+			continue;
 
 		if (chainparams->is_elements
 		    && tx->outputs[i]->script_len == 0) {
@@ -2784,11 +2990,31 @@ static void handle_their_cheat(const struct tx_parts *tx,
 		if (script[LOCAL]
 		    && wally_tx_output_scripteq(tx->outputs[i],
 						script[LOCAL])) {
-			their_unilateral_local(&outs, tx, &outpoint,
-					       tx_blockheight,
-					       amt, script[LOCAL],
-					       THEIR_REVOKED_UNILATERAL, 1);
+			if (is_asset_output(tx->outputs[i]))
+				their_unilateral_asset_local(&outs, tx,
+							     &outpoint,
+							     tx_blockheight,
+							     amt, script[LOCAL],
+							     THEIR_REVOKED_UNILATERAL,
+							     1);
+			else
+				their_unilateral_local(&outs, tx, &outpoint,
+						       tx_blockheight,
+						       amt, script[LOCAL],
+						       THEIR_REVOKED_UNILATERAL,
+						       1);
 			script[LOCAL] = NULL;
+			continue;
+		}
+		/* PoC: no penalties for Liquid asset channels yet. */
+		if (script[REMOTE]
+		    && wally_tx_output_scripteq(tx->outputs[i],
+						script[REMOTE])
+		    && is_asset_output(tx->outputs[i])) {
+			ignore_asset_output(&outs, &outpoint, tx_blockheight,
+					    THEIR_REVOKED_UNILATERAL, amt,
+					    DELAYED_CHEAT_OUTPUT_TO_THEM);
+			script[REMOTE] = NULL;
 			continue;
 		}
 		if (script[REMOTE]
@@ -2915,6 +3141,16 @@ static void handle_their_cheat(const struct tx_parts *tx,
 		/* In this case, we don't care which HTLC we choose; so pick
 		   first one */
 		which_htlc = matches[0];
+		/* PoC: no penalties for Liquid asset channels yet. */
+		if (is_asset_output(tx->outputs[i])) {
+			ignore_asset_output(&outs, &outpoint, tx_blockheight,
+					    THEIR_REVOKED_UNILATERAL, amt,
+					    matches_direction(matches,
+							      htlcs_info->htlcs)
+					    == LOCAL ? OUR_HTLC : THEIR_HTLC);
+			htlc_scripts[which_htlc] = NULL;
+			continue;
+		}
 		if (matches_direction(matches, htlcs_info->htlcs) == LOCAL) {
 			/* BOLT #5:
 			 *
@@ -3080,12 +3316,14 @@ static void handle_their_unilateral(const struct tx_parts *tx,
 		struct tracked_output *out;
 		const size_t *matches;
 		size_t which_htlc;
-		struct amount_asset asset = wally_tx_output_get_amount(tx->outputs[i]);
 		struct amount_sat amt;
 		struct bitcoin_outpoint outpoint;
 
-		assert(amount_asset_is_main(&asset));
-		amt = amount_asset_to_sat(&asset);
+		/* PoC: Liquid asset channel outputs are in the asset, and
+		 * fee reserve change goes with its asset output. */
+		amt = output_value(tx->outputs[i]);
+		if (is_fee_reserve_change(tx, i))
+			continue;
 
 		outpoint.txid = tx->txid;
 		outpoint.n = i;
@@ -3105,10 +3343,18 @@ static void handle_their_unilateral(const struct tx_parts *tx,
 		} else if (script[LOCAL]
 			   && wally_tx_output_scripteq(tx->outputs[i],
 						       script[LOCAL])) {
-			their_unilateral_local(&outs, tx, &outpoint,
-					       tx_blockheight,
-					       amt, script[LOCAL],
-					       THEIR_UNILATERAL, 1);
+			if (is_asset_output(tx->outputs[i]))
+				their_unilateral_asset_local(&outs, tx,
+							     &outpoint,
+							     tx_blockheight,
+							     amt, script[LOCAL],
+							     THEIR_UNILATERAL,
+							     1);
+			else
+				their_unilateral_local(&outs, tx, &outpoint,
+						       tx_blockheight,
+						       amt, script[LOCAL],
+						       THEIR_UNILATERAL, 1);
 
 			script[LOCAL] = NULL;
 			continue;
@@ -3166,6 +3412,16 @@ static void handle_their_unilateral(const struct tx_parts *tx,
 		}
 
 		matches = match_htlc_output(tmpctx, tx->outputs[i], htlc_scripts);
+		/* PoC: no HTLC resolution for Liquid asset channels yet. */
+		if (tal_count(matches) && is_asset_output(tx->outputs[i])) {
+			ignore_asset_output(&outs, &outpoint, tx_blockheight,
+					    THEIR_UNILATERAL, amt,
+					    matches_direction(matches,
+							      htlcs_info->htlcs)
+					    == LOCAL ? OUR_HTLC : THEIR_HTLC);
+			htlc_scripts[matches[0]] = NULL;
+			continue;
+		}
 		if (tal_count(matches) == 0) {
 			bool found = false;
 
@@ -3320,6 +3576,15 @@ static void handle_unknown_commitment(const struct tx_parts *tx,
 						      local_script))
 				continue;
 
+			/* PoC: Liquid asset channels: the wallet can't
+			 * hold assets, and we don't sweep from unknown
+			 * commitments. */
+			if (is_asset_output(tx->outputs[i])) {
+				status_broken("Liquid asset channel: not"
+					      " recovering asset output %zu"
+					      " of unknown commitment", i);
+				continue;
+			}
 			asset = wally_tx_output_get_amount(tx->outputs[i]);
 			assert(amount_asset_is_main(&asset));
 			amt = amount_asset_to_sat(&asset);
@@ -3364,9 +3629,9 @@ found:
 		if (i == to_us_output)
 			continue;
 
+		/* PoC: Liquid asset channel outputs are in the asset */
 		asset = wally_tx_output_get_amount(tx->outputs[i]);
-		assert(amount_asset_is_main(&asset));
-		amt = amount_asset_to_sat(&asset);
+		amt = amount_sat(asset.value);
 
 		outpoint.txid = tx->txid;
 		outpoint.n = i;

@@ -588,10 +588,22 @@ static void sign_our_inputs(struct hsm_utxo **utxos, struct wally_psbt *psbt)
 					= bitcoin_wscript_to_remote_anchored(tmpctx,
 									     &pubkey,
 									     utxo->close_info->csv);
+				/* PoC: a Liquid asset channel's to_remote
+				 * output is in the asset, not L-BTC. */
+				const u8 *asset = NULL;
+				const struct wally_tx_output *wout
+					= psbt->inputs[j].witness_utxo;
+				if (is_elements(chainparams) && wout
+				    && wout->asset_len == ELEMENTS_ASSET_LEN)
+					asset = tal_dup_arr(tmpctx, u8,
+							    wout->asset,
+							    ELEMENTS_ASSET_LEN,
+							    0);
 				psbt_input_set_witscript(psbt, j, wscript);
-				psbt_input_set_wit_utxo(psbt, j,
-							scriptpubkey_p2wsh(psbt, wscript),
-							utxo->amount);
+				psbt_input_set_wit_utxo_asset(psbt, j,
+							      scriptpubkey_p2wsh(psbt, wscript),
+							      utxo->amount,
+							      asset);
 			}
 			tal_wally_start();
 			if (!is_cache_enabled) {
@@ -677,10 +689,12 @@ static u8 *handle_sign_to_us_tx(struct hsmd_client *c, const u8 *msg_in,
 		return hsmd_status_bad_request(c, msg_in,
 					       "bad pubkey_from_privkey");
 
-	if (tx->wtx->num_inputs != 1)
+	/* PoC: Liquid asset channel sweeps also spend L-BTC to pay the fee. */
+	if (tx->wtx->num_inputs != 1 && !is_elements(chainparams))
 		return hsmd_status_bad_request(c, msg_in, "bad txinput count");
 
-	sign_tx_input(tx, 0, NULL, wscript, privkey, &pubkey, sighash_type, &sig);
+	sign_tx_input(tx, input_num, NULL, wscript, privkey, &pubkey,
+		      sighash_type, &sig);
 	check_overgrind(&sig);
 
 	return towire_hsmd_sign_tx_reply(NULL, &sig);

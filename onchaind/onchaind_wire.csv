@@ -198,6 +198,26 @@ msgdata,onchaind_spend_htlc_expired,remote_per_commitment_point,pubkey,
 msgdata,onchaind_spend_htlc_expired,wscript_len,u32,
 msgdata,onchaind_spend_htlc_expired,wscript,u8,wscript_len
 
+# PoC: Liquid asset channels.  We tell lightningd to sweep our asset output:
+# to_local once its CSV delay is over (signed with the delayed key for
+# commit_num), or our to_remote (signed like a to_remote wallet UTXO).  Fees
+# are L-BTC, so it also spends fee_input if set (the opener's L-BTC change,
+# with the same script), otherwise L-BTC from our wallet.
+msgtype,onchaind_spend_asset_to_us,5046
+msgdata,onchaind_spend_asset_to_us,outpoint,bitcoin_outpoint,
+msgdata,onchaind_spend_asset_to_us,outpoint_amount,amount_sat,
+msgdata,onchaind_spend_asset_to_us,fee_input,?bitcoin_outpoint,
+msgdata,onchaind_spend_asset_to_us,fee_input_amount,amount_sat,
+msgdata,onchaind_spend_asset_to_us,sequence,u32,
+msgdata,onchaind_spend_asset_to_us,minblock,u32,
+msgdata,onchaind_spend_asset_to_us,to_remote,bool,
+msgdata,onchaind_spend_asset_to_us,commit_num,u64,
+msgdata,onchaind_spend_asset_to_us,per_commit_point,?pubkey,
+msgdata,onchaind_spend_asset_to_us,scriptpubkey_len,u16,
+msgdata,onchaind_spend_asset_to_us,scriptpubkey,u8,scriptpubkey_len
+msgdata,onchaind_spend_asset_to_us,wscript_len,u32,
+msgdata,onchaind_spend_asset_to_us,wscript,u8,wscript_len
+
 subtype,onchain_witness_element
 subtypedata,onchain_witness_element,is_signature,bool,
 subtypedata,onchain_witness_element,len,u32,
