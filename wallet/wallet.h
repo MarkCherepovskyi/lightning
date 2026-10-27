@@ -1232,6 +1232,50 @@ bool wallet_outpoint_spend(const tal_t *ctx, struct wallet *w,
 			   const u32 blockheight,
 			   const struct bitcoin_outpoint *outpoint);
 
+/* PoC: an output in a Liquid asset (not L-BTC) paying to our wallet keys. */
+struct asset_output {
+	struct bitcoin_outpoint outpoint;
+	/* 33-byte asset tag */
+	u8 *asset;
+	/* In units of the asset */
+	struct amount_sat amount;
+	u8 *scriptpubkey;
+	/* 0 if unconfirmed */
+	u32 blockheight;
+	/* 0 if unspent */
+	u32 spendheight;
+	/* Wallet key index of scriptpubkey (a p2wpkh) */
+	u32 keyindex;
+	/* Not to be used for a spend before this block (0: free) */
+	u32 reserved_til;
+};
+
+/* PoC: remember an asset output we own (idempotent; sets the blockheight). */
+void wallet_add_asset_output(struct wallet *w,
+			     const struct bitcoin_outpoint *outpoint,
+			     const u8 *asset,
+			     struct amount_sat amount,
+			     const u8 *scriptpubkey,
+			     u32 keyindex,
+			     u32 blockheight);
+
+/* PoC: is this one of our asset outputs (not L-BTC, so not a utxo)? */
+bool wallet_is_asset_output(struct wallet *w,
+			    const struct bitcoin_outpoint *outpoint);
+
+/* PoC: hold an asset output for a spend we're making (for @nblocks), or let
+ * it go again. */
+void wallet_reserve_asset_output(struct wallet *w,
+				 const struct bitcoin_outpoint *outpoint,
+				 u32 blockheight, u32 nblocks);
+void wallet_unreserve_asset_output(struct wallet *w,
+				   const struct bitcoin_outpoint *outpoint);
+
+/* PoC: all asset outputs we own (including spent ones if @spent). */
+struct asset_output **wallet_get_asset_outputs(const tal_t *ctx,
+					       struct wallet *w,
+					       bool spent);
+
 struct outpoint *wallet_outpoint_for_scid(const tal_t *ctx, struct wallet *w,
 					  struct short_channel_id scid);
 

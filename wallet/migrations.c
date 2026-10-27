@@ -1227,6 +1227,20 @@ static const struct db_migration dbmigrations[] = {
     {SQL("ALTER TABLE invoices ADD liquid_asset BLOB DEFAULT NULL;"), NULL},
     /* PoC: asset of P2WSH outputs kept for gossip checks (NULL: the chain's own) */
     {SQL("ALTER TABLE utxoset ADD asset BLOB DEFAULT NULL;"), NULL},
+    /* PoC: Liquid asset outputs paying to our wallet keys (we can't spend
+     * them with the wallet, but we know about them) */
+    {SQL("CREATE TABLE our_asset_outputs ("
+	 "  txid BLOB"
+	 ", outnum INTEGER"
+	 ", asset BLOB"
+	 ", amount BIGINT"
+	 ", scriptpubkey BLOB"
+	 ", blockheight INTEGER DEFAULT 0"
+	 ", spendheight INTEGER DEFAULT NULL"
+	 ", PRIMARY KEY (txid, outnum));"), NULL},
+    /* PoC: what we need to spend asset outputs with the wallet */
+    {SQL("ALTER TABLE our_asset_outputs ADD keyindex INTEGER DEFAULT 0;"), NULL},
+    {SQL("ALTER TABLE our_asset_outputs ADD reserved_til INTEGER DEFAULT 0;"), NULL},
 };
 
 const struct db_migration *get_db_migrations(size_t *num)

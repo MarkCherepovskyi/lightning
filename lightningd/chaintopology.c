@@ -934,6 +934,9 @@ static void record_wallet_spend(struct lightningd *ld,
 
 	/* Find the amount this was for */
 	utxo = wallet_utxo_get(tmpctx, ld->wallet, outpoint);
+	/* PoC: asset outputs aren't utxos, and aren't in the books */
+	if (!utxo && wallet_is_asset_output(ld->wallet, outpoint))
+		return;
 	if (!utxo) {
 		log_broken(ld->log, "No record of utxo %s",
 			   fmt_bitcoin_outpoint(tmpctx,

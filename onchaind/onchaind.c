@@ -211,8 +211,47 @@ static void trim_maximum_feerate(struct amount_sat funding,
 	status_debug("... to %u", max_possible_feerate);
 }
 
+static bool is_asset_output(const struct wally_tx_output *out);
+
+/* PoC: an asset channel's account is in units of its asset, so L-BTC outputs
+ * of its transactions (anchors, the opener's change) must stay out of it. */
+static struct bitcoin_outpoint *lbtc_outpoints;
+
+static void note_lbtc_outputs(const struct tx_parts *tx)
+{
+	if (!liquid_channel_asset())
+		return;
+	for (size_t i = 0; i < tal_count(tx->outputs); i++) {
+		struct bitcoin_outpoint op;
+
+		if (!tx->outputs[i] || is_asset_output(tx->outputs[i]))
+			continue;
+		op.txid = tx->txid;
+		op.n = i;
+		if (!lbtc_outpoints)
+			lbtc_outpoints = notleak(tal_arr(NULL,
+							 struct bitcoin_outpoint,
+							 0));
+		tal_arr_expand(&lbtc_outpoints, op);
+	}
+}
+
+static bool is_lbtc_outpoint(const struct bitcoin_outpoint *outpoint)
+{
+	for (size_t i = 0; i < tal_count(lbtc_outpoints); i++) {
+		if (bitcoin_outpoint_eq(&lbtc_outpoints[i], outpoint))
+			return true;
+	}
+	return false;
+}
+
 static void send_coin_mvt(struct chain_coin_mvt *mvt TAKES)
 {
+	if (liquid_channel_asset() && is_lbtc_outpoint(&mvt->outpoint)) {
+		tal_free_if_taken(mvt);
+		return;
+	}
+
 	wire_sync_write(REQ_FD,
 			take(towire_onchaind_notify_coin_mvt(NULL, mvt)));
 
@@ -271,7 +310,7 @@ static void record_mutual_close(const struct tx_parts *tx,
 		out.n = i;
 		out.txid = tx->txid;
 		record_external_output(&out,
-				       amount_sat(tx->outputs[i]->satoshi),
+				       amount_sat(wally_tx_output_get_amount(tx->outputs[i]).value),
 				       blockheight,
 				       mk_mvt_tags(MVT_TO_THEM));
 		break;
@@ -1854,6 +1893,7 @@ static void handle_mutual_close(struct tracked_output **outs,
 				const struct tx_parts *tx)
 {
 	/* In this case, we don't care about htlcs: there are none. */
+	note_lbtc_outputs(tx);
 	init_reply(tmpctx, "Tracking mutual close transaction");
 
 	/* Annotate the first input as close. We can currently only have a
@@ -2394,6 +2434,7 @@ static void handle_our_unilateral(const struct tx_parts *tx,
 	size_t i;
 	struct htlcs_info *htlcs_info;
 
+	note_lbtc_outputs(tx);
 	htlcs_info = init_reply(tx, "Tracking our own unilateral close");
 	onchain_annotate_txin(&tx->txid, 0, TX_CHANNEL_UNILATERAL);
 
@@ -2926,6 +2967,7 @@ static void handle_their_cheat(const struct tx_parts *tx,
 	size_t i;
 	struct htlcs_info *htlcs_info;
 
+	note_lbtc_outputs(tx);
 	htlcs_info = init_reply(tx,
 				"Tracking their illegal close: taking all funds");
 	onchain_annotate_txin(
@@ -3271,6 +3313,7 @@ static void handle_their_unilateral(const struct tx_parts *tx,
 	size_t i;
 	struct htlcs_info *htlcs_info;
 
+	note_lbtc_outputs(tx);
 	htlcs_info = init_reply(tx, "Tracking their unilateral close");
 	onchain_annotate_txin(&tx->txid, 0, TX_CHANNEL_UNILATERAL | TX_THEIRS);
 
@@ -3608,6 +3651,7 @@ static void handle_unknown_commitment(const struct tx_parts *tx,
 	struct htlcs_info *htlcs_info;
 
 	onchain_annotate_txin(&tx->txid, 0, TX_CHANNEL_UNILATERAL | TX_THEIRS);
+	note_lbtc_outputs(tx);
 
 	resolved_by_other(outs[0], &tx->txid, UNKNOWN_UNILATERAL);
 

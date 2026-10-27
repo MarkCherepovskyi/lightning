@@ -441,6 +441,75 @@ def mine_until_forgotten(bitcoind, nodes, maxblocks=200):
     raise ValueError("onchaind not done after {} blocks".format(maxblocks))
 
 
+@pytest.mark.skipif(TEST_NETWORK != 'liquid-regtest',
+                    reason="Liquid asset channels need elementsd")
+def test_liquid_asset_wallet_spend_and_bookkeeper(node_factory, bitcoind):
+    """The asset of a force-closed channel lands on a wallet key: it's listed
+    by listassetfunds, bookkeeper balances the channel's account (in asset
+    units) and `withdrawasset` sends it on, with the change back to us."""
+    lbtc = bitcoind.rpc.dumpassetlabels()['bitcoin']
+    asset = bitcoind.rpc.issueasset(1000, 0, False)['asset']
+    bitcoind.generate_block(1)
+
+    l1, l2 = node_factory.get_nodes(2)
+    l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
+    # l1 needs L-BTC in its wallet to pay for a withdrawal.
+    for _ in range(2):
+        l1.fundwallet(10**6)
+    # No close_to: the asset comes to l1's wallet.
+    funding = fund_asset_channel(bitcoind, l1, l2, asset, lbtc)
+    bitcoind.generate_block(6, wait_for_mempool=funding)
+    for n in (l1, l2):
+        wait_for(lambda: only_one(n.rpc.listpeerchannels()['channels'])['state'] == 'CHANNELD_NORMAL')
+    ch = only_one(l1.rpc.listpeerchannels()['channels'])
+
+    l2.stop()
+    assert l1.rpc.close(ch['channel_id'], unilateraltimeout=1)['type'] == 'unilateral'
+    bitcoind.generate_block(1, wait_for_mempool=1)
+    bitcoind.generate_block(10)
+    # The sweep waits for the CSV delay, then confirms.
+    wait_for(lambda: len(bitcoind.rpc.getrawmempool()) > 0)
+    bitcoind.generate_block(1, wait_for_mempool=1)
+    bitcoind.generate_block(1)
+
+    def held():
+        return [o for o in l1.rpc.call('listassetfunds', {})['outputs']
+                if o['asset'] == asset and o['status'] == 'confirmed']
+    wait_for(lambda: len(held()) == 1)
+    assert held()[0]['amount'] == CHANNEL_UNITS
+
+    # Bookkeeper: the channel account is in asset units, and balances.
+    acct = ch['channel_id']
+    wait_for(lambda: any(b['account'] == acct and b['balances'][0]['balance_msat'] == 0
+                         for b in l1.rpc.call('bkpr-listbalances', {})['accounts']))
+    events = [e for e in l1.rpc.call('bkpr-listaccountevents', {})['events']
+              if e['account'] == acct]
+    tags = {e['tag'] for e in events}
+    assert {'channel_open', 'channel_close', 'to_wallet'} <= tags
+    assert all(e['credit_msat'] != 2 * CHANNEL_UNITS * 1000 or e['tag'] != 'onchain_fee'
+               for e in events)
+    open_msat = sum(e['credit_msat'] for e in events if e['tag'] == 'channel_open')
+    assert open_msat == CHANNEL_UNITS * 1000
+
+    # Spend part of it to elementsd.
+    dest, dest_spk = unconfidential(bitcoind)
+    send = 1_200_000
+    res = l1.rpc.call('withdrawasset', {'destination': dest, 'asset': asset,
+                                        'amount': send})
+    tx = bitcoind.rpc.getrawtransaction(res['txid'], True)
+    bitcoind.generate_block(1, wait_for_mempool=res['txid'])
+    outs = [v for v in tx['vout'] if v['asset'] == asset]
+    assert sorted(units(v) for v in outs) == [send, CHANNEL_UNITS - send]
+    assert [v for v in outs if units(v) == send][0]['scriptPubKey']['hex'] == dest_spk.hex()
+    sync_blockheight(bitcoind, [l1])
+    wait_for(lambda: [o['amount'] for o in held()] == [CHANNEL_UNITS - send])
+
+    # Not more than we have, and only confirmed outputs are used.
+    with pytest.raises(RpcError, match='Cannot afford'):
+        l1.rpc.call('withdrawasset', {'destination': dest, 'asset': asset,
+                                      'amount': CHANNEL_UNITS})
+
+
 def open_asset_channel(node_factory, bitcoind, opts, wallet_outputs=(2, 2),
                        fee_reserve=FEE_RESERVE_SAT):
     """l1 opens an asset channel to l2 (when it closes, l1's asset goes to
