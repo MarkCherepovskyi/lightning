@@ -375,6 +375,15 @@ def test_liquid_asset_unilateral_close(node_factory, bitcoind, closer):
     peer_after = sum(o['amount_msat'] for o in l2.rpc.listfunds()['outputs']) // 1000
     assert peer_wallet - 5000 < peer_after < peer_wallet
 
+    # Bookkeeper: each side's channel account is in asset units and, with the
+    # commitment's output swept, it balances to zero.  (A sweep that is not
+    # matched by a deposit underflows the account and bookkeeper takes the
+    # node down.)
+    for n in (l1, l2):
+        wait_for(lambda: any(a['account'] == ch['channel_id']
+                             and a['balances'][0]['balance_msat'] == 0
+                             for a in n.rpc.call('bkpr-listbalances', {})['accounts']))
+
     # Everything is resolved; nobody logged anything broken.
     bitcoind.generate_block(100)
     for n in (l1, l2):

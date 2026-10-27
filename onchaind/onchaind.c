@@ -399,6 +399,16 @@ static void record_coin_movements(struct tracked_output *out,
 						  mk_mvt_tags(MVT_HTLC_FULFILL));
 	}
 
+	/* PoC: Liquid asset channels: we sweep our to_remote asset output
+	 * ourselves (the wallet can't hold it), so the channel account never
+	 * gets the deposit that lightningd's wallet makes for an L-BTC
+	 * to_remote.  Without it, the withdrawal below underflows the account. */
+	if (liquid_channel_asset()
+	    && out->tx_type == THEIR_UNILATERAL
+	    && out->output_type == OUTPUT_TO_US)
+		record_channel_deposit(out, out->tx_blockheight,
+				       mk_mvt_tags(MVT_CHANNEL_TO_US));
+
 	if (out->tx_type == THEIR_REVOKED_UNILATERAL
 	    || out->resolved->tx_type == OUR_PENALTY_TX)
 		record_channel_deposit(out, out->tx_blockheight, mk_mvt_tags(MVT_PENALTY));
