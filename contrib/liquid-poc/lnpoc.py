@@ -26,14 +26,26 @@ import time
 from decimal import Decimal
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-COMPOSE = ['docker', 'compose', '-f', os.path.join(HERE, 'docker-compose.yml')]
-STATE_FILE = os.path.join(HERE, '.lnpoc-state.json')
-NODES = ['alice', 'bob', 'carol']
+# LNPOC_NET=testnet drives docker-compose.testnet.yml: the real Liquid testnet
+# (blocks come every minute, nobody can mine them, coins come from the faucet).
+TESTNET = os.environ.get('LNPOC_NET') == 'testnet'
+if TESTNET:
+    COMPOSE = ['docker', 'compose', '-f', os.path.join(HERE, 'docker-compose.testnet.yml')]
+    STATE_FILE = os.path.join(HERE, '.lnpoc-testnet-state.json')
+    NODES = ['alice', 'bob', 'carol', 'dave']
+    LN_NETWORK = 'liquid-testnet'
+    ECLI = ['elements-cli', '-chain=liquidtestnet', '-rpcport=7039',
+            '-rpcuser=poc', '-rpcpassword=poc']
+else:
+    COMPOSE = ['docker', 'compose', '-f', os.path.join(HERE, 'docker-compose.yml')]
+    STATE_FILE = os.path.join(HERE, '.lnpoc-state.json')
+    NODES = ['alice', 'bob', 'carol']
+    LN_NETWORK = 'liquid-regtest'
+    ECLI = ['elements-cli', '-chain=liquid-regtest', '-rpcport=18884',
+            '-rpcuser=poc', '-rpcpassword=poc']
 LN_PORT = 20735
 COIN = 10**8
 WALLET = 'poc'
-ECLI = ['elements-cli', '-chain=liquid-regtest', '-rpcport=18884',
-        '-rpcuser=poc', '-rpcpassword=poc']
 
 
 class Fail(Exception):
@@ -76,7 +88,7 @@ def ecli(*args, wallet=True, check=True, **named):
 def ln(node, method, check=True, **params):
     """lightning-cli in a node's container."""
     cmd = COMPOSE + ['exec', '-T', node, 'lightning-cli',
-                     '--network=liquid-regtest', '--lightning-dir=/data', '-k', method]
+                     f'--network={LN_NETWORK}', '--lightning-dir=/data', '-k', method]
     for k, v in params.items():
         if v is None:
             continue
@@ -157,6 +169,17 @@ def node_name(nid):
 
 
 def mine(n=1, nodes=NODES):
+    if TESTNET:
+        # Nobody can mine here: wait for n blocks (about a minute each).
+        height = ecli('getblockcount', wallet=False) + n
+        wait_for(f"block {height}",
+                 lambda: ecli('getblockcount', wallet=False) >= height,
+                 timeout=n * 300)
+        for node in nodes:
+            wait_for(f"{node} to sync to block {height}",
+                     lambda: ln(node, 'getinfo')['blockheight'] >= height,
+                     timeout=300)
+        return height
     addr = ecli('getnewaddress')
     ecli('generatetoaddress', n, addr)
     height = ecli('getblockcount', wallet=False)
@@ -292,12 +315,13 @@ def cmd_open_asset(args):
     #    the L-BTC fee reserve to the same address at output 1.  Explicit
     #    inputs, so nothing needs blinding.
     x_in = explicit_utxo(asset, args.units)
-    l_in = explicit_utxo(lbtc, args.fee_reserve + fee + 100000)
+    change = getattr(args, 'change', 100000)
+    l_in = explicit_utxo(lbtc, args.fee_reserve + fee + change)
     mine(1)
     psbt = ecli('createpsbt', [x_in, l_in],
                 [{addr: coins(args.units), 'asset': asset},
                  {addr: coins(args.fee_reserve)},
-                 {unconfidential_address(): coins(100000)},
+                 {unconfidential_address(): coins(change)},
                  {'fee': coins(fee)}])
     signed = ecli('walletprocesspsbt', psbt)
     if not signed.get('complete'):
@@ -551,6 +575,97 @@ def cmd_demo_gossip(args):
             cmd_close(argparse.Namespace(frm=a, to=b, asset=None, lbtc=lbtc))
 
 
+# ------------------------------------------------------ Liquid testnet only
+FAUCET = 'https://liquidtestnet.com/faucet'
+
+
+def faucet(address, action):
+    """Ask the public testnet faucet (action: lbtc, test or amp) for coins."""
+    import re
+    import urllib.parse
+    import urllib.request
+    url = FAUCET + '?' + urllib.parse.urlencode({'address': address, 'action': action})
+    with urllib.request.urlopen(url, timeout=60) as r:
+        text = re.sub(r'<[^>]*>', ' ', r.read().decode())
+    return ' '.join(text.split())
+
+
+def wallet_balances():
+    return ecli('getbalance')
+
+
+def cmd_testnet_setup(args):
+    """Wallet, faucet coins, our own asset, fund the nodes, connect A-B-C-D."""
+    if not TESTNET:
+        raise Fail("run this with LNPOC_NET=testnet")
+    wait_for('elementsd', lambda: ecli('getblockchaininfo', wallet=False))
+    info = ecli('getblockchaininfo', wallet=False)
+    if info.get('initialblockdownload') or info['blocks'] < info['headers'] - 2:
+        raise Fail(f"elementsd is still syncing: block {info['blocks']} of {info['headers']}")
+    if WALLET not in ecli('listwallets', wallet=False):
+        ecli('loadwallet', WALLET, wallet=False, check=False)
+    if WALLET not in ecli('listwallets', wallet=False):
+        ecli('createwallet', WALLET, wallet=False)
+
+    state = load_state()
+    if not state.get('address'):
+        state['address'] = unconfidential_address()
+        save_state(state)
+    print(f"elementsd wallet address (unconfidential): {state['address']}")
+
+    lbtc = lbtc_asset()
+    if not args.no_faucet and not wallet_balances().get('bitcoin'):
+        print("faucet:", faucet(state['address'], 'lbtc')[-300:])
+        if args.faucet_asset:
+            print("faucet (test asset):", faucet(state['address'], 'test')[-300:])
+    wait_for('faucet L-BTC (1 confirmation)',
+             lambda: ecli('getbalance', minconf=1).get('bitcoin'), timeout=900)
+    print("wallet balances:", json.dumps(wallet_balances()))
+
+    if not state.get('asset'):
+        issued = ecli('issueasset', args.asset_amount, 0, False)
+        state['asset'] = issued['asset']
+        save_state(state)
+        print(f"issued {args.asset_amount} of our own asset {state['asset']}")
+        mine(1, nodes=[])
+    follow_asset(state['asset'])
+
+    for node in NODES:
+        wait_for(node, lambda: ln(node, 'getinfo'))
+        addr = ln(node, 'newaddr', addresstype='bech32')['bech32']
+        ecli('sendtoaddress', addr, coins(args.fund_sat))
+        print(f"{node:6} {node_id(node)}  funded with {args.fund_sat} sat L-BTC")
+    mine(1)
+    for a, b in zip(NODES, NODES[1:]):
+        connect(a, b)
+        print(f"connected {a} -> {b}")
+    print(f"\nasset: {state['asset']}\nL-BTC: {lbtc}")
+
+
+def cmd_testnet_demo(args):
+    """A -> B -> C -> D with our own asset: three asset channels, one payment
+    from alice to dave across all of them."""
+    if not TESTNET:
+        raise Fail("run this with LNPOC_NET=testnet")
+    asset = load_state().get('asset')
+    if not asset:
+        raise Fail("run testnet-setup first")
+    for a, b in zip(NODES, NODES[1:]):
+        try:
+            channel_between(a, b, asset)
+            print(f"{a} -> {b}: channel exists")
+            continue
+        except Fail:
+            pass
+        cmd_open_asset(argparse.Namespace(frm=a, to=b, units=args.units,
+                                          fee_reserve=args.fee_reserve, change=args.change,
+                                          asset=asset, lbtc=False, announce=False))
+    cmd_channels(args)
+    cmd_pay(argparse.Namespace(frm='alice', to='dave', amount_msat=args.pay_units * 1000,
+                               asset=asset, lbtc=False))
+    cmd_channels(args)
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -617,6 +732,18 @@ def main():
     sp.add_argument('frm', choices=NODES)
     sp.add_argument('to', choices=NODES)
     sp.add_argument('amount_msat', type=int)
+    sp = add('testnet-setup', cmd_testnet_setup,
+             'Liquid testnet: wallet, faucet coins, our own asset, fund nodes, connect')
+    sp.add_argument('--asset-amount', type=int, default=100, help='asset to issue (whole units)')
+    sp.add_argument('--fund-sat', type=int, default=30_000, help='L-BTC per node wallet')
+    sp.add_argument('--no-faucet', action='store_true', help="don't ask the faucet")
+    sp.add_argument('--faucet-asset', action='store_true',
+                    help='also ask the faucet for its test asset')
+    sp = add('testnet-demo', cmd_testnet_demo, 'Liquid testnet: A-B-C-D asset channels, pay A -> D')
+    sp.add_argument('--units', type=int, default=1_000_000, help='asset base units per channel')
+    sp.add_argument('--fee-reserve', type=int, default=20_000, help='L-BTC sats per channel')
+    sp.add_argument('--change', type=int, default=10_000, help='L-BTC sats back to elementsd')
+    sp.add_argument('--pay-units', type=int, default=100_000, help='asset base units to pay')
     add('demo', cmd_demo, 'setup, open both kinds of channels, pay in both, close')
     add('demo-gossip', cmd_demo_gossip, 'like demo, with announced channels and xpay')
 
