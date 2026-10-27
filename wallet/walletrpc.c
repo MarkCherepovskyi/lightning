@@ -4,12 +4,14 @@
 #include <common/addr.h>
 #include <common/base64.h>
 #include <common/bech32.h>
+#include <common/liquid_asset.h>
 #include <common/json_command.h>
 #include <common/psbt_keypath.h>
 #include <common/psbt_open.h>
 #include <db/exec.h>
 #include <errno.h>
 #include <hsmd/hsmd_wiregen.h>
+#include <lightningd/chaintopology.h>
 #include <lightningd/channel.h>
 #include <lightningd/hsm_control.h>
 #include <lightningd/notification.h>
@@ -493,6 +495,354 @@ static struct command_result *json_listfunds(struct command *cmd,
 
 	return command_success(cmd, response);
 }
+
+/* PoC: Liquid assets we hold: outputs paying to our wallet keys (e.g. swept
+ * from a closed asset channel; the wallet can't spend them yet) and our share
+ * of asset channels.  listfunds only shows L-BTC. */
+static struct command_result *json_listassetfunds(struct command *cmd,
+						  const char *buffer,
+						  const jsmntok_t *obj UNNEEDED,
+						  const jsmntok_t *params)
+{
+	struct json_stream *response;
+	struct peer *p;
+	struct peer_node_id_map_iter it;
+	struct asset_output **outs;
+	bool *spent;
+
+	if (!param(cmd, buffer, params,
+		   p_opt_def("spent", param_bool, &spent, false),
+		   NULL))
+		return command_param_failed();
+
+	response = json_stream_success(cmd);
+
+	outs = wallet_get_asset_outputs(cmd, cmd->ld->wallet, *spent);
+	json_array_start(response, "outputs");
+	for (size_t i = 0; i < tal_count(outs); i++) {
+		json_object_start(response, NULL);
+		json_add_txid(response, "txid", &outs[i]->outpoint.txid);
+		json_add_num(response, "output", outs[i]->outpoint.n);
+		json_add_string(response, "asset",
+				fmt_liquid_asset(tmpctx, outs[i]->asset));
+		/* In units of the asset */
+		json_add_u64(response, "amount", outs[i]->amount.satoshis); /* Raw: asset units */
+		json_add_hex_talarr(response, "scriptpubkey",
+				    outs[i]->scriptpubkey);
+		if (outs[i]->spendheight)
+			json_add_string(response, "status", "spent");
+		else if (outs[i]->blockheight)
+			json_add_string(response, "status", "confirmed");
+		else
+			json_add_string(response, "status", "unconfirmed");
+		if (outs[i]->blockheight)
+			json_add_num(response, "blockheight",
+				     outs[i]->blockheight);
+		if (outs[i]->spendheight)
+			json_add_num(response, "spendheight",
+				     outs[i]->spendheight);
+		json_object_end(response);
+	}
+	json_array_end(response);
+
+	json_array_start(response, "channels");
+	for (p = peer_node_id_map_first(cmd->ld->peers, &it);
+	     p;
+	     p = peer_node_id_map_next(cmd->ld->peers, &it)) {
+		struct channel *c;
+		list_for_each(&p->channels, c, list) {
+			if (!c->liquid_asset
+			    || channel_state_uncommitted(c->state))
+				continue;
+			json_object_start(response, NULL);
+			json_add_node_id(response, "peer_id", &p->id);
+			json_add_string(response, "state",
+					channel_state_name(c));
+			json_add_channel_id(response, "channel_id", &c->cid);
+			json_add_string(response, "asset",
+					fmt_liquid_asset(tmpctx,
+							 c->liquid_asset));
+			/* msat of the asset's units */
+			json_add_amount_msat(response, "our_amount_msat",
+					     c->our_msat);
+			json_add_amount_sat_msat(response, "amount_msat",
+						 c->funding_sats);
+			json_add_amount_sat_msat(response,
+						 "fee_reserve_msat",
+						 c->liquid_fee_reserve);
+			json_object_end(response);
+		}
+	}
+	json_array_end(response);
+
+	return command_success(cmd, response);
+}
+
+/* PoC: spending a Liquid asset we hold (e.g. swept from a closed asset
+ * channel).  Wallet L-BTC UTXOs pay the fee, since the fee asset can only be
+ * L-BTC. */
+#define WITHDRAWASSET_RESERVE 6
+
+struct sending_asset {
+	struct command *cmd;
+	/* The L-BTC UTXOs paying the fee */
+	struct utxo **utxos;
+	/* The asset outputs being spent */
+	struct asset_output **aouts;
+	struct wally_tx *wtx;
+};
+
+static void withdrawasset_done(struct bitcoind *bitcoind UNUSED,
+			       bool success, const char *msg,
+			       struct sending_asset *sending)
+{
+	struct lightningd *ld = sending->cmd->ld;
+	struct json_stream *response;
+	struct bitcoin_txid txid;
+
+	if (!success) {
+		for (size_t i = 0; i < tal_count(sending->utxos); i++)
+			wallet_unreserve_utxo(ld->wallet, sending->utxos[i],
+					      get_block_height(ld->topology),
+					      WITHDRAWASSET_RESERVE);
+		for (size_t i = 0; i < tal_count(sending->aouts); i++)
+			wallet_unreserve_asset_output(ld->wallet,
+						      &sending->aouts[i]->outpoint);
+		was_pending(command_fail(sending->cmd, LIGHTNINGD,
+					 "Error broadcasting transaction: %s."
+					 " Unsent tx discarded %s",
+					 msg,
+					 fmt_wally_tx(tmpctx, sending->wtx)));
+		return;
+	}
+
+	wallet_transaction_add(ld->wallet, sending->wtx, 0, 0);
+	wally_txid(sending->wtx, &txid);
+
+	/* Picks up our change, in L-BTC and in the asset */
+	if (!wallet_extract_owned_outputs(ld->wallet, sending->wtx, false,
+					  NULL, NULL))
+		watch_unconfirmed_txid(ld, ld->topology, &txid);
+
+	response = json_stream_success(sending->cmd);
+	json_add_hex_talarr(response, "tx",
+			    linearize_wtx(tmpctx, sending->wtx));
+	json_add_txid(response, "txid", &txid);
+	was_pending(command_success(sending->cmd, response));
+}
+
+static struct command_result *param_liquid_asset(struct command *cmd,
+						 const char *name,
+						 const char *buffer,
+						 const jsmntok_t *tok,
+						 u8 **asset)
+{
+	*asset = liquid_asset_from_hex(cmd, buffer + tok->start,
+				       tok->end - tok->start);
+	if (*asset)
+		return NULL;
+	return command_fail_badparam(cmd, name, buffer, tok,
+				     "should be a 32-byte asset id");
+}
+
+static struct command_result *json_withdrawasset(struct command *cmd,
+						 const char *buffer,
+						 const jsmntok_t *obj UNNEEDED,
+						 const jsmntok_t *params)
+{
+	struct lightningd *ld = cmd->ld;
+	const u8 *destination;
+	u8 *asset;
+	u64 *amount_units;
+	u32 *feerate_opt, feerate, height = get_block_height(ld->topology);
+	struct sending_asset *sending;
+	struct asset_output **all;
+	struct utxo **utxos;
+	struct utxo *fake;
+	const struct hsm_utxo **hsm_utxos;
+	struct amount_sat want, have = AMOUNT_SAT(0), excess = AMOUNT_SAT(0);
+	struct amount_sat asset_change, btc_change, fee;
+	struct bitcoin_tx *tx;
+	struct wally_psbt *psbt;
+	struct pubkey pubkey;
+	size_t weight, num_in;
+	bool insufficient;
+	const u8 *msg;
+
+	if (!param(cmd, buffer, params,
+		   p_req("destination", param_bitcoin_address, &destination),
+		   p_req("asset", param_liquid_asset, &asset),
+		   p_req("amount", param_u64, &amount_units),
+		   p_opt("feerate", param_u32, &feerate_opt),
+		   NULL))
+		return command_param_failed();
+
+	if (!chainparams->is_elements)
+		return command_fail(cmd, LIGHTNINGD, "Not on Liquid");
+	if (*amount_units == 0)
+		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+				    "amount must be non-zero");
+	want = amount_sat(*amount_units);
+
+	sending = tal(cmd, struct sending_asset);
+	sending->cmd = cmd;
+	sending->aouts = tal_arr(sending, struct asset_output *, 0);
+
+	/* Confirmed, unspent, unreserved outputs of the asset, until we have
+	 * enough. */
+	all = wallet_get_asset_outputs(tmpctx, ld->wallet, false);
+	for (size_t i = 0; i < tal_count(all) && amount_sat_less(have, want); i++) {
+		if (!liquid_asset_eq(all[i]->asset, asset)
+		    || !all[i]->blockheight
+		    || all[i]->reserved_til > height)
+			continue;
+		if (!amount_sat_add(&have, have, all[i]->amount))
+			return command_fail(cmd, LIGHTNINGD, "Amount overflow");
+		tal_arr_expand(&sending->aouts, tal_steal(sending, all[i]));
+	}
+	if (amount_sat_less(have, want))
+		return command_fail(cmd, FUND_CANNOT_AFFORD,
+				    "Cannot afford %"PRIu64" units of %s:"
+				    " only %s confirmed and unreserved",
+				    *amount_units, fmt_liquid_asset(tmpctx, asset),
+				    fmt_amount_sat(tmpctx, have));
+	if (!amount_sat_sub(&asset_change, have, want))
+		abort();
+
+	feerate = feerate_opt ? *feerate_opt
+		: feerate_for_target(ld->topology, height + 12);
+	num_in = tal_count(sending->aouts);
+
+	/* Weight so far: the asset inputs (p2wpkh), destination and change. */
+	tx = bitcoin_tx(tmpctx, chainparams, num_in, 2, 0);
+	for (size_t i = 0; i < num_in; i++)
+		bitcoin_tx_add_asset_input(tx, &sending->aouts[i]->outpoint,
+					   BITCOIN_TX_RBF_SEQUENCE, NULL,
+					   sending->aouts[i]->amount,
+					   sending->aouts[i]->scriptpubkey,
+					   NULL, asset);
+	bitcoin_tx_add_asset_output(tx, destination, NULL, want, asset);
+	bitcoin_tx_add_asset_output(tx, destination, NULL, asset_change, asset);
+	weight = bitcoin_tx_weight(tx);
+	weight += num_in * (1 + 1 + 73 + 1 + 33);
+	/* Allow for a couple of L-BTC inputs, the L-BTC change and the fee */
+	weight += elements_tx_overhead(chainparams, num_in + 2, 4);
+
+	utxos = wallet_utxo_boost(sending, ld->wallet, height,
+				  AMOUNT_SAT(0), AMOUNT_SAT(0), feerate,
+				  &weight, &insufficient);
+	for (size_t i = 0; i < tal_count(utxos); i++) {
+		if (!amount_sat_add(&excess, excess, utxos[i]->amount))
+			abort();
+	}
+	if (amount_sat_less(excess, amount_tx_fee(feerate, weight)))
+		return command_fail(cmd, FUND_CANNOT_AFFORD,
+				    "Not enough L-BTC in the wallet to pay the"
+				    " fee (need %s, have %s)",
+				    fmt_amount_sat(tmpctx,
+						   amount_tx_fee(feerate, weight)),
+				    fmt_amount_sat(tmpctx, excess));
+	sending->utxos = utxos;
+	btc_change = change_amount(excess, feerate, weight);
+	if (!amount_sat_sub(&fee, excess, btc_change))
+		fee = excess;
+
+	/* Change goes to new wallet keys (it's p2wpkh on Elements). */
+	tx = bitcoin_tx(sending, chainparams, num_in + tal_count(utxos), 4, 0);
+	for (size_t i = 0; i < num_in; i++)
+		bitcoin_tx_add_asset_input(tx, &sending->aouts[i]->outpoint,
+					   BITCOIN_TX_RBF_SEQUENCE, NULL,
+					   sending->aouts[i]->amount,
+					   sending->aouts[i]->scriptpubkey,
+					   NULL, asset);
+	for (size_t i = 0; i < tal_count(utxos); i++) {
+		assert(utxos[i]->scriptPubkey);
+		bitcoin_tx_add_input(tx, &utxos[i]->outpoint,
+				     (utxos[i]->close_info
+				      && utxos[i]->close_info->option_anchors)
+				     ? utxos[i]->close_info->csv
+				     : BITCOIN_TX_RBF_SEQUENCE,
+				     NULL, utxos[i]->amount,
+				     utxos[i]->scriptPubkey, NULL);
+	}
+	bitcoin_tx_add_asset_output(tx, destination, NULL, want, asset);
+	if (!amount_sat_is_zero(asset_change)) {
+		if (!newaddr_inner(cmd, &pubkey, ADDR_BECH32))
+			return command_fail(cmd, LIGHTNINGD, "Keys exhausted ");
+		bitcoin_tx_add_asset_output(tx,
+					    scriptpubkey_p2wpkh(tmpctx, &pubkey),
+					    NULL, asset_change, asset);
+	}
+	if (!amount_sat_is_zero(btc_change)) {
+		if (!newaddr_inner(cmd, &pubkey, ADDR_BECH32))
+			return command_fail(cmd, LIGHTNINGD, "Keys exhausted ");
+		bitcoin_tx_add_output(tx, scriptpubkey_p2wpkh(tmpctx, &pubkey),
+				      NULL, btc_change);
+	}
+	/* Elements wants the fee as an explicit output. */
+	bitcoin_tx_finalize(tx);
+
+	/* The HSM signs the asset outputs like wallet UTXOs. */
+	for (size_t i = 0; i < num_in; i++) {
+		fake = tal(tmpctx, struct utxo);
+		fake->outpoint = sending->aouts[i]->outpoint;
+		fake->amount = sending->aouts[i]->amount;
+		fake->keyindex = sending->aouts[i]->keyindex;
+		fake->utxotype = UTXO_P2WPKH;
+		fake->status = OUTPUT_STATE_AVAILABLE;
+		fake->blockheight = NULL;
+		fake->spendheight = NULL;
+		fake->reserved_til = 0;
+		fake->scriptPubkey = sending->aouts[i]->scriptpubkey;
+		fake->is_in_coinbase = false;
+		fake->close_info = NULL;
+		tal_arr_expand(&utxos, fake);
+	}
+	hsm_utxos = utxos_to_hsm_utxos(tmpctx, utxos);
+	msg = hsm_sync_req(tmpctx, ld,
+			   take(towire_hsmd_sign_withdrawal(NULL, hsm_utxos,
+							    tx->psbt)));
+	if (!fromwire_hsmd_sign_withdrawal_reply(tmpctx, msg, &psbt))
+		return command_fail(cmd, LIGHTNINGD,
+				    "HSM gave bad sign_withdrawal_reply %s",
+				    tal_hex(tmpctx, msg));
+	if (!psbt_finalize(psbt))
+		return command_fail(cmd, LIGHTNINGD,
+				    "PSBT not finalizeable %s",
+				    fmt_wally_psbt(tmpctx, psbt));
+	sending->wtx = psbt_final_tx(sending, psbt);
+	if (!sending->wtx)
+		return command_fail(cmd, LIGHTNINGD,
+				    "PSBT not finalizeable %s",
+				    fmt_wally_psbt(tmpctx, psbt));
+
+	for (size_t i = 0; i < tal_count(sending->utxos); i++) {
+		if (!wallet_reserve_utxo(ld->wallet, sending->utxos[i], height,
+					 WITHDRAWASSET_RESERVE))
+			fatal("UTXO not reservable?");
+	}
+	for (size_t i = 0; i < tal_count(sending->aouts); i++)
+		wallet_reserve_asset_output(ld->wallet,
+					    &sending->aouts[i]->outpoint,
+					    height, WITHDRAWASSET_RESERVE);
+
+	bitcoind_sendrawtx(sending, ld->topology->bitcoind, cmd->id,
+			   tal_hex(tmpctx, linearize_wtx(tmpctx, sending->wtx)),
+			   false, withdrawasset_done, sending);
+	return command_still_pending(cmd);
+}
+
+static const struct json_command withdrawasset_command = {
+	"withdrawasset",
+	json_withdrawasset,
+};
+AUTODATA(json_command, &withdrawasset_command);
+
+static const struct json_command listassetfunds_command = {
+	"listassetfunds",
+	json_listassetfunds,
+};
+AUTODATA(json_command, &listassetfunds_command);
 
 static const struct json_command listfunds_command = {
 	"listfunds",
