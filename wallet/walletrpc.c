@@ -657,7 +657,7 @@ static struct command_result *json_withdrawasset(struct command *cmd,
 	u32 *feerate_opt, feerate, height = get_block_height(ld->topology);
 	struct sending_asset *sending;
 	struct asset_output **all;
-	struct utxo **utxos;
+	struct utxo **utxos, **sign_utxos;
 	struct utxo *fake;
 	const struct hsm_utxo **hsm_utxos;
 	struct amount_sat want, have = AMOUNT_SAT(0), excess = AMOUNT_SAT(0);
@@ -782,7 +782,11 @@ static struct command_result *json_withdrawasset(struct command *cmd,
 	/* Elements wants the fee as an explicit output. */
 	bitcoin_tx_finalize(tx);
 
-	/* The HSM signs the asset outputs like wallet UTXOs. */
+	/* The HSM signs the asset outputs like wallet UTXOs.  (A separate
+	 * array: sending->utxos must stay just the L-BTC ones we reserve.) */
+	sign_utxos = tal_arr(tmpctx, struct utxo *, tal_count(utxos));
+	for (size_t i = 0; i < tal_count(utxos); i++)
+		sign_utxos[i] = utxos[i];
 	for (size_t i = 0; i < num_in; i++) {
 		fake = tal(tmpctx, struct utxo);
 		fake->outpoint = sending->aouts[i]->outpoint;
@@ -796,9 +800,9 @@ static struct command_result *json_withdrawasset(struct command *cmd,
 		fake->scriptPubkey = sending->aouts[i]->scriptpubkey;
 		fake->is_in_coinbase = false;
 		fake->close_info = NULL;
-		tal_arr_expand(&utxos, fake);
+		tal_arr_expand(&sign_utxos, fake);
 	}
-	hsm_utxos = utxos_to_hsm_utxos(tmpctx, utxos);
+	hsm_utxos = utxos_to_hsm_utxos(tmpctx, sign_utxos);
 	msg = hsm_sync_req(tmpctx, ld,
 			   take(towire_hsmd_sign_withdrawal(NULL, hsm_utxos,
 							    tx->psbt)));
