@@ -464,11 +464,20 @@ def cmd_close(args):
     asset = default_asset(args)
     c = channel_between(args.frm, args.to, asset)
     before = set(ecli('getrawmempool', wallet=False))
-    ln(args.frm, 'close', id=c['channel_id'])
-    # An opener who funded via fundchannel_complete leaves broadcasting the
-    # close to the peer, so just watch the mempool.
-    txid = wait_for('close tx', lambda: [t for t in ecli('getrawmempool', wallet=False)
-                                         if t not in before])[0]
+    res = ln(args.frm, 'close', id=c['channel_id'])
+    if TESTNET:
+        # The mempool is shared with the world: use the txid close gave us
+        # and wait until it's mined.
+        txid = res.get('txid') or res['txids'][0]
+        wait_for('close tx', lambda: ecli('getrawtransaction', txid, True,
+                                          wallet=False, check=False).get('confirmations')
+                 if isinstance(ecli('getrawtransaction', txid, True, wallet=False, check=False), dict)
+                 else None, timeout=900)
+    else:
+        # An opener who funded via fundchannel_complete leaves broadcasting the
+        # close to the peer, so just watch the mempool.
+        txid = wait_for('close tx', lambda: [t for t in ecli('getrawmempool', wallet=False)
+                                             if t not in before])[0]
     mine(1)
     tx = ecli('getrawtransaction', txid, True, wallet=False)
     print(f"closed {asset_label(asset)} channel {args.frm} <-> {args.to}: tx {txid}")
@@ -698,6 +707,8 @@ def main():
     sp.add_argument('to', choices=NODES)
     sp.add_argument('units', type=int, help='asset base units')
     sp.add_argument('--fee-reserve', type=int, default=100_000, help='L-BTC sats')
+    sp.add_argument('--change', type=int, default=100_000,
+                    help='L-BTC sats of the funding input that go back to elementsd')
     sp.add_argument('--asset', help='asset id (default: the one `setup` issued)')
     sp.add_argument('--announce', action='store_true',
                     help="announce it, on the asset's own gossip network")
