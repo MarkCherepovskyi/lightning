@@ -1,2 +1,4 @@
 # lnpoc.py remembers the issued test asset here
 .lnpoc-state.json
+.lnpoc-testnet-state.json
+__pycache__/
