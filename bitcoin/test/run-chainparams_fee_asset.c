@@ -28,6 +28,42 @@ static void check_fee_asset(const char *network, const char *printed_id)
 		assert(p->fee_asset_tag[1 + i] == id[sizeof(id) - 1 - i]);
 }
 
+/* The genesis block id.  On Elements chains chainparams holds it in the order
+ * elements-cli prints it (unlike Bitcoin's, and unlike the fee asset). */
+static void check_genesis(const char *network, const char *printed_id)
+{
+	const struct chainparams *p = chainparams_for_network(network);
+	u8 id[32];
+
+	assert(p);
+	assert(p->is_elements);
+	assert(hex_decode(printed_id, strlen(printed_id), id, sizeof(id)));
+	for (size_t i = 0; i < sizeof(id); i++)
+		assert(p->genesis_blockhash.shad.sha.u.u8[i] == id[i]);
+}
+
+/* Parameters checked against the real Liquid testnet. */
+static void check_liquid_testnet(void)
+{
+	const struct chainparams *p = chainparams_for_network("liquid-testnet");
+
+	assert(p);
+	assert(p->is_elements);
+	assert(p->testnet);
+	assert(streq(p->onchain_hrp, "tex"));
+	assert(streq(p->lightning_hrp, "tex"));
+	assert(streq(p->bip70_name, "liquidtestnet"));
+	assert(streq(p->cli_args, "-chain=liquidtestnet"));
+	assert(p->rpc_port == 7039);
+	assert(p->p2pkh_version == 36);
+	assert(p->p2sh_version == 19);
+
+	/* It is found by name, and not confused with the other networks. */
+	assert(chainparams_for_network("liquid-testnet") != chainparams_for_network("liquid"));
+	assert(chainparams_for_network("liquid-testnet") != chainparams_for_network("liquid-regtest"));
+	assert(chainparams_for_network("liquid-testnet") != chainparams_for_network("testnet"));
+}
+
 int main(int argc, char *argv[])
 {
 	common_setup(argv[0]);
@@ -38,6 +74,12 @@ int main(int argc, char *argv[])
 			"ceb851388a62039c49710566bc8b0b229eaa8a92bafbca512d8f7fd363b9e75c");
 	check_fee_asset("liquid-testnet",
 			"144c654344aa716d6f3abcc1ca90e5641e4e2a7f633bc09fe3baf64585819a49");
+
+	check_genesis("liquid",
+		      "1466275836220db2944ca059a3a10ef6fd2ea684b0688d2c379296888a206003");
+	check_genesis("liquid-testnet",
+		      "a771da8e52ee6ad581ed1e9a99825e5b3b7992225534eaa2ae23244fe26ab1c1");
+	check_liquid_testnet();
 
 	common_shutdown();
 	return 0;
