@@ -90,6 +90,8 @@ export LNPOC_NET=testnet            # (the default of lq.py)
 ./lq.py -h
 ```
 
+See `LQ.md` for every command and the two asset RPCs.
+
 ### The test cases
 
 `TESTNET_TESTS.md` lists the cases with their results and transactions (T1 to T14).
