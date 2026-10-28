@@ -240,3 +240,9 @@ Still missing for asset channels:
   it with `asset=`.
 - Regtest has no fee estimates, so the nodes use the minimum feerate (as on
   Bitcoin regtest).
+
+## More
+
+- `TESTING.md`: what to run to test (unit tests, regtest suite, real Liquid testnet).
+- `LQ.md`: the `lq` command line (open channels, pay, close, send) and the `withdrawasset` / `listassetfunds` RPCs.
+- `TESTNET_TESTS.md`: the cases run on the real Liquid testnet, with their transactions.
