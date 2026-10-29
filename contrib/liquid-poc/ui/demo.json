@@ -1,0 +1,43 @@
+{
+  "net": "liquid-testnet",
+  "block": 2679213,
+  "headers": 2679213,
+  "syncing": false,
+  "default_asset": "723376e4a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c",
+  "assets": {
+    "723376e4a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c": "ASSET(723376e4)"
+  },
+  "elements": {"L-BTC": 55509, "ASSET(723376e4)": 9994000000},
+  "nodes": [
+    {"name": "alice", "id": "03a1f0c4b27e9d5c8e1f3a6b9d2c4e7f0a1b3c5d7e9f1a2b4c6d8e0f2a4b6c8d0e", "ok": true,
+     "lbtc": 9059, "assets": {"723376e4a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c": 1050000},
+     "peers": [{"name": "bob", "connected": true}, {"name": "carol", "connected": true}]},
+    {"name": "bob", "id": "02b7c3d1e5f9a2b4c6d8e0f1a3b5c7d9e1f3a5b7c9d1e3f5a7b9c1d3e5f7a9b1c3", "ok": true,
+     "lbtc": 21400, "assets": {"723376e4a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c": 300000},
+     "peers": [{"name": "alice", "connected": true}, {"name": "carol", "connected": true}, {"name": "dave", "connected": true}]},
+    {"name": "carol", "id": "0314e8a6c2f0b4d8e2a6c0f4b8d2e6a0c4f8b2d6e0a4c8f2b6d0e4a8c2f6b0d4e8", "ok": true,
+     "lbtc": 7120, "assets": {},
+     "peers": [{"name": "alice", "connected": true}, {"name": "bob", "connected": true}]},
+    {"name": "dave", "id": "02d9b5e1a7c3f9b5e1a7c3f9b5e1a7c3f9b5e1a7c3f9b5e1a7c3f9b5e1a7c3f9b5", "ok": true,
+     "lbtc": 30000, "assets": {},
+     "peers": [{"name": "bob", "connected": true}]}
+  ],
+  "channels": [
+    {"id": "c1", "a": "alice", "b": "bob", "asset": "723376e4a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c",
+     "state": "open", "a_units": 400000, "b_units": 100000, "scid": "2679101x1x0", "announced": false},
+    {"id": "c2", "a": "bob", "b": "carol", "asset": null,
+     "state": "open", "a_units": 1200000, "b_units": 800000, "scid": "2679150x2x0", "announced": false},
+    {"id": "c3", "a": "bob", "b": "dave", "asset": "723376e4a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c",
+     "state": "opening", "a_units": 250000, "b_units": 0, "scid": null, "announced": false},
+    {"id": "c4", "a": "alice", "b": "carol", "asset": "723376e4a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c",
+     "state": "closed", "a_units": 0, "b_units": 0, "scid": "2678800x1x0", "announced": false}
+  ],
+  "job": {
+    "id": 3, "title": "Open channel alice to bob, 400,000 ASSET(723376e4)", "status": "done",
+    "started": 1793218000, "ended": 1793218610,
+    "log": [
+      "funding tx 9f3c0e7a41b6d25e8c0f1a3b5d7e9f2a4c6e8b0d1f3a5c7e9b2d4f6a8c0e1b3d",
+      "ASSET(723376e4) channel alice -> bob ready: 400000 units + 6000 sat L-BTC fee reserve"
+    ]
+  }
+}

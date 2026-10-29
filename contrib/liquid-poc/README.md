@@ -246,3 +246,21 @@ Still missing for asset channels:
 - `TESTING.md`: what to run to test (unit tests, regtest suite, real Liquid testnet).
 - `LQ.md`: the `lq` command line (open channels, pay, close, send) and the `withdrawasset` / `listassetfunds` RPCs.
 - `TESTNET_TESTS.md`: the cases run on the real Liquid testnet, with their transactions.
+- `lqui.py`: a web page for the same nodes (see below).
+
+## Web page
+
+```sh
+./lqui.py                  # real Liquid testnet stack (default)
+./lqui.py --net regtest    # the regtest stack
+```
+
+Open http://127.0.0.1:8765. The page shows the nodes, who is connected to whom, wallet
+balances and every channel with its split, and has forms to open, pay, close (also a
+force close), send on-chain and fund a node. It calls the same functions as `lq.py`, one
+at a time; the Activity panel shows the running command's output. Opening a channel on
+the testnet takes about ten minutes. `?demo` shows the page with sample data.
+
+It uses only the Python standard library, listens on localhost and spends test coins:
+don't expose it. The design follows Blockstream's Blueprint design system (dark, square,
+blue accent); the page is `ui/index.html`, with no build step.

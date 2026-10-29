@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="VcsDirectoryMappings">
+    <mapping directory="" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/external/gheap" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/external/jsmn" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/external/libbacktrace" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/external/libwally-core" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/external/libwally-core/src/secp256k1" vcs="Git" />
+  </component>
+</project>
