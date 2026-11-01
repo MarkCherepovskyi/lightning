@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Drive the Liquid asset-channel PoC network (docker-compose.yml) from the host.
 
+    ./lnpoc.py start                        # up + setup + the web UI, all in one
     ./lnpoc.py setup                        # wallet, blocks, test asset, fund nodes, connect
     ./lnpoc.py open-lbtc alice bob 2000000  # ordinary L-BTC channel (sats)
     ./lnpoc.py open-asset alice bob 5000000 # asset channel (asset base units)
@@ -20,6 +21,7 @@ commands.  Only needs Python 3 and `docker compose`.
 import argparse
 import json
 import os
+import socket
 import subprocess
 import sys
 import time
@@ -251,6 +253,38 @@ def cmd_down(args):
     if args.volumes and os.path.exists(STATE_FILE):
         # The chain is gone, and the asset with it.
         os.remove(STATE_FILE)
+
+
+def _port_open(port):
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(0.5)
+        return s.connect_ex(('127.0.0.1', port)) == 0
+
+
+def start_ui(port):
+    # node_id() caches ids for the life of the process, so a lqui.py left
+    # running from before this up/setup would hand out node ids that no
+    # longer match the nodes' (possibly regenerated) HSM seeds, and `connect`
+    # fails with "wrong key". Always replace it with a fresh one.
+    subprocess.run(['pkill', '-f', 'lqui.py'], check=False)
+    wait_for(f"port {port} to free up", lambda: not _port_open(port), timeout=10)
+    log_path = os.path.join(HERE, 'lqui.log')
+    with open(log_path, 'a') as log:
+        subprocess.Popen(
+            [sys.executable, os.path.join(HERE, 'lqui.py'), '--net', 'regtest', '--port', str(port)],
+            stdout=log, stderr=subprocess.STDOUT, cwd=HERE, start_new_session=True)
+    wait_for('the web UI', lambda: _port_open(port))
+    print(f"UI: http://127.0.0.1:{port}  (log: {log_path})")
+
+
+def cmd_start(args):
+    """up + setup + the web UI, in one call."""
+    if TESTNET:
+        raise Fail("start is for regtest; on testnet use `up`, `testnet-setup` and lqui.py by hand")
+    cmd_up(args)
+    cmd_setup(args)
+    if not args.no_ui:
+        start_ui(args.ui_port)
 
 
 def cmd_setup(args):
@@ -695,6 +729,11 @@ def main():
     sp = add('setup', cmd_setup, 'wallet, blocks, test asset, fund nodes, connect them')
     sp.add_argument('--asset-amount', type=int, default=1000, help='asset to issue (whole units)')
     sp.add_argument('--fund-sat', type=int, default=10_000_000, help='L-BTC per node wallet')
+    sp = add('start', cmd_start, 'up + setup + the web UI, all in one (regtest only)')
+    sp.add_argument('--asset-amount', type=int, default=1000, help='asset to issue (whole units)')
+    sp.add_argument('--fund-sat', type=int, default=10_000_000, help='L-BTC per node wallet')
+    sp.add_argument('--ui-port', type=int, default=8765)
+    sp.add_argument('--no-ui', action='store_true', help="don't start lqui.py")
     sp = add('mine', cmd_mine, 'mine blocks')
     sp.add_argument('blocks', type=int, nargs='?', default=1)
     sp = add('open-lbtc', cmd_open_lbtc, 'open an ordinary L-BTC channel')
