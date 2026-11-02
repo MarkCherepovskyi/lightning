@@ -188,6 +188,7 @@ pre.log { margin: 12px 0 0; padding: 12px 16px; background: var(--bg); border-to
         <button role="tab" aria-selected="false" data-tab="close" id="t-close">Close</button>
         <button role="tab" aria-selected="false" data-tab="send" id="t-send">Send</button>
         <button role="tab" aria-selected="false" data-tab="fund" id="t-fund">Fund</button>
+        <button role="tab" aria-selected="false" data-tab="mine" id="t-mine">Mine</button>
       </div>
 
       <form id="f-open" data-action="open">
@@ -235,6 +236,12 @@ pre.log { margin: 12px 0 0; padding: 12px 16px; background: var(--bg); border-to
         <label>L-BTC (sat)<input id="fund-sats" name="sats" type="number" min="1" step="1" value="20000" required></label>
         <p class="hint">Moves L-BTC from the elementsd wallet to the node's wallet. Nodes need it for on-chain fees.</p>
         <button class="btn" type="submit">Fund node</button>
+      </form>
+
+      <form id="f-mine" data-action="mine" hidden>
+        <label>Blocks<input id="mine-blocks" name="blocks" type="number" min="1" step="1" value="1" required></label>
+        <p class="hint">Mines the given number of blocks on the chain. On testnet this just waits for them.</p>
+        <button class="btn" type="submit">Mine blocks</button>
       </form>
     </section>
 
