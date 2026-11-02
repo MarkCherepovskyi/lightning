@@ -291,6 +291,10 @@ def build_job(body):
         node, sats = node_arg(body, 'node'), int_arg(body, 'sats')
         args = ns(node=node, sats=sats)
         return (f"Fund {node} with {sats:,} sat L-BTC", lambda: lq.cmd_fund(args))
+    if action == 'mine':
+        blocks = int_arg(body, 'blocks')
+        return (f"Mine {blocks:,} block{'s' if blocks != 1 else ''}",
+                lambda: print(f"block height {L.mine(blocks)}"))
     raise BadRequest("unknown action")
 
 
