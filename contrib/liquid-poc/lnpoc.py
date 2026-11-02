@@ -249,6 +249,7 @@ def cmd_up(args):
 
 
 def cmd_down(args):
+    subprocess.run(['pkill', '-f', 'lqui.py'], check=False)
     subprocess.run(COMPOSE + ['down'] + (['-v'] if args.volumes else []), check=True)
     if args.volumes and os.path.exists(STATE_FILE):
         # The chain is gone, and the asset with it.
