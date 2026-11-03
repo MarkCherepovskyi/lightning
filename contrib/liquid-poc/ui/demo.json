@@ -32,6 +32,10 @@
     {"id": "c4", "a": "alice", "b": "carol", "asset": "723376e4a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c",
      "state": "closed", "a_units": 0, "b_units": 0, "scid": "2678800x1x0", "announced": false}
   ],
+  "swap_pairs": [
+    {"provider": "bob", "frm": "lbtc", "to": "723376e4a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c", "rate_ppm": 1000000, "fee_base_msat": 500},
+    {"provider": "bob", "frm": "723376e4a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c", "to": "lbtc", "rate_ppm": 1000000, "fee_base_msat": 500}
+  ],
   "job": {
     "id": 3, "title": "Open channel alice to bob, 400,000 ASSET(723376e4)", "status": "done",
     "started": 1793218000, "ended": 1793218610,
