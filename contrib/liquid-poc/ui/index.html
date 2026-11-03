@@ -95,7 +95,8 @@ main { display: grid; grid-template-columns: minmax(0, 1fr) 380px; gap: 24px; ma
 .chip::before { content: ""; width: 8px; height: 8px; background: var(--c, var(--muted)); }
 .pill { display: inline-block; padding: 1px 8px; font: 600 11px var(--display); letter-spacing: .1em; text-transform: uppercase; border: 1px solid currentColor; }
 .pill.open { color: var(--ok); } .pill.opening, .pill.closing, .pill.running { color: var(--warn); } .pill.closed { color: var(--dim); }
-.pill.failed { color: var(--bad); } .pill.done { color: var(--ok); }
+.pill.failed { color: var(--bad); } .pill.done { color: var(--ok); } .pill.swap { color: var(--accent-hi); }
+#map .swaptag { font: 700 9px var(--mono); letter-spacing: .08em; fill: var(--accent-hi); }
 
 /* channels table */
 .tablewrap { overflow-x: auto; }
@@ -282,6 +283,8 @@ pre.log { margin: 12px 0 0; padding: 12px 16px; background: var(--bg); border-to
         <label>Name<input id="add-name" name="name" type="text" autocomplete="off" spellcheck="false"
           placeholder="dave2" pattern="[a-z][a-z0-9]{0,19}" maxlength="20" required></label>
         <label>Fund with L-BTC (sat)<input id="add-fund" name="fund_sat" type="number" min="0" step="1" value="10000000"></label>
+        <label class="check"><input id="add-swap" name="swap_provider" type="checkbox"> Set up as a swap service</label>
+        <p class="hint" id="add-swap-hint"></p>
         <p class="hint">Builds and starts one more Core Lightning node in the compose stack, from the same image as
           the others. Lowercase letters/digits, starting with a letter. 0: don't fund it yet.</p>
         <button class="btn" type="submit">Add node</button>
@@ -332,6 +335,8 @@ const swapLabel = a => label(a === 'lbtc' ? null : a);
    amount shown here is the amount the provider will actually quote, not
    an approximation. */
 const TIER_PERMILLE = {low: 2010, medium: 2030, high: 2060};
+
+const isSwapProvider = name => (S.swap_pairs || []).some(p => p.provider === name);
 
 function findSwapPair(toAsset) {
   if (!toAsset || !S.default_asset) return null;
@@ -457,15 +462,18 @@ function renderMap() {
   }));
   S.nodes.forEach(nd => {
     const [x, y] = pos[nd.name];
-    svg += `<g data-node="${esc(nd.name)}"><title>${esc(nd.name)} ${esc(nd.id)}</title>
-      <rect x="${x - 40}" y="${y - 16}" width="80" height="32" fill="var(--raised)" stroke="${nd.ok ? 'var(--accent)' : 'var(--bad)'}" stroke-width="1.5"/>
-      <text class="nm" x="${x}" y="${y + 5}" text-anchor="middle">${esc(nd.name)}</text></g>`;
+    const swap = isSwapProvider(nd.name);
+    svg += `<g data-node="${esc(nd.name)}"><title>${esc(nd.name)} ${esc(nd.id)}${swap ? ' (swap service)' : ''}</title>
+      <rect x="${x - 40}" y="${y - 16}" width="80" height="32" fill="var(--raised)" stroke="${swap ? 'var(--accent-hi)' : (nd.ok ? 'var(--accent)' : 'var(--bad)')}" stroke-width="1.5"${swap ? ' stroke-dasharray="4 3"' : ''}/>
+      <text class="nm" x="${x}" y="${y + 5}" text-anchor="middle">${esc(nd.name)}</text>
+      ${swap ? `<text class="swaptag" x="${x}" y="${y - 21}" text-anchor="middle">SWAP SERVICE</text>` : ''}</g>`;
   });
   put('#map', svg);
   const assets = Object.keys(S.assets);
   put('#legend', [`<span><i style="background:var(--lbtc)"></i>L-BTC</span>`]
     .concat(assets.map(a => `<span><i style="background:${color(a)}"></i>${esc(label(a))}</span>`))
-    .concat([`<span><i class="dash"></i>Connected, no channel</span>`]).join(''));
+    .concat([`<span><i class="dash"></i>Connected, no channel</span>`,
+              `<span style="color:var(--accent-hi)">Dashed outline: swap service</span>`]).join(''));
 }
 
 function renderNodes() {
@@ -476,6 +484,7 @@ function renderNodes() {
     const peers = nd.peers.filter(p => p.connected).map(p => p.name).join(', ') || 'none';
     return `<div class="node">
       <div class="top"><span class="dot ${nd.ok ? 'ok' : 'bad'}"></span><span class="name">${esc(nd.name)}</span>
+        ${isSwapProvider(nd.name) ? '<span class="pill swap">Swap service</span>' : ''}
         <button class="id mono" type="button" data-copy="${esc(nd.id)}" title="Copy node id">${nd.id ? esc(nd.id.slice(0, 10)) + '…' : ''}</button></div>
       <div class="bal"><span>${chip(null)}</span><b>${n(nd.lbtc)}</b></div>
       ${assets}
@@ -539,6 +548,10 @@ function renderSelects() {
   $('#open-hint').textContent = $('#open-asset').value === 'lbtc'
     ? 'L-BTC channel. Usable after 6 blocks.'
     : 'Asset channels also lock 6,000 sat L-BTC for fees. Usable after 6 blocks.';
+  $('#add-swap').disabled = !S.default_asset;
+  $('#add-swap-hint').textContent = S.default_asset
+    ? `Quotes L-BTC ⇄ ${label(S.default_asset)} at 1:1 plus a 500 msat base fee, both directions -- same as bob's. It can only actually quote once it holds open channels in both.`
+    : 'No asset issued yet -- run setup first.';
   const busy = S.job && S.job.status === 'running';
   document.querySelectorAll('form .btn').forEach(b => b.disabled = busy);
 }

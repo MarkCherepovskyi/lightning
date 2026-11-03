@@ -343,8 +343,24 @@ def build_job(body):
             raise BadRequest("fund_sat: enter a whole number")
         if not 0 <= fund_sat <= 10**13:
             raise BadRequest("fund_sat: out of range")
+        swap_provider = bool(body.get('swap_provider'))
+        asset = L.load_state().get('asset')
+        if swap_provider and not asset:
+            raise BadRequest("swap_provider: no asset issued yet -- run setup first")
         args = ns(name=name, fund_sat=fund_sat)
-        return (f"Add node {name}", lambda: L.cmd_add_node(args))
+
+        def do_add():
+            L.cmd_add_node(args)
+            if swap_provider:
+                # Same rate bob gets in cmd_setup: 1:1 plus a flat 500 msat
+                # base fee, both directions, so the pair shows a real quote
+                # as soon as this node holds both assets.
+                for frm, to in (('lbtc', asset), (asset, 'lbtc')):
+                    L.cmd_swap_provider(ns(node=name, from_asset=frm, to_asset=to,
+                                           rate_ppm=1_000_000, fee_base_msat=500))
+
+        title = f"Add node {name}" + (" as a swap service" if swap_provider else "")
+        return (title, do_add)
     raise BadRequest("unknown action")
 
 
