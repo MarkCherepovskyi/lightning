@@ -229,25 +229,41 @@ signed bytes.
 
 ### 2. Swap-provider config (static for v1)
 
+Pricing policy — which pairs are quotable, at what reference rate, with
+what tier margins — is deliberately **not** `assetswap-plugin`'s own
+config at all. It lives in a separate, swap-mechanics-agnostic plugin,
+**`plugins/pricetiers-plugin`** (`pricetiers-plugin` binary), which
+`assetswap-plugin` calls as a plain local RPC (`pricetiers`, via
+`cln_rpc::ClnRpc::call_raw` — not a core lightningd method, so not
+`call_typed`). This plugin knows nothing about Liquid assets, swaps, or
+`htlc_accepted` at all; asset ids are opaque strings to it, just matched
+against what a `pricetiers` caller asks for. Splitting it out this way
+means a different pricing policy (e.g. a genuine oracle-backed one, see
+below) can be swapped in without touching `assetswap-plugin`.
+
 Plugin options read at startup via `cln_plugin::options`, no new RPC
 required:
 
-- `--assetswap-pair=<from_asset_hex>:<to_asset_hex>:<rate_ppm>:<fee_base_msat>`
-  (repeatable) — which asset pairs a provider is willing to quote, and at
-  what reference price. **As implemented, this `rate_ppm` is the live
-  price source** — the "fixed" source described below, not an external
-  feed. The live-price recheck in the `htlc_accepted` hook therefore
-  always compares a tier's cap against this same configured number, so
-  (as noted in Limits) it's a permanently-satisfied check in this
-  increment, not yet a real defense against price movement.
-- `--assetswap-provider=<node_id>` (repeatable, payer side) — which
-  providers to query. Onion-message-based discovery is a natural v2; not
-  needed for v1.
-- **Not yet implemented**: calling `plugins/currencyrate-plugin`'s
-  `currencyconvert` RPC (already in this tree) as a genuine live-price
-  oracle, behind an `--assetswap-price-source=oracle` option. This is the
-  natural next step for making the price-tier mechanism's protection real
-  rather than theoretical — see Limits.
+- `pricetiers-plugin`'s `--pricetiers-pair=<from_asset>:<to_asset>:<rate_ppm>:<fee_base_msat>`
+  (repeatable) — which asset pairs are quotable, and at what reference
+  price. **As implemented, this `rate_ppm` is the live price source** —
+  the "fixed" source described below, not an external feed. The
+  live-price recheck in `assetswap-plugin`'s `htlc_accepted` hook calls
+  `pricetiers-plugin` again and therefore always compares a tier's cap
+  against this same configured number, so (as noted in Limits) it's a
+  permanently-satisfied check in this increment, not yet a real defense
+  against price movement.
+- `assetswap-plugin`'s `--assetswap-provider=<node_id>` (repeatable,
+  payer side) — which providers to query. Onion-message-based discovery
+  is a natural v2; not needed for v1.
+- **Not yet implemented**: a second pricing-policy plugin, implementing
+  the same `pricetiers` RPC contract but backed by
+  `plugins/currencyrate-plugin`'s `currencyconvert` RPC (already in this
+  tree) as a genuine live-price oracle instead of a static configured
+  rate. Because pricing is already its own plugin, this needs no change
+  to `assetswap-plugin` at all — just loading a different pricing plugin.
+  This is the natural next step for making the price-tier mechanism's
+  protection real rather than theoretical — see Limits.
 
 ### 3. Quote protocol — `custommsg` / `sendcustommsg`, with three price tiers
 
@@ -503,15 +519,17 @@ The fix is operational, not code: **a swap-provider must load this plugin
 before lightningd can ever replay a pending HTLC**, never only via
 `plugin start`. In `contrib/liquid-poc`, this is now structural rather
 than something an operator has to remember: the Dockerfile's
-`assetswap-builder` stage builds the plugin into the `cln` image itself,
-and `docker-compose.yml`'s shared entrypoint passes
-`--plugin=/opt/lightning/libexec/c-lightning/plugins/assetswap-plugin` on
-every node's command line — so it's loaded from each node's very first
-startup, the same way for alice, bob, and carol, with nothing left for
-`lnpoc.py`'s swap commands to configure beyond the `assetswap-pair=`/
-`assetswap-provider=` lines themselves (see Files, below). Outside this
-PoC's Docker setup, the equivalent is a `plugin=/path/to/assetswap-plugin`
-line in a provider's own `config` file. Verified by repeating the same
+`rust-plugins-builder` stage builds both `assetswap-plugin` and
+`pricetiers-plugin` into the `cln` image itself, and
+`docker-compose.yml`'s shared entrypoint passes `--plugin=` for each of
+them on every node's command line — so both are loaded from each node's
+very first startup, the same way for alice, bob, and carol, with nothing
+left for `lnpoc.py`'s swap commands to configure beyond the
+`pricetiers-pair=`/`assetswap-provider=` lines themselves (see Files,
+below). Outside this PoC's Docker setup, the equivalent is a
+`plugin=/path/to/assetswap-plugin` and
+`plugin=/path/to/pricetiers-plugin` line in a provider's own `config`
+file. Verified by repeating the same
 hold-and-restart test against the baked-in setup: the replayed hook fires
 with the plugin already loaded, `resolve_from_leg2_status` finds leg 2
 `pending`, waits on it, and correctly resolves leg 1 once leg 2 lands. A
@@ -542,30 +560,36 @@ rather than inventing new numbers:
   datastore-backed quote record, and a thin client for
   `currencyrate-plugin`'s `currencyconvert` RPC), with its own `README.md`
   mirroring this directory's.
-- **One-line change**: add `"plugins/assetswap-plugin"` to the root
-  `Cargo.toml`'s `[workspace] members` — the same step every sibling
-  plugin crate required, not a behavioral change to anything.
+- **New**: `plugins/pricetiers-plugin/` (Rust crate `cln-pricetiers`,
+  binary `pricetiers-plugin`) — the standalone, swap-agnostic pricing
+  policy described in §2, with its own `pricetiers` RPC method. Has no
+  `cln-rpc` dependency at all (it never calls back into lightningd) and
+  no notion of swaps, Liquid assets, or `htlc_accepted`.
+- **One-line changes**: add `"plugins/assetswap-plugin"` and
+  `"plugins/pricetiers-plugin"` to the root `Cargo.toml`'s `[workspace]
+  members` — the same step every sibling plugin crate required, not a
+  behavioral change to anything.
 - **New**: `tests/test_assetswap.py` (pytest, same harness as
   `tests/test_liquid_asset_gossip.py`/`tests/test_liquid_asset_poc.py`:
   `node_factory`, `fund_asset_channel`, `asset_invoice`,
   `TEST_NETWORK=liquid-regtest` skip-guard, nodes loaded with
   `opts=[{'plugin': os.path.join(os.getcwd(), 'target/debug/assetswap-plugin')}, ...]`
-  — the test harness itself stays Python/pytest as this fork already does
-  for its Rust-adjacent plugins; only the plugin binary is Rust).
+  plus `pricetiers-plugin` and its `--pricetiers-pair=` option — the test
+  harness itself stays Python/pytest as this fork already does for its
+  Rust-adjacent plugins; only the plugin binaries are Rust).
 - **`contrib/liquid-poc` infra** (this PoC's test harness, not core):
-  - `Dockerfile`: a new `assetswap-builder` stage (`rust:1-bookworm`,
+  - `Dockerfile`: a `rust-plugins-builder` stage (`rust:1-bookworm`,
     building just `cln-rpc`/`cln-grpc`/`plugins` so unrelated C-side
-    changes don't invalidate its cache) and one `COPY --from=` line
-    dropping the built binary into the `cln` stage's default plugins
-    directory.
-  - `docker-compose.yml`: one added `--plugin=...` flag on the shared
-    `x-cln` entrypoint, so alice/bob/carol all load it from their very
-    first startup — see §7's restart-idempotency requirement.
+    changes don't invalidate its cache) building both
+    `cln-assetswap`/`cln-pricetiers`, and one `COPY --from=` line per
+    binary dropping it into the `cln` stage's default plugins directory.
+  - `docker-compose.yml`: two added `--plugin=...` flags on the shared
+    `x-cln` entrypoint, so alice/bob/carol all load both plugins from
+    their very first startup — see §7's restart-idempotency requirement.
   - `lnpoc.py`: `swap-provider`/`swap-payer`/`assetinvoice`/
     `payassetinvoice`/`swap`/`swap-demo` subcommands (see its own
-    docstring), which only ever need to write the `assetswap-pair=`/
-    `assetswap-provider=` config lines — the plugin itself is already
-    loaded.
+    docstring), which only ever need to write the `pricetiers-pair=`/
+    `assetswap-provider=` config lines — both plugins are already loaded.
 - **Unchanged**: everything under `lightningd/`, `gossipd/`, `channeld/`,
   `common/`, `wire/`. The only reuse of existing core features is the
   already-shipped `invoice ... asset=` and `xpay ... asset=` support, plus
