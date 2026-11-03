@@ -189,6 +189,7 @@ pre.log { margin: 12px 0 0; padding: 12px 16px; background: var(--bg); border-to
         <button role="tab" aria-selected="false" data-tab="send" id="t-send">Send</button>
         <button role="tab" aria-selected="false" data-tab="fund" id="t-fund">Fund</button>
         <button role="tab" aria-selected="false" data-tab="mine" id="t-mine">Mine</button>
+        <button role="tab" aria-selected="false" data-tab="add_node" id="t-add">Add node</button>
       </div>
 
       <form id="f-open" data-action="open">
@@ -242,6 +243,15 @@ pre.log { margin: 12px 0 0; padding: 12px 16px; background: var(--bg); border-to
         <label>Blocks<input id="mine-blocks" name="blocks" type="number" min="1" step="1" value="1" required></label>
         <p class="hint">Mines the given number of blocks on the chain. On testnet this just waits for them.</p>
         <button class="btn" type="submit">Mine blocks</button>
+      </form>
+
+      <form id="f-add" data-action="add_node" hidden>
+        <label>Name<input id="add-name" name="name" type="text" autocomplete="off" spellcheck="false"
+          placeholder="dave2" pattern="[a-z][a-z0-9]{0,19}" maxlength="20" required></label>
+        <label>Fund with L-BTC (sat)<input id="add-fund" name="fund_sat" type="number" min="0" step="1" value="10000000"></label>
+        <p class="hint">Builds and starts one more Core Lightning node in the compose stack, from the same image as
+          the others. Lowercase letters/digits, starting with a letter. 0: don't fund it yet.</p>
+        <button class="btn" type="submit">Add node</button>
       </form>
     </section>
 

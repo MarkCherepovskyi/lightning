@@ -33,7 +33,6 @@ sys.path.insert(0, HERE)
 import lnpoc as L  # noqa: E402
 import lq  # noqa: E402
 
-NODES = L.NODES
 HEX64 = re.compile(r'^[0-9a-f]{64}$')
 ADDRESS = re.compile(r'^[A-Za-z0-9]{20,150}$')
 ns = argparse.Namespace
@@ -62,10 +61,13 @@ class Poller:
             return None
 
     def poll(self):
+        # Read fresh each cycle so a node added at runtime (add_node) shows
+        # up without restarting this server.
+        nodes = L.all_nodes()
         chain = self.pool.submit(lambda: L.ecli('getblockchaininfo', wallet=False))
         wallet = self.pool.submit(self.elements_wallet)
         snaps = {n: f.result() for n, f in
-                 [(n, self.pool.submit(self.node_snapshot, n)) for n in NODES]}
+                 [(n, self.pool.submit(self.node_snapshot, n)) for n in nodes]}
         try:
             info = chain.result()
         except L.Fail:
@@ -77,16 +79,16 @@ class Poller:
         if asset:
             assets[asset] = L.asset_label(asset)
 
-        nodes = []
-        for name in NODES:
+        node_rows = []
+        for name in nodes:
             s = snaps[name]
             if not s:
-                nodes.append({'name': name, 'id': '', 'ok': False, 'lbtc': 0, 'assets': {}, 'peers': []})
+                node_rows.append({'name': name, 'id': '', 'ok': False, 'lbtc': 0, 'assets': {}, 'peers': []})
                 continue
             lbtc, held = s['funds']
             for a in held:
                 assets.setdefault(a, L.asset_label(a))
-            nodes.append({
+            node_rows.append({
                 'name': name, 'id': s['info']['id'], 'ok': True, 'lbtc': lbtc, 'assets': held,
                 'peers': [{'name': ids.get(p['id'], p['id'][:10]), 'connected': p['connected']}
                           for p in s['peers']],
@@ -94,7 +96,7 @@ class Poller:
 
         # Every channel shows up on both nodes; keep the opener's view.
         chans = {}
-        for name in NODES:
+        for name in nodes:
             for c in (snaps[name] or {}).get('chans', []):
                 key = c.get('channel_id') or c.get('peer_id') + str(c.get('short_channel_id'))
                 if key in chans and c.get('opener') != 'local':
@@ -115,7 +117,7 @@ class Poller:
             'net': info['chain'], 'block': info['blocks'], 'headers': info['headers'],
             'syncing': bool(info.get('initialblockdownload')),
             'default_asset': asset, 'assets': assets, 'elements': wallet.result(),
-            'nodes': nodes, 'channels': channels,
+            'nodes': node_rows, 'channels': channels,
         }
         with self.lock:
             self.state = state
@@ -225,8 +227,9 @@ class BadRequest(Exception):
 # ---------------------------------------------------------------- requests
 def node_arg(body, key):
     v = body.get(key)
-    if v not in NODES:
-        raise BadRequest(f"{key}: pick one of {', '.join(NODES)}")
+    nodes = L.all_nodes()
+    if v not in nodes:
+        raise BadRequest(f"{key}: pick one of {', '.join(nodes)}")
     return v
 
 
@@ -295,6 +298,18 @@ def build_job(body):
         blocks = int_arg(body, 'blocks')
         return (f"Mine {blocks:,} block{'s' if blocks != 1 else ''}",
                 lambda: print(f"block height {L.mine(blocks)}"))
+    if action == 'add_node':
+        name = body.get('name', '')
+        if not L.NODE_NAME_RE.match(name):
+            raise BadRequest("name: lowercase letters/digits, starting with a letter, up to 20 characters")
+        try:
+            fund_sat = int(body.get('fund_sat', 0) or 0)
+        except (TypeError, ValueError):
+            raise BadRequest("fund_sat: enter a whole number")
+        if not 0 <= fund_sat <= 10**13:
+            raise BadRequest("fund_sat: out of range")
+        args = ns(name=name, fund_sat=fund_sat)
+        return (f"Add node {name}", lambda: L.cmd_add_node(args))
     raise BadRequest("unknown action")
 
 

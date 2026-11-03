@@ -66,6 +66,16 @@ and `xpay` use L-BTC channels unless given `asset=<id>`.
 
 Other commands: `mine [n]`, `invoice <node> <msat> [--lbtc]`, `down [-v]`
 (`-v` also wipes the chain, the nodes and the saved asset id).
+
+```bash
+./lnpoc.py add-node dave2                      # one more CLN node, same image, funded with 10,000,000 sat
+./lnpoc.py add-node dave2 --fund-sat 0          # ... without funding it
+```
+
+Builds and starts it from the `cln` image (already built for alice/bob/carol, so this is
+fast), adds it to `.lnpoc-nodes.yml` (an overlay compose file next to `docker-compose.yml`,
+regenerated each time) and remembers it in the state file, so later runs and the web UI
+pick it up too. `down` / `down -v` tear it down along with the rest.
 Any `lightning-cli` / `elements-cli` call works directly too:
 
 ```bash
@@ -257,8 +267,9 @@ Still missing for asset channels:
 
 Open http://127.0.0.1:8765. The page shows the nodes, who is connected to whom, wallet
 balances and every channel with its split, and has forms to open, pay, close (also a
-force close), send on-chain and fund a node. It calls the same functions as `lq.py`, one
-at a time; the Activity panel shows the running command's output. Opening a channel on
+force close), send on-chain, fund a node and add one more node (`add-node` above, from
+the "Add node" tab). It calls the same functions as `lq.py` and `lnpoc.py`, one at a
+time; the Activity panel shows the running command's output. Opening a channel on
 the testnet takes about ten minutes. `?demo` shows the page with sample data.
 
 It uses only the Python standard library, listens on localhost and spends test coins:
