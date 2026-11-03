@@ -16,6 +16,7 @@ base units (asset units, or sats for L-BTC).
     lq pay FROM TO UNITS                   pay along our channels
     lq close FROM TO [--force]             cooperative close; --force: peer offline, unilateral
     lq send NODE ADDRESS UNITS [--lbtc]    spend a node's coins on-chain (asset: withdrawasset)
+    lq swap FROM TO UNITS ASSET [--tier]   TO invoices ASSET, FROM pays it (swaps if FROM lacks it)
 
 Opening a channel or closing one waits for blocks: about a minute each on
 the testnet, so an open takes around ten minutes.
@@ -128,6 +129,11 @@ def cmd_close(args):
         L.cmd_close(ns(frm=args.frm, to=args.to, asset=args.asset, lbtc=args.lbtc))
 
 
+def cmd_swap(args):
+    L.cmd_swap(ns(frm=args.frm, to=args.to, amount_msat=args.units * 1000,
+                 asset=args.asset, tier=args.tier, label=None))
+
+
 def cmd_send(args):
     if args.lbtc:
         res = L.ln(args.node, 'withdraw', destination=args.address, satoshi=args.units)
@@ -181,6 +187,12 @@ def main():
     sp.add_argument('node', choices=NODES)
     sp.add_argument('address')
     sp.add_argument('units', type=int)
+    sp = add('swap', cmd_swap)
+    sp.add_argument('frm', choices=NODES)
+    sp.add_argument('to', choices=NODES)
+    sp.add_argument('units', type=int)
+    sp.add_argument('asset', help="asset id, or 'lbtc' -- the asset `to` wants")
+    sp.add_argument('--tier', choices=['low', 'medium', 'high'], default='medium')
 
     args = p.parse_args()
     try:
