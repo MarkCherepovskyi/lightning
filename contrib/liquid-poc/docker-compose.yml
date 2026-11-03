@@ -38,6 +38,7 @@ x-cln: &cln
       --developer
       --dev-fast-gossip
       --dev-bitcoind-poll=1
+      --plugin=/opt/lightning/libexec/c-lightning/plugins/assetswap-plugin
 
 services:
   elementsd:
