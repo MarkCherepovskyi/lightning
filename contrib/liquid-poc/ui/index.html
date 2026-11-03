@@ -71,10 +71,12 @@ main { display: grid; grid-template-columns: minmax(0, 1fr) 380px; gap: 24px; ma
 .legend i.dash { background: repeating-linear-gradient(90deg, var(--dim) 0 4px, transparent 4px 7px); }
 
 /* map */
-#map { display: block; width: 100%; height: auto; max-height: 340px; }
+#map { display: block; width: 100%; height: auto; max-height: 340px; touch-action: none; }
 #map text { font-family: var(--body); fill: var(--fg); }
 #map .nm { font: 600 13px var(--display); letter-spacing: .04em; }
 #map .cap { font: 11px var(--mono); fill: var(--muted); paint-order: stroke; stroke: var(--panel); stroke-width: 5px; }
+#map [data-node] { cursor: grab; }
+#map [data-node]:active { cursor: grabbing; }
 
 /* nodes */
 .nodes { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); }
@@ -268,6 +270,8 @@ const $ = s => document.querySelector(s);
 const demo = location.search.includes('demo');
 const ASSET_COLORS = ['--a1', '--a2', '--a3', '--a4'];
 let S = null, showClosed = false;
+const nodePos = {};  // name -> [x, y] in #map's viewBox units; set once per node, then only by dragging.
+let drag = null;  // {name, dx, dy} while a node is being dragged
 
 const esc = s => String(s).replace(/[&<>"']/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]));
 const n = x => Number(x).toLocaleString('en-US');
@@ -329,8 +333,12 @@ function renderMap() {
   const names = S.nodes.map(x => x.name), N = names.length, cx = 320, cy = 150, rx = 220, ry = 100;
   const pos = {};
   names.forEach((nm, i) => {
-    const t = Math.PI + i * 2 * Math.PI / N;
-    pos[nm] = [cx + rx * Math.cos(t), cy + ry * Math.sin(t)];
+    // Lay out a node once, on an ellipse; after that keep wherever it was dragged to.
+    if (!nodePos[nm]) {
+      const t = Math.PI + i * 2 * Math.PI / N;
+      nodePos[nm] = [cx + rx * Math.cos(t), cy + ry * Math.sin(t)];
+    }
+    pos[nm] = nodePos[nm];
   });
   const byPair = {};
   liveChannels().forEach(c => (byPair[[c.a, c.b].sort()] = byPair[[c.a, c.b].sort()] || []).push(c));
@@ -355,7 +363,7 @@ function renderMap() {
   }));
   S.nodes.forEach(nd => {
     const [x, y] = pos[nd.name];
-    svg += `<g><title>${esc(nd.name)} ${esc(nd.id)}</title>
+    svg += `<g data-node="${esc(nd.name)}"><title>${esc(nd.name)} ${esc(nd.id)}</title>
       <rect x="${x - 40}" y="${y - 16}" width="80" height="32" fill="var(--raised)" stroke="${nd.ok ? 'var(--accent)' : 'var(--bad)'}" stroke-width="1.5"/>
       <text class="nm" x="${x}" y="${y + 5}" text-anchor="middle">${esc(nd.name)}</text></g>`;
   });
@@ -450,6 +458,30 @@ function showTab(name) {
   document.querySelectorAll('form[data-action]').forEach(f => f.hidden = f.dataset.action !== name);
 }
 $('#tabs').addEventListener('click', e => { const b = e.target.closest('button'); if (b) showTab(b.dataset.tab); });
+
+/* Drag a node on the map. #map's children are replaced on every render, so
+   listeners live on #map itself (never replaced) and find the node via
+   closest('[data-node]') rather than being bound to the node elements. */
+function toMapPoint(evt) {
+  const svg = $('#map'), pt = svg.createSVGPoint();
+  pt.x = evt.clientX; pt.y = evt.clientY;
+  return pt.matrixTransform(svg.getScreenCTM().inverse());
+}
+$('#map').addEventListener('pointerdown', e => {
+  const g = e.target.closest('[data-node]');
+  if (!g || !S) return;
+  const name = g.dataset.node, [x, y] = nodePos[name], p = toMapPoint(e);
+  drag = {name, dx: x - p.x, dy: y - p.y};
+  $('#map').setPointerCapture(e.pointerId);
+  e.preventDefault();
+});
+$('#map').addEventListener('pointermove', e => {
+  if (!drag) return;
+  const p = toMapPoint(e);
+  nodePos[drag.name] = [Math.min(600, Math.max(40, p.x + drag.dx)), Math.min(280, Math.max(20, p.y + drag.dy))];
+  renderMap();
+});
+['pointerup', 'pointercancel', 'lostpointercapture'].forEach(ev => $('#map').addEventListener(ev, () => drag = null));
 $('#toggleClosed').addEventListener('click', () => { showClosed = !showClosed; renderChannels(); });
 $('#close-force').addEventListener('change', e => $('#close-warn').hidden = !e.target.checked);
 document.addEventListener('change', e => { if (S && e.target.matches('#open-asset, #open-frm, #pay-frm')) renderSelects(); });
