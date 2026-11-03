@@ -70,17 +70,19 @@ ARG VERSION=liquid-poc
 RUN PYTHON=python3 ./configure --prefix=/opt/lightning --disable-rust --disable-valgrind --disable-compat \
  && make -j"$(nproc)" VERSION="${VERSION}" install-program
 
-# assetswap-plugin (contrib/liquid-poc/CROSS_ASSET_SWAP.md): built in its own
-# Rust stage, separate from cln-builder's --disable-rust build above. Only the
-# crates it actually needs are copied in, so unrelated C-side changes don't
-# invalidate this stage's cache.
-FROM rust:1-bookworm AS assetswap-builder
+# assetswap-plugin and pricetiers-plugin (contrib/liquid-poc/
+# CROSS_ASSET_SWAP.md): built in their own Rust stage, separate from
+# cln-builder's --disable-rust build above. Only the crates actually needed
+# are copied in, so unrelated C-side changes don't invalidate this stage's
+# cache. pricetiers-plugin is deliberately a separate, swappable pricing
+# policy plugin -- see plugins/pricetiers-plugin/src/main.rs's doc comment.
+FROM rust:1-bookworm AS rust-plugins-builder
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY cln-rpc cln-rpc
 COPY cln-grpc cln-grpc
 COPY plugins plugins
-RUN cargo build --release -p cln-assetswap
+RUN cargo build --release -p cln-assetswap -p cln-pricetiers
 
 FROM debian:bookworm-slim AS cln
 RUN apt-get update \
@@ -91,10 +93,11 @@ COPY --from=cln-builder /opt/lightning /opt/lightning
 # bcli talks to elementsd through elements-cli.
 COPY --from=elements /usr/local/bin/elements-cli /usr/local/bin/
 # Dropped straight into the default plugins directory, so every node loads
-# it automatically at startup -- no --plugin=/plugin= config line needed,
+# them automatically at startup -- no --plugin=/plugin= config line needed,
 # and (importantly, see CROSS_ASSET_SWAP.md's "Restart idempotency" section)
-# it's always present before lightningd replays any pending HTLC on restart.
-COPY --from=assetswap-builder /src/target/release/assetswap-plugin /opt/lightning/libexec/c-lightning/plugins/assetswap-plugin
+# they're always present before lightningd replays any pending HTLC on restart.
+COPY --from=rust-plugins-builder /src/target/release/assetswap-plugin /opt/lightning/libexec/c-lightning/plugins/assetswap-plugin
+COPY --from=rust-plugins-builder /src/target/release/pricetiers-plugin /opt/lightning/libexec/c-lightning/plugins/pricetiers-plugin
 ENV PATH=/opt/lightning/bin:${PATH}
 VOLUME /data
 ENTRYPOINT ["lightningd"]
