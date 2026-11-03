@@ -4,8 +4,8 @@
 //! *reply* back to whichever `payassetinvoice` call is waiting on it.
 
 use crate::protocol::{
-    decode_custommsg, encode_custommsg, make_tiers, now_unix, quote_key, QuoteReply, QuoteRecord,
-    QuoteRequest,
+    decode_custommsg, encode_custommsg, fetch_price_tiers, now_unix, quote_key, QuoteReply,
+    QuoteRecord, QuoteRequest,
 };
 use crate::rpc::new_rpc;
 use crate::State;
@@ -36,23 +36,6 @@ async fn handle_quote_request_inner(
         })
         .await?;
 
-    let Some(pair) = p.state().config.pair_for(&req.to_asset) else {
-        let reply = QuoteReply {
-            req_id: req.req_id.clone(),
-            ok: false,
-            reason: Some("unsupported asset pair".into()),
-            from_asset: None,
-            to_asset: None,
-            payment_hash: None,
-            tiers: None,
-            quote_expiry_unix: None,
-            min_leg1_cltv: None,
-        };
-        let msg = encode_custommsg(reply_type, &reply)?;
-        rpc.call_typed(&SendcustommsgRequest { node_id: peer_id, msg }).await?;
-        return Ok(());
-    };
-
     let to_amount_msat = decoded
         .amount_msat
         .ok_or_else(|| anyhow!("invoice has no amount"))?
@@ -65,7 +48,30 @@ async fn handle_quote_request_inner(
         .min_final_cltv_expiry
         .ok_or_else(|| anyhow!("invoice has no min_final_cltv_expiry"))?;
 
-    let tiers = make_tiers(pair, to_amount_msat);
+    // Pricing is pricetiers-plugin's job, not ours -- see protocol.rs's
+    // doc comment. Its failure (pair not configured, or it isn't even
+    // loaded) looks the same to a payer either way: unsupported pair.
+    let priced = match fetch_price_tiers(&mut rpc, &req.to_asset, to_amount_msat).await {
+        Ok(p) => p,
+        Err(e) => {
+            log::debug!("assetswap: no price for {}: {e}", req.to_asset);
+            let reply = QuoteReply {
+                req_id: req.req_id.clone(),
+                ok: false,
+                reason: Some("unsupported asset pair".into()),
+                from_asset: None,
+                to_asset: None,
+                payment_hash: None,
+                tiers: None,
+                quote_expiry_unix: None,
+                min_leg1_cltv: None,
+            };
+            let msg = encode_custommsg(reply_type, &reply)?;
+            rpc.call_typed(&SendcustommsgRequest { node_id: peer_id, msg }).await?;
+            return Ok(());
+        }
+    };
+
     let expiry = now_unix() + p.state().config.quote_expiry_secs;
     // +1 block of slack over the hook's own exact gate, so routing-time
     // rounding doesn't put leg 1 exactly on the boundary.
@@ -74,12 +80,12 @@ async fn handle_quote_request_inner(
 
     let record = QuoteRecord {
         state: "quoted".into(),
-        from_asset: pair.from_asset.clone(),
-        to_asset: pair.to_asset.clone(),
+        from_asset: priced.from_asset.clone(),
+        to_asset: req.to_asset.clone(),
         final_bolt11: req.final_bolt11.clone(),
         quote_expiry_unix: expiry,
         leg2_final_cltv,
-        tiers: tiers.clone(),
+        tiers: priced.tiers.clone(),
     };
     rpc.call_typed(&DatastoreRequest {
         generation: None,
@@ -94,10 +100,10 @@ async fn handle_quote_request_inner(
         req_id: req.req_id.clone(),
         ok: true,
         reason: None,
-        from_asset: Some(pair.from_asset.clone()),
-        to_asset: Some(pair.to_asset.clone()),
+        from_asset: Some(priced.from_asset),
+        to_asset: Some(req.to_asset.clone()),
         payment_hash: Some(payment_hash),
-        tiers: Some(tiers),
+        tiers: Some(priced.tiers),
         quote_expiry_unix: Some(expiry),
         min_leg1_cltv: Some(min_leg1_cltv),
     };

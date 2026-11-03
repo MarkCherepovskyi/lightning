@@ -1,15 +1,14 @@
 //! Plugin options and the parsed configuration they produce.
+//!
+//! Price-ceiling tiers for a pair aren't configured here at all anymore --
+//! that's `plugins/pricetiers-plugin`'s job (a separate, swappable pricing
+//! policy plugin; see `protocol::fetch_price_tiers`). This plugin only
+//! knows about the swap *mechanics*: who to ask for quotes, and the
+//! custommsg/CLTV/expiry knobs around them.
 
-use anyhow::{anyhow, Error};
 use cln_plugin::options::{DefaultIntegerConfigOption, StringArrayConfigOption};
 use cln_rpc::primitives::PublicKey;
 
-pub(crate) const OPT_PAIR: StringArrayConfigOption = StringArrayConfigOption::new_str_arr_no_default(
-    "assetswap-pair",
-    "A swap pair this node provides, as from_asset:to_asset:rate_ppm:fee_base_msat. \
-     rate_ppm is how many msat of from_asset are required per 1_000_000 msat worth of \
-     to_asset at today's reference price. Repeatable.",
-);
 pub(crate) const OPT_PROVIDER: StringArrayConfigOption = StringArrayConfigOption::new_str_arr_no_default(
     "assetswap-provider",
     "A swap-provider node_id to query for quotes when paying a cross-asset invoice \
@@ -44,51 +43,11 @@ pub(crate) const OPT_QUOTE_EXPIRY: DefaultIntegerConfigOption = DefaultIntegerCo
 );
 
 #[derive(Clone, Debug)]
-pub(crate) struct SwapPair {
-    pub(crate) from_asset: String,
-    pub(crate) to_asset: String,
-    pub(crate) rate_ppm: u64,
-    pub(crate) fee_base_msat: u64,
-}
-
-pub(crate) fn parse_pair(s: &str) -> Result<SwapPair, Error> {
-    let parts: Vec<&str> = s.split(':').collect();
-    let [from_asset, to_asset, rate_ppm, fee_base_msat] = parts.as_slice() else {
-        return Err(anyhow!(
-            "assetswap-pair must be from_asset:to_asset:rate_ppm:fee_base_msat, got {s:?}"
-        ));
-    };
-    Ok(SwapPair {
-        from_asset: from_asset.to_string(),
-        to_asset: to_asset.to_string(),
-        rate_ppm: rate_ppm.parse()?,
-        fee_base_msat: fee_base_msat.parse()?,
-    })
-}
-
-#[derive(Clone, Debug)]
 pub(crate) struct Config {
-    pub(crate) pairs: Vec<SwapPair>,
     pub(crate) providers: Vec<PublicKey>,
     pub(crate) msgtype_request: u16,
     pub(crate) msgtype_reply: u16,
     pub(crate) safety_blocks: u32,
     pub(crate) min_hop_budget: u32,
     pub(crate) quote_expiry_secs: u64,
-}
-
-impl Config {
-    /// The "fixed" price source: today's reference price for a pair is
-    /// just whatever rate_ppm the operator configured for it. See the
-    /// crate-level doc comment in `main.rs`.
-    pub(crate) fn current_rate_ppm(&self, from_asset: &str, to_asset: &str) -> Option<u64> {
-        self.pairs
-            .iter()
-            .find(|p| p.from_asset == from_asset && p.to_asset == to_asset)
-            .map(|p| p.rate_ppm)
-    }
-
-    pub(crate) fn pair_for(&self, to_asset: &str) -> Option<&SwapPair> {
-        self.pairs.iter().find(|p| p.to_asset == to_asset)
-    }
 }
