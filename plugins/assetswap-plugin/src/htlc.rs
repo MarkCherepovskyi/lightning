@@ -3,7 +3,7 @@
 //! fail leg 1 — plus the restart-replay idempotency path for an HTLC we
 //! already committed to before a prior process exited.
 
-use crate::protocol::{now_unix, quote_key, QuoteRecord};
+use crate::protocol::{asset_sha, fetch_price_tiers, is_lbtc, now_unix, quote_key, QuoteRecord};
 use crate::rpc::new_rpc;
 use crate::State;
 use anyhow::{anyhow, Error};
@@ -13,7 +13,7 @@ use cln_rpc::model::requests::{
     ListsendpaysRequest, WaitsendpayRequest, XpayRequest,
 };
 use cln_rpc::model::responses::ListsendpaysPaymentsStatus;
-use cln_rpc::primitives::{Secret, Sha256, ShortChannelId};
+use cln_rpc::primitives::{Secret, ShortChannelId};
 use cln_rpc::ClnRpc;
 use serde_json::{json, Value};
 use std::str::FromStr;
@@ -261,9 +261,12 @@ pub(crate) async fn on_htlc_accepted(p: Plugin<State>, v: Value) -> Result<Value
         return Ok(fail_incorrect_details()); // amount doesn't match any quoted tier
     };
 
+    // CLN's own `liquid_asset` field is `None` for an L-BTC channel, not
+    // the literal "lbtc" our own protocol uses — bridge the two here.
     let chan_asset = channel_asset(&mut rpc, &scid).await.ok().flatten();
+    let expected_chan_asset = if is_lbtc(&rec.from_asset) { None } else { Some(rec.from_asset.as_str()) };
     let budget = rec.leg2_final_cltv + p.state().config.safety_blocks + p.state().config.min_hop_budget;
-    if chan_asset.as_deref() != Some(rec.from_asset.as_str())
+    if chan_asset.as_deref() != expected_chan_asset
         || now_unix() > rec.quote_expiry_unix
         || cltv_expiry_relative < budget
     {
@@ -271,10 +274,11 @@ pub(crate) async fn on_htlc_accepted(p: Plugin<State>, v: Value) -> Result<Value
     }
 
     // Live-price recheck: has the market moved past the ceiling the payer
-    // pre-approved for this tier since the quote was issued? (A no-op
-    // under the "fixed" price source — see the crate-level doc comment.)
-    match p.state().config.current_rate_ppm(&rec.from_asset, &rec.to_asset) {
-        Some(live) if tier.rate_ppm >= live => {}
+    // pre-approved for this tier since the quote was issued? Ask
+    // pricetiers-plugin again (amount is irrelevant here, only its
+    // rate_ppm is used) rather than trusting the quote-time snapshot.
+    match fetch_price_tiers(&mut rpc, &rec.to_asset, 1).await {
+        Ok(priced) if priced.from_asset == rec.from_asset && tier.rate_ppm >= priced.rate_ppm => {}
         _ => return Ok(fail_incorrect_details()),
     }
 
@@ -286,7 +290,7 @@ pub(crate) async fn on_htlc_accepted(p: Plugin<State>, v: Value) -> Result<Value
     };
 
     let maxdelay = cltv_expiry_relative.saturating_sub(rec.leg2_final_cltv + p.state().config.safety_blocks);
-    let to_asset_sha = match Sha256::from_str(&rec.to_asset) {
+    let to_asset_sha = match asset_sha(&rec.to_asset) {
         Ok(a) => a,
         Err(_) => {
             mark_quote_failed(&mut rpc, &payment_hash, &rec, claimed_generation).await;
@@ -297,7 +301,7 @@ pub(crate) async fn on_htlc_accepted(p: Plugin<State>, v: Value) -> Result<Value
         .call_typed(&XpayRequest {
             invstring: rec.final_bolt11.clone(),
             amount_msat: None,
-            asset: Some(to_asset_sha),
+            asset: to_asset_sha,
             dev_use_shadow: None,
             label: None,
             localinvreqid: None,
