@@ -3,7 +3,7 @@
 //! leg-1 payment if that fails.
 
 use crate::assetinvoice::decode_wrapper;
-use crate::protocol::{encode_custommsg, new_req_id, QuoteReply, QuoteRequest};
+use crate::protocol::{asset_sha, encode_custommsg, new_req_id, QuoteReply, QuoteRequest};
 use crate::rpc::{getroutes_path_to_sendpay_route, new_rpc, param};
 use crate::State;
 use anyhow::{anyhow, Error};
@@ -71,9 +71,6 @@ pub(crate) async fn payassetinvoice(p: Plugin<State>, args: Value) -> Result<Val
         .to_string();
     let wrapper = decode_wrapper(encoded)?;
 
-    let asset_sha = Sha256::from_str(&wrapper.asset)
-        .map_err(|e| anyhow!("invalid asset id {}: {e}", wrapper.asset))?;
-
     let mut rpc = new_rpc(&p).await?;
 
     // Try the direct, same-asset path first — a payer may already hold
@@ -82,7 +79,7 @@ pub(crate) async fn payassetinvoice(p: Plugin<State>, args: Value) -> Result<Val
     let direct_err = match rpc
         .call_typed(&XpayRequest {
             invstring: wrapper.bolt11.clone(),
-            asset: Some(asset_sha),
+            asset: asset_sha(&wrapper.asset)?,
             amount_msat: None,
             dev_use_shadow: None,
             label: None,
@@ -122,8 +119,6 @@ pub(crate) async fn payassetinvoice(p: Plugin<State>, args: Value) -> Result<Val
     let from_asset = quote
         .from_asset
         .ok_or_else(|| anyhow!("provider sent no from_asset"))?;
-    let from_asset_sha =
-        Sha256::from_str(&from_asset).map_err(|e| anyhow!("invalid from_asset: {e}"))?;
     let final_cltv = quote
         .min_leg1_cltv
         .ok_or_else(|| anyhow!("provider sent no min_leg1_cltv"))?;
@@ -135,7 +130,7 @@ pub(crate) async fn payassetinvoice(p: Plugin<State>, args: Value) -> Result<Val
             source: my_id,
             destination: provider,
             amount_msat: Amount::from_msat(tier.from_amount_msat),
-            asset: Some(from_asset_sha),
+            asset: asset_sha(&from_asset)?,
             final_cltv,
             layers: vec!["auto.localchans".into(), "auto.sourcefree".into()],
             maxfee_msat: Amount::from_msat(maxfee_msat),
