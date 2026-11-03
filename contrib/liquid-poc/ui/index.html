@@ -174,7 +174,7 @@ pre.log { margin: 12px 0 0; padding: 12px 16px; background: var(--bg); border-to
     <section class="panel" aria-labelledby="h-chan">
       <header><h2 id="h-chan">Channels</h2><button class="link" id="toggleClosed" type="button"></button></header>
       <div class="tablewrap"><table>
-        <thead><tr><th>Channel</th><th>Asset</th><th>State</th><th>Balance (left | right)</th><th></th></tr></thead>
+        <thead><tr><th>Channel</th><th>Asset</th><th>State</th><th>Total</th><th>Balance (left | right)</th><th></th></tr></thead>
         <tbody id="channels"></tbody>
       </table></div>
     </section>
@@ -349,7 +349,9 @@ function renderMap() {
     x1 += ox; x2 += ox; y1 += oy; y2 += oy;
     const dash = c.state === 'open' ? '' : ' stroke-dasharray="6 4" opacity=".7"';
     svg += `<line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" stroke="${color(c.asset)}" stroke-width="3"${dash}/>`;
-    svg += `<text class="cap" x="${(x1 + x2) / 2}" y="${(y1 + y2) / 2 + 4}" text-anchor="middle">${n(c.a_units + c.b_units)}</text>`;
+    // Each side's own balance, near its end of the line (not the combined total).
+    svg += `<text class="cap" x="${x1 + (x2 - x1) * .3}" y="${y1 + (y2 - y1) * .3 + 4}" text-anchor="middle">${n(c.a_units)}</text>`;
+    svg += `<text class="cap" x="${x1 + (x2 - x1) * .7}" y="${y1 + (y2 - y1) * .7 + 4}" text-anchor="middle">${n(c.b_units)}</text>`;
   }));
   S.nodes.forEach(nd => {
     const [x, y] = pos[nd.name];
@@ -387,7 +389,7 @@ function renderChannels() {
   const tb = $('#toggleClosed');
   tb.hidden = !closed; tb.textContent = showClosed ? 'Hide closed' : `Show closed (${closed})`;
   if (!rows.length) {
-    put('#channels', `<tr><td colspan="5" class="empty">No channels yet. Open one from the panel on the right.</td></tr>`);
+    put('#channels', `<tr><td colspan="6" class="empty">No channels yet. Open one from the panel on the right.</td></tr>`);
     return;
   }
   put('#channels', rows.map(c => {
@@ -396,6 +398,7 @@ function renderChannels() {
       <td><span class="pair">${esc(c.a)}<span>⇄</span>${esc(c.b)}</span>${c.scid ? `<div class="mono" style="color:var(--dim)">${esc(c.scid)}</div>` : ''}</td>
       <td>${chip(c.asset)}</td>
       <td><span class="pill ${c.state}">${STATES[c.state] || esc(c.state)}</span></td>
+      <td class="num">${n(total)}</td>
       <td><div class="split" style="--c:${color(c.asset)}"><div class="barline"><i style="width:${pct}%"></i></div>
         <div class="nums num"><span>${n(c.a_units)}</span><span>${n(c.b_units)}</span></div></div></td>
       <td>${c.state === 'open' ? `<button class="btn ghost" type="button" data-close="${esc(c.id)}">Close…</button>` : ''}</td>
