@@ -11,10 +11,10 @@
 //! hook (`htlc.rs`: validate, atomically claim the quote, run leg 2 via
 //! `xpay`, resolve leg 1 with the resulting preimage or fail it).
 //!
-//! The live-price recheck is pluggable in principle but only the `fixed`
-//! source (each pair's own configured `rate_ppm`, which never moves) is
-//! implemented here — see CROSS_ASSET_SWAP.md's "Limits" section: tiers
-//! only add real protection once a genuine live price feed is wired in.
+//! Pricing (which pairs are quotable, at what rate, with what tier
+//! margins) isn't this plugin's job at all -- that's
+//! `plugins/pricetiers-plugin`'s, a separate, swappable policy plugin
+//! this one calls via a plain local RPC call (`protocol::fetch_price_tiers`).
 
 mod assetinvoice;
 mod config;
@@ -47,7 +47,6 @@ async fn main() -> Result<(), Error> {
 
     let Some(plugin) = Builder::new(tokio::io::stdin(), tokio::io::stdout())
         .dynamic()
-        .option(config::OPT_PAIR)
         .option(config::OPT_PROVIDER)
         .option(config::OPT_MSGTYPE_REQUEST)
         .option(config::OPT_MSGTYPE_REPLY)
@@ -74,13 +73,6 @@ async fn main() -> Result<(), Error> {
         return Ok(());
     };
 
-    let pairs: Vec<config::SwapPair> = plugin
-        .option_str("assetswap-pair")?
-        .and_then(|v| v.as_str_arr().cloned())
-        .unwrap_or_default()
-        .iter()
-        .map(|s| config::parse_pair(s))
-        .collect::<Result<_, _>>()?;
     let providers: Vec<PublicKey> = plugin
         .option_str("assetswap-provider")?
         .and_then(|v| v.as_str_arr().cloned())
@@ -97,7 +89,6 @@ async fn main() -> Result<(), Error> {
     }
 
     let config = config::Config {
-        pairs,
         providers,
         msgtype_request,
         msgtype_reply,

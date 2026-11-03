@@ -2,6 +2,7 @@
 //! RPC into one self-contained string that also carries the asset it
 //! requires, since that asset isn't part of the signed bolt11 bytes.
 
+use crate::protocol::is_lbtc;
 use crate::rpc::{new_rpc, param};
 use crate::State;
 use anyhow::{anyhow, Error};
@@ -47,7 +48,7 @@ pub(crate) async fn assetinvoice(p: Plugin<State>, args: Value) -> Result<Value,
         .to_owned();
     let asset = param(&args, 3, "asset")
         .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("Missing asset (the id of the asset you want to be paid in)"))?
+        .ok_or_else(|| anyhow!("Missing asset ('lbtc', or the id of the asset you want to be paid in)"))?
         .to_owned();
 
     let mut rpc = new_rpc(&p).await?;
@@ -56,7 +57,7 @@ pub(crate) async fn assetinvoice(p: Plugin<State>, args: Value) -> Result<Value,
             amount_msat: AmountOrAny::Amount(Amount::from_msat(amount_msat)),
             description,
             label,
-            asset: Some(asset.clone()),
+            asset: if is_lbtc(&asset) { None } else { Some(asset.clone()) },
             cltv: None,
             deschashonly: None,
             expiry: None,
