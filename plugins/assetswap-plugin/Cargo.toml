@@ -1,0 +1,26 @@
+[package]
+name = "cln-assetswap"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Pay an invoice that requires a different Liquid asset than you hold, by routing through a swap-provider node (two hash-linked payments, no core changes)"
+homepage = "https://github.com/ElementsProject/lightning/tree/master/plugins"
+repository = "https://github.com/ElementsProject/lightning"
+rust-version.workspace = true
+
+[[bin]]
+name = "assetswap-plugin"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+hex = "0.4"
+log = { version = "0.4", features = ["std"] }
+log-panics = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync"] }
+
+cln-plugin = { workspace = true }
+cln-rpc = { workspace = true }
