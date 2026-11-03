@@ -131,9 +131,10 @@ form { display: flex; flex-direction: column; gap: 14px; padding: 16px; }
 form[hidden] { display: none; }
 .row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 label { display: flex; flex-direction: column; gap: 4px; color: var(--muted); font-size: 12px; min-width: 0; }
-input[type=text], input[type=number], select { background: var(--bg); border: 1px solid var(--line); padding: 9px 10px; color: var(--fg); width: 100%; min-width: 0; border-radius: 0; font-size: 14px; }
-input:hover, select:hover { border-color: var(--dim); }
-input:focus, select:focus { border-color: var(--accent-hi); outline: 0; }
+input[type=text], input[type=number], select, textarea { background: var(--bg); border: 1px solid var(--line); padding: 9px 10px; color: var(--fg); width: 100%; min-width: 0; border-radius: 0; font-size: 14px; }
+textarea { font-family: var(--mono); font-size: 12px; resize: vertical; }
+input:hover, select:hover, textarea:hover { border-color: var(--dim); }
+input:focus, select:focus, textarea:focus { border-color: var(--accent-hi); outline: 0; }
 label.check { flex-direction: row; align-items: center; gap: 8px; font-size: 13px; }
 input[type=checkbox] { accent-color: var(--accent); width: 16px; height: 16px; margin: 0; }
 .hint { color: var(--dim); font-size: 12px; margin: 0; }
@@ -150,6 +151,9 @@ pre.log { margin: 12px 0 0; padding: 12px 16px; background: var(--bg); border-to
 @media (prefers-reduced-motion: reduce) { .pulse { animation: none; } }
 #toast { position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%); background: var(--raised); border: 1px solid var(--line); padding: 10px 16px; max-width: 90vw; }
 #toast.bad { border-color: var(--bad); }
+.result { display: flex; gap: 8px; padding: 12px 16px 0; }
+.result input { flex: 1; min-width: 0; background: var(--bg); border: 1px solid var(--line); color: var(--fg); padding: 8px 10px; font-family: var(--mono); font-size: 12px; }
+.result .btn.ghost { flex: none; }
 </style>
 </head>
 <body>
@@ -187,6 +191,8 @@ pre.log { margin: 12px 0 0; padding: 12px 16px; background: var(--bg); border-to
       <div class="tabs" role="tablist" id="tabs">
         <button role="tab" aria-selected="true" data-tab="open" id="t-open">Open</button>
         <button role="tab" aria-selected="false" data-tab="pay" id="t-pay">Pay</button>
+        <button role="tab" aria-selected="false" data-tab="invoice" id="t-invoice">Invoice</button>
+        <button role="tab" aria-selected="false" data-tab="payinvoice" id="t-payinvoice">Pay invoice</button>
         <button role="tab" aria-selected="false" data-tab="close" id="t-close">Close</button>
         <button role="tab" aria-selected="false" data-tab="send" id="t-send">Send</button>
         <button role="tab" aria-selected="false" data-tab="fund" id="t-fund">Fund</button>
@@ -215,6 +221,31 @@ pre.log { margin: 12px 0 0; padding: 12px 16px; background: var(--bg); border-to
         <label>Amount<input id="pay-units" name="units" type="number" min="1" step="1" value="1000" required></label>
         <p class="hint">Finds a path over open channels in this asset. Several hops are fine.</p>
         <button class="btn" type="submit">Send payment</button>
+      </form>
+
+      <form id="f-invoice" data-action="invoice" hidden>
+        <label>Node (asks to be paid)<select id="invoice-node" name="node"></select></label>
+        <label>Asset<select id="invoice-asset" name="asset"></select></label>
+        <p class="hint mono" id="invoice-rate"></p>
+        <label>Amount<input id="invoice-units" name="units" type="number" min="1" step="1" value="1000" required></label>
+        <p class="hint">Creates an invoice string carrying its own asset. Copy it and hand it to
+          whoever is paying -- on Pay invoice they don't pick an asset or a counterparty, just
+          paste this and pay.</p>
+        <button class="btn" type="submit">Request invoice</button>
+      </form>
+
+      <form id="f-payinvoice" data-action="payinvoice" hidden>
+        <label>From<select id="payinvoice-node" name="node"></select></label>
+        <label>Invoice string<textarea id="payinvoice-invoice" name="invoice" rows="3" spellcheck="false" autocomplete="off" placeholder="paste the invoice from Request invoice" required></textarea></label>
+        <p class="hint mono" id="payinvoice-rate"></p>
+        <label>Tier<select id="payinvoice-tier" name="tier">
+          <option value="low">Low</option>
+          <option value="medium" selected>Medium</option>
+          <option value="high">High</option>
+        </select></label>
+        <p class="hint">Pays an invoice from Request invoice. If this node doesn't hold the asset
+          it requires, it swaps through bob (the configured provider) at this tier.</p>
+        <button class="btn" type="submit">Pay invoice</button>
       </form>
 
       <form id="f-close" data-action="close" hidden>
@@ -289,6 +320,69 @@ function put(sel, html) {
   if (el.dataset.h !== html) { el.innerHTML = html; el.dataset.h = html; }
 }
 const chip = a => `<span class="chip" style="--c:${color(a)}">${esc(label(a))}</span>`;
+
+/* Swap/invoice forms carry the asset as either the literal string "lbtc"
+   or a real asset id (assetswap-plugin's own convention -- see
+   protocol.rs's is_lbtc/asset_sha), not null-for-L-BTC like the rest of
+   this page; translate before handing it to label()/color(). */
+const swapLabel = a => label(a === 'lbtc' ? null : a);
+
+/* Mirrors plugins/pricetiers-plugin/src/main.rs's make_tiers()/MARGINS
+   exactly (same margins, same integer truncation at each step) so the
+   amount shown here is the amount the provider will actually quote, not
+   an approximation. */
+const TIER_PERMILLE = {low: 2010, medium: 2030, high: 2060};
+
+function findSwapPair(toAsset) {
+  if (!toAsset || !S.default_asset) return null;
+  const fromAsset = toAsset === 'lbtc' ? S.default_asset : 'lbtc';
+  return (S.swap_pairs || []).find(p => p.frm === fromAsset && p.to === toAsset) || null;
+}
+
+/* The exact from_amount_msat a payer would send for toAmountMsat of
+   toAsset at the given tier, or null if no provider is configured for
+   this direction (toAmountMsat may be fractional/garbage mid-typing --
+   callers check isFinite). */
+function swapFromAmount(toAsset, toAmountMsat, tier) {
+  const pair = findSwapPair(toAsset);
+  if (!pair || !Number.isFinite(toAmountMsat) || toAmountMsat <= 0) return null;
+  const tierRatePpm = Math.floor(pair.rate_ppm * TIER_PERMILLE[tier] / 1000);
+  const fromAmountMsat = Math.floor(toAmountMsat * tierRatePpm / 1e6) + pair.fee_base_msat;
+  return {pair, fromAmountMsat};
+}
+
+/* One tier, as a line for the Swap/Pay-invoice forms (amount and tier both
+   already chosen). */
+function swapQuoteLine(toAsset, toAmountMsat, tier) {
+  if (!toAsset) return '';
+  const pair = findSwapPair(toAsset);
+  if (!pair) return `No swap provider configured for ${swapLabel(toAsset === 'lbtc' ? S.default_asset : 'lbtc')} → ${swapLabel(toAsset)} yet.`;
+  const got = swapFromAmount(toAsset, toAmountMsat, tier);
+  if (!got) return `${pair.provider} quotes this pair -- enter an amount to see the exact cost.`;
+  return `To deliver ${n(toAmountMsat)} msat of ${swapLabel(toAsset)}, pay ${n(got.fromAmountMsat)} msat of `
+    + `${swapLabel(pair.frm)} (${pair.provider}, ${tier} tier).`;
+}
+
+/* All three tiers, for the Invoice form, where the payer -- not the
+   invoice's creator -- picks the tier later. */
+function swapQuoteAllTiers(toAsset, toAmountMsat) {
+  if (!toAsset) return '';
+  const pair = findSwapPair(toAsset);
+  if (!pair) return `No swap provider configured for ${swapLabel(toAsset === 'lbtc' ? S.default_asset : 'lbtc')} → ${swapLabel(toAsset)} yet.`;
+  if (!Number.isFinite(toAmountMsat) || toAmountMsat <= 0) return `${pair.provider} quotes this pair -- enter an amount to see the exact cost.`;
+  const costs = ['low', 'medium', 'high'].map(t => `${t} ${n(swapFromAmount(toAsset, toAmountMsat, t).fromAmountMsat)}`);
+  return `A payer without ${swapLabel(toAsset)} would pay this many msat of ${swapLabel(pair.frm)} via ${pair.provider}: ${costs.join(', ')}.`;
+}
+
+/* assetinvoice.rs's wrapper: base64url(JSON), no padding -- decodable
+   entirely client-side, no round trip needed to show what it requires. */
+function decodeAssetInvoice(s) {
+  try {
+    const b64 = s.trim().replace(/-/g, '+').replace(/_/g, '/');
+    return JSON.parse(atob(b64 + '='.repeat((4 - b64.length % 4) % 4)));
+  } catch (e) { return null; }
+}
+
 let toastTimer;
 function toast(msg, bad) {
   const t = $('#toast'); t.textContent = msg; t.className = bad ? 'bad' : ''; t.hidden = false;
@@ -425,19 +519,35 @@ function renderSelects() {
   const nodes = S.nodes.map(x => [x.name, x.name]);
   const assets = [['lbtc', 'L-BTC (sat)']].concat(Object.keys(S.assets).map(a => [a, label(a)]));
   const assetsFirst = assets.slice(1).concat(assets.slice(0, 1));  // the PoC asset is the point: list it first
-  ['#open-frm', '#pay-frm', '#send-node', '#fund-node'].forEach(s => fill(s, nodes));
+  ['#open-frm', '#pay-frm', '#invoice-node', '#payinvoice-node', '#send-node', '#fund-node'].forEach(s => fill(s, nodes));
   ['#open-to', '#pay-to'].forEach(s => {
     fill(s, nodes);
     const from = $(s.replace('to', 'frm')).value;
     if ($(s).value === from) $(s).value = (nodes.find(x => x[0] !== from) || nodes[0])[0];
   });
   ['#open-asset', '#pay-asset', '#send-asset'].forEach(s => fill(s, assetsFirst));
+  // The self-contained invoice is only ever between L-BTC and the one PoC
+  // asset -- not a general asset-to-asset picker, so it gets its own,
+  // narrower option list.
+  const swapAssets = S.default_asset ? [[S.default_asset, label(S.default_asset)], ['lbtc', 'L-BTC (sat)']]
+                                      : [['lbtc', 'L-BTC (sat)']];
+  fill('#invoice-asset', swapAssets);
+  $('#invoice-rate').textContent = swapQuoteAllTiers($('#invoice-asset').value,
+    Number($('#invoice-units').value) * 1000);
+  renderPayInvoiceRate();
   fill('#close-chan', S.channels.filter(c => c.state === 'open').map(c => [c.id, `${c.a} ⇄ ${c.b} · ${label(c.asset)} · ${n(c.a_units)} | ${n(c.b_units)}`]));
   $('#open-hint').textContent = $('#open-asset').value === 'lbtc'
     ? 'L-BTC channel. Usable after 6 blocks.'
     : 'Asset channels also lock 6,000 sat L-BTC for fees. Usable after 6 blocks.';
   const busy = S.job && S.job.status === 'running';
   document.querySelectorAll('form .btn').forEach(b => b.disabled = busy);
+}
+
+function renderPayInvoiceRate() {
+  const el = $('#payinvoice-rate'), dec = decodeAssetInvoice($('#payinvoice-invoice').value);
+  el.textContent = dec
+    ? `Requires ${n(dec.amount_msat)} msat of ${swapLabel(dec.asset)}. ${swapQuoteLine(dec.asset, dec.amount_msat, $('#payinvoice-tier').value)}`
+    : '';
 }
 
 const fmtTime = s => s >= 60 ? `${Math.floor(s / 60)} min ${Math.round(s % 60)} s` : `${Math.round(s)} s`;
@@ -447,8 +557,13 @@ function renderJob() {
   const status = j.status === 'error' ? 'failed' : j.status;
   const secs = (j.ended || Date.now() / 1000) - j.started;
   $('#job-state').innerHTML = `<span class="pill ${status} ${j.status === 'running' ? 'pulse' : ''}">${status === 'running' ? 'Running' : status === 'done' ? 'Done' : 'Failed'}</span>`;
+  const result = j.status === 'done' && typeof j.result === 'string' && j.result
+    ? `<div class="result"><input class="mono" readonly value="${esc(j.result)}">
+         <button class="btn ghost" type="button" data-copy="${esc(j.result)}">Copy</button></div>`
+    : '';
   el.innerHTML = `<div class="title"><p>${esc(j.title)}</p></div>
     <div class="meta">${j.status === 'running' ? 'Running for ' : 'Took '}${fmtTime(Math.max(0, secs))}${j.status === 'running' ? '. Blocks on the testnet take about a minute.' : ''}</div>
+    ${result}
     <pre class="log">${esc(j.log.join('\n') || 'Starting…')}</pre>`;
 }
 
@@ -484,12 +599,16 @@ $('#map').addEventListener('pointermove', e => {
 ['pointerup', 'pointercancel', 'lostpointercapture'].forEach(ev => $('#map').addEventListener(ev, () => drag = null));
 $('#toggleClosed').addEventListener('click', () => { showClosed = !showClosed; renderChannels(); });
 $('#close-force').addEventListener('change', e => $('#close-warn').hidden = !e.target.checked);
-document.addEventListener('change', e => { if (S && e.target.matches('#open-asset, #open-frm, #pay-frm')) renderSelects(); });
+document.addEventListener('change', e => { if (S && e.target.matches('#open-asset, #open-frm, #pay-frm, #invoice-asset')) renderSelects(); });
+document.addEventListener('input', e => { if (S && e.target.matches('#invoice-units')) renderSelects(); });
+$('#payinvoice-invoice').addEventListener('input', () => { if (S) renderPayInvoiceRate(); });
+$('#payinvoice-tier').addEventListener('change', () => { if (S) renderPayInvoiceRate(); });
 document.addEventListener('click', e => {
   const c = e.target.closest('[data-close]');
   if (c) { showTab('close'); $('#close-chan').value = c.dataset.close; $('#close-chan').focus(); }
+  if (e.target.matches('.result input')) e.target.select();
   const cp = e.target.closest('[data-copy]');
-  if (cp) navigator.clipboard.writeText(cp.dataset.copy).then(() => toast('Node id copied.'), () => toast(cp.dataset.copy));
+  if (cp) navigator.clipboard.writeText(cp.dataset.copy).then(() => toast('Copied.'), () => toast(cp.dataset.copy));
 });
 
 document.querySelectorAll('form[data-action]').forEach(f => f.addEventListener('submit', e => {
