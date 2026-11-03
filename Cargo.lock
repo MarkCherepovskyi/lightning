@@ -436,6 +436,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "cln-assetswap"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "cln-plugin",
+ "cln-rpc",
+ "hex",
+ "log",
+ "log-panics",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "cln-bip353"
 version = "0.1.0"
 dependencies = [

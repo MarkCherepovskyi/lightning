@@ -17,6 +17,20 @@
 `--lbtc` switches route/pay/close/invoice from the asset to L-BTC; `--asset ID`
 picks another asset than the one `setup` issued.  Run `./lnpoc.py -h` for all
 commands.  Only needs Python 3 and `docker compose`.
+
+Cross-asset swaps (contrib/liquid-poc/CROSS_ASSET_SWAP.md): pay an invoice in
+an asset you don't hold, via a swap-provider node.  `assetswap-plugin` is
+built into the `cln` image and loaded on every node from startup (`up`/
+`start` already cover it; see Dockerfile's `assetswap-builder` stage).
+
+    ./lnpoc.py swap-provider bob <assetA> <assetB> 1000000  # bob quotes A->B at 1:1 (+ fee)
+    ./lnpoc.py swap-payer alice bob                         # alice uses bob as a provider
+    ./lnpoc.py swap alice carol 1000000000 <assetB>         # carol invoices assetB, alice pays it
+    ./lnpoc.py assetinvoice carol 1000000000 <assetB>       # just the invoice half of `swap`
+    ./lnpoc.py payassetinvoice alice <assetinvoice-string>  # just the paying half of `swap`
+    ./lnpoc.py swap-demo                                    # the whole thing, start to finish
+
+`lbtc` is accepted in place of an asset id anywhere swap commands take one.
 """
 import argparse
 import json
@@ -132,8 +146,8 @@ class Fail(Exception):
 
 
 # ---------------------------------------------------------------- plumbing
-def run(cmd, check=True):
-    p = subprocess.run(cmd, capture_output=True, text=True)
+def run(cmd, check=True, input=None):
+    p = subprocess.run(cmd, capture_output=True, text=True, input=input)
     if check and p.returncode != 0:
         raise Fail(f"{' '.join(cmd[len(COMPOSE):])}\n{p.stderr.strip() or p.stdout.strip()}")
     return p.stdout.strip()
@@ -319,6 +333,30 @@ def follow_asset(asset):
         run(COMPOSE + ['restart'] + changed)
         for node in changed:
             wait_for(node, lambda: ln(node, 'getinfo'))
+
+
+def add_config_lines(node, lines):
+    """Append any of `lines` not already verbatim in node's /data/config,
+    then restart it to pick them up.  Same append-if-missing approach as
+    follow_asset(), generalized to more than one line at a time (used for
+    assetswap-plugin's `assetswap-pair=`/`assetswap-provider=` config,
+    which must survive a restart -- see CROSS_ASSET_SWAP.md's "Restart
+    idempotency" section for why; the plugin itself is always loaded from
+    the image, so there's no `plugin=` line to add here)."""
+    conf = run(COMPOSE + ['exec', '-T', node, 'sh', '-c', 'cat /data/config 2>/dev/null; true'])
+    have = set(conf.splitlines())
+    missing = [l for l in lines if l not in have]
+    if not missing:
+        return
+    run(COMPOSE + ['exec', '-T', node, 'sh', '-c', 'cat >> /data/config'],
+       input='\n'.join(missing) + '\n')
+    print(f"restarting {node} to apply: {', '.join(missing)}")
+    run(COMPOSE + ['restart', node])
+    wait_for(node, lambda: ln(node, 'getinfo'))
+
+
+def resolve_asset(a):
+    return lbtc_asset() if a == 'lbtc' else a
 
 
 # ---------------------------------------------------------------- commands
@@ -604,6 +642,113 @@ def cmd_xpay(args):
     res = ln(args.frm, 'xpay', invstring=inv['bolt11'], asset=asset)
     print(f"xpay {args.frm} -> {args.to}: {res['amount_msat']} msat in {asset_label(asset)}, "
           f"sent {res['amount_sent_msat']} (fees included), {res['successful_parts']} part(s)")
+
+
+# ---------------------------------------------------------- swap commands
+# CROSS_ASSET_SWAP.md: pay an invoice in an asset you don't hold, by
+# routing through a swap-provider node that holds channels in both.
+# assetswap-plugin is built into the `cln` image (Dockerfile's
+# assetswap-builder stage) and loaded on every node from startup, so there's
+# no separate build/load step here -- only its per-pair/per-provider config.
+def cmd_swap_provider(args):
+    """Configure node as a swap provider for from_asset -> to_asset, at
+    rate_ppm (msat of from_asset per 1_000_000 msat worth of to_asset) plus
+    a flat fee_base_msat.  Persistent (survives a restart): see
+    add_config_lines()'s docstring for why that matters here."""
+    from_asset, to_asset = resolve_asset(args.from_asset), resolve_asset(args.to_asset)
+    add_config_lines(args.node, [
+        f'assetswap-pair={from_asset}:{to_asset}:{args.rate_ppm}:{args.fee_base_msat}',
+    ])
+    print(f"{args.node}: swap-provider {asset_label(from_asset)} -> {asset_label(to_asset)} "
+          f"at {args.rate_ppm} ppm (+{args.fee_base_msat} msat base fee)")
+
+
+def cmd_swap_payer(args):
+    """Configure node to use provider as its swap provider.  Persistent,
+    same as swap-provider (not strictly required on the payer side, but
+    harmless and keeps the two commands symmetric)."""
+    provider_id = node_id(args.provider)
+    add_config_lines(args.node, [f'assetswap-provider={provider_id}'])
+    print(f"{args.node}: will use {args.provider} ({provider_id}) as a swap provider")
+
+
+def cmd_assetinvoice(args):
+    """Create an invoice on node requiring asset, wrapped with the asset
+    into one self-contained string (assetinvoice RPC)."""
+    asset = resolve_asset(args.asset)
+    label = args.label or f"lnpoc-swap-{int(time.time() * 1000)}"
+    res = ln(args.node, 'assetinvoice', amount_msat=args.amount_msat, label=label,
+             description=f"lnpoc swap {asset_label(asset)}", asset=asset)
+    print(res['assetinvoice'])
+    return res
+
+
+def cmd_payassetinvoice(args):
+    """Pay an assetinvoice string from node, swapping via a configured
+    provider if node doesn't hold the required asset directly."""
+    res = ln(args.node, 'payassetinvoice', assetinvoice=args.assetinvoice, tier=args.tier)
+    print(f"paid {res['amount_msat']} msat, preimage {res['payment_preimage']}")
+    return res
+
+
+def cmd_swap(args):
+    """Invoice on `to` requiring asset, paid by `frm` via payassetinvoice --
+    the swap half of pay/xpay's pattern: creates the invoice and pays it in
+    one call, swapping through a configured provider if needed."""
+    asset = resolve_asset(args.asset)
+    label = args.label or f"lnpoc-swap-{int(time.time() * 1000)}"
+    inv = ln(args.to, 'assetinvoice', amount_msat=args.amount_msat, label=label,
+             description=f"lnpoc swap {asset_label(asset)}", asset=asset)
+    print(f"invoiced {args.amount_msat} msat of {asset_label(asset)} on {args.to}, paying from {args.frm} ...")
+    res = ln(args.frm, 'payassetinvoice', assetinvoice=inv['assetinvoice'], tier=args.tier)
+    print(f"swapped: {args.frm} -> {args.to}, {res['amount_msat']} msat sent, "
+          f"preimage {res['payment_preimage']}")
+
+
+def cmd_swap_demo(args):
+    """Whole story in one go: issue a second asset, open alice-bob in the
+    first asset and bob-carol in the second, make bob a swap provider
+    between them, and have alice pay a carol invoice in the second asset
+    while only holding the first."""
+    if not load_state().get('asset'):
+        cmd_setup(argparse.Namespace(asset_amount=1000, fund_sat=10_000_000))
+
+    state = load_state()
+    asset_a = state['asset']
+    if not state.get('asset2'):
+        issued = ecli('issueasset', args.asset_amount, 0, False)
+        state['asset2'] = issued['asset']
+        save_state(state)
+        ecli('generatetoaddress', 1, ecli('getnewaddress'))
+        print(f"issued second asset {state['asset2']}")
+    asset_b = state['asset2']
+    follow_asset(asset_b)
+
+    try:
+        channel_between('alice', 'bob', asset_a)
+    except Fail:
+        cmd_open_asset(argparse.Namespace(frm='alice', to='bob', units=args.units,
+                                          fee_reserve=100_000, change=100_000,
+                                          asset=asset_a, lbtc=False, announce=False))
+    try:
+        channel_between('bob', 'carol', asset_b)
+    except Fail:
+        cmd_open_asset(argparse.Namespace(frm='bob', to='carol', units=args.units,
+                                          fee_reserve=100_000, change=100_000,
+                                          asset=asset_b, lbtc=False, announce=False))
+
+    cmd_swap_provider(argparse.Namespace(node='bob', from_asset=asset_a, to_asset=asset_b,
+                                         rate_ppm=args.rate_ppm, fee_base_msat=500))
+    cmd_swap_payer(argparse.Namespace(node='alice', provider='bob'))
+
+    # Any of the restarts above (follow_asset, add_config_lines) drop peer
+    # connections; the quote protocol needs alice and bob directly connected.
+    connect('alice', 'bob')
+
+    print(f"\nswapping {args.pay_units} units of asset({asset_a[:8]}) -> asset({asset_b[:8]}) ...")
+    cmd_swap(argparse.Namespace(frm='alice', to='carol', amount_msat=args.pay_units * 1000,
+                                asset=asset_b, tier='medium', label=None))
+    cmd_balances(args)
 
 
 def cmd_close(args):
@@ -897,6 +1042,36 @@ def main():
     sp.add_argument('frm', choices=NODES)
     sp.add_argument('to', choices=NODES)
     sp.add_argument('amount_msat', type=int)
+    sp = add('swap-provider', cmd_swap_provider,
+             'configure node as a swap provider for from_asset -> to_asset')
+    sp.add_argument('node', choices=NODES)
+    sp.add_argument('from_asset', help="asset id, or 'lbtc'")
+    sp.add_argument('to_asset', help="asset id, or 'lbtc'")
+    sp.add_argument('rate_ppm', type=int,
+                    help='msat of from_asset required per 1_000_000 msat worth of to_asset')
+    sp.add_argument('--fee-base-msat', type=int, default=500)
+    sp = add('swap-payer', cmd_swap_payer, 'configure node to use provider as its swap provider')
+    sp.add_argument('node', choices=NODES)
+    sp.add_argument('provider', choices=NODES)
+    sp = add('assetinvoice', cmd_assetinvoice,
+             'create an invoice requiring asset, wrapped for payassetinvoice/swap')
+    sp.add_argument('node', choices=NODES)
+    sp.add_argument('amount_msat', type=int)
+    sp.add_argument('asset', help="asset id, or 'lbtc'")
+    sp.add_argument('--label')
+    sp = add('payassetinvoice', cmd_payassetinvoice,
+             'pay an assetinvoice string, swapping via a configured provider if needed')
+    sp.add_argument('node', choices=NODES)
+    sp.add_argument('assetinvoice')
+    sp.add_argument('--tier', choices=['low', 'medium', 'high'], default='medium')
+    sp = add('swap', cmd_swap,
+             'invoice on `to` requiring asset, pay it from `frm` (swapping via its provider if needed)')
+    sp.add_argument('frm', choices=NODES)
+    sp.add_argument('to', choices=NODES)
+    sp.add_argument('amount_msat', type=int)
+    sp.add_argument('asset', help="asset id, or 'lbtc'")
+    sp.add_argument('--tier', choices=['low', 'medium', 'high'], default='medium')
+    sp.add_argument('--label')
     sp = add('testnet-setup', cmd_testnet_setup,
              'Liquid testnet: wallet, faucet coins, our own asset, fund nodes, connect')
     sp.add_argument('--asset-amount', type=int, default=100, help='asset to issue (whole units)')
@@ -911,6 +1086,12 @@ def main():
     sp.add_argument('--pay-units', type=int, default=100_000, help='asset base units to pay')
     add('demo', cmd_demo, 'setup, open both kinds of channels, pay in both, close')
     add('demo-gossip', cmd_demo_gossip, 'like demo, with announced channels and xpay')
+    sp = add('swap-demo', cmd_swap_demo,
+             'cross-asset swap end to end: issue a second asset, set up a provider, swap, show balances')
+    sp.add_argument('--asset-amount', type=int, default=1000, help='second asset to issue (whole units)')
+    sp.add_argument('--units', type=int, default=5_000_000, help='asset base units per channel')
+    sp.add_argument('--rate-ppm', type=int, default=1_000_000, help="bob's quoted rate (1:1 default)")
+    sp.add_argument('--pay-units', type=int, default=1_000_000, help='asset base units to swap')
 
     args = p.parse_args()
     try:
