@@ -1,16 +1,21 @@
-//! The swap-provider's `htlc_accepted` hook: validate a candidate leg-1
-//! HTLC against its quote, atomically claim it, run leg 2, and resolve or
-//! fail leg 1 — plus the restart-replay idempotency path for an HTLC we
-//! already committed to before a prior process exited.
+//! The swap-provider's `htlc_accepted` hook: decode what a candidate leg-1
+//! HTLC's `payment_metadata` is asking for, price it live, atomically
+//! claim it, run leg 2, and resolve or fail leg 1 — plus the
+//! restart-replay idempotency path for an HTLC we already committed to
+//! before a prior process exited. There's no prior quote to look up: the
+//! provider decides live, on arrival, whether this HTLC is profitable at
+//! its current price (see pay.rs's doc comment for why).
 
-use crate::protocol::{asset_sha, fetch_price_tiers, is_lbtc, now_unix, quote_key, QuoteRecord};
+use crate::protocol::{
+    asset_sha, decode_swap_metadata, fetch_price_tiers, is_lbtc, quote_key, QuoteRecord,
+};
 use crate::rpc::new_rpc;
 use crate::State;
 use anyhow::{anyhow, Error};
 use cln_plugin::Plugin;
 use cln_rpc::model::requests::{
-    DatastoreMode, DatastoreRequest, ListdatastoreRequest, ListpeerchannelsRequest,
-    ListsendpaysRequest, WaitsendpayRequest, XpayRequest,
+    DatastoreMode, DatastoreRequest, DecodeRequest, ListdatastoreRequest,
+    ListpeerchannelsRequest, ListsendpaysRequest, WaitsendpayRequest, XpayRequest,
 };
 use cln_rpc::model::responses::ListsendpaysPaymentsStatus;
 use cln_rpc::primitives::{Secret, ShortChannelId};
@@ -67,10 +72,12 @@ async fn channel_asset(rpc: &mut ClnRpc, scid: &str) -> Result<Option<String>, E
 }
 
 /// Atomic claim via datastore's generation CAS: only the first HTLC for a
-/// given quote wins, so a replayed/duplicated HTLC can't double-spend it.
-/// Returns the record's new generation on success, so a caller can chain a
-/// further state transition (e.g. "claimed" -> "failed") without a second
-/// round-trip to learn it.
+/// given payment_hash wins, so a replayed/duplicated HTLC can't
+/// double-commit (and a second attempt after an earlier "failed" verdict
+/// is allowed to retry, rather than being permanently wedged). Returns the
+/// record's new generation on success, so a caller can chain a further
+/// state transition ("claimed" -> "failed") without a second round-trip to
+/// learn it.
 async fn claim_quote_atomically(
     rpc: &mut ClnRpc,
     payment_hash: &str,
@@ -81,7 +88,9 @@ async fn claim_quote_atomically(
             key: Some(quote_key(payment_hash)),
         })
         .await?;
-    let generation = cur.datastore.into_iter().next().and_then(|d| d.generation);
+    let existing = cur.datastore.into_iter().next();
+    let mode = if existing.is_some() { DatastoreMode::MUST_REPLACE } else { DatastoreMode::MUST_CREATE };
+    let generation = existing.and_then(|d| d.generation);
     let claimed = QuoteRecord {
         state: "claimed".into(),
         ..rec.clone()
@@ -90,7 +99,7 @@ async fn claim_quote_atomically(
         .call_typed(&DatastoreRequest {
             generation,
             hex: None,
-            mode: Some(DatastoreMode::MUST_REPLACE),
+            mode: Some(mode),
             string: Some(serde_json::to_string(&claimed)?),
             key: quote_key(payment_hash),
         })
@@ -240,56 +249,91 @@ pub(crate) async fn on_htlc_accepted(p: Plugin<State>, v: Value) -> Result<Value
 
     let mut rpc = new_rpc(&p).await?;
 
-    let rec = match lookup_quote(&mut rpc, &payment_hash).await {
-        Ok(Some(r)) if r.state == "quoted" => r,
+    // Restart-replay idempotency: if we already committed to this swap
+    // before a prior process exited, don't re-decide -- re-derive the
+    // verdict from leg 2's own status (see resolve_from_leg2_status). A
+    // "failed" record means we already gave a verdict in a prior run; let
+    // a fresh attempt (same payment_hash, e.g. the payer retrying with a
+    // bigger amount) fall through and be judged again from scratch.
+    match lookup_quote(&mut rpc, &payment_hash).await {
         Ok(Some(r)) if r.state == "claimed" => {
-            // lightningd replays HTLCs with no final verdict on restart
-            // (see the htlc_accepted hook's own docs). We already
-            // committed to this swap before the restart — don't guess or
-            // re-run leg 2, re-derive the right answer from its own
-            // status instead.
             return Ok(resolve_from_leg2_status(&mut rpc, &r).await);
         }
-        Ok(_) => return Ok(json!({"result": "continue"})), // not ours: no record, or already "failed"
+        Ok(_) => {}
         Err(e) => {
             log::warn!("assetswap: datastore lookup failed for {payment_hash}: {e}");
             return Ok(json!({"result": "continue"}));
         }
+    }
+
+    // No prior negotiation: the payer packs what we need directly into
+    // leg 1's payment_metadata. No metadata (or garbage) means this isn't
+    // a swap HTLC at all -- not ours to second-guess.
+    let onion = v.get("onion").cloned().unwrap_or(Value::Null);
+    let Some(metadata_hex) = onion.get("payment_metadata").and_then(Value::as_str) else {
+        return Ok(json!({"result": "continue"}));
+    };
+    let Ok(meta) = decode_swap_metadata(metadata_hex) else {
+        return Ok(json!({"result": "continue"}));
     };
 
-    let Some(tier) = rec.tiers.iter().find(|t| t.from_amount_msat == amount_msat) else {
-        return Ok(fail_incorrect_details()); // amount doesn't match any quoted tier
+    let decoded = rpc
+        .call_typed(&DecodeRequest {
+            string: meta.final_bolt11.clone(),
+        })
+        .await?;
+    let (Some(to_amount_msat), Some(final_payment_hash), Some(leg2_final_cltv)) = (
+        decoded.amount_msat.map(|a| a.msat()),
+        decoded.payment_hash.map(|h| h.to_string()),
+        decoded.min_final_cltv_expiry,
+    ) else {
+        return Ok(fail_incorrect_details());
     };
+    // The hash-link the whole swap's atomicity rests on: leg 1 must carry
+    // the SAME payment_hash as the invoice it's meant to settle, or we
+    // could pay leg 2 and be left holding a preimage leg 1 won't accept.
+    if final_payment_hash != payment_hash {
+        return Ok(fail_incorrect_details());
+    }
+
+    // Live pricing: this is the only check that decides whether we'd lose
+    // money, since nothing was pre-approved. Ask pricetiers-plugin for
+    // today's rate and require at least its cheapest tier -- anything above
+    // that is just extra profit, there's no fixed amount to match exactly.
+    let priced = match fetch_price_tiers(&mut rpc, &meta.to_asset, to_amount_msat).await {
+        Ok(p) => p,
+        Err(_) => return Ok(fail_incorrect_details()), // not a pair we quote
+    };
+    let Some(floor_msat) = priced.tiers.iter().map(|t| t.from_amount_msat).min() else {
+        return Ok(fail_incorrect_details());
+    };
+    if amount_msat < floor_msat {
+        return Ok(fail_incorrect_details()); // we'd lose money at our own current price
+    }
 
     // CLN's own `liquid_asset` field is `None` for an L-BTC channel, not
     // the literal "lbtc" our own protocol uses — bridge the two here.
     let chan_asset = channel_asset(&mut rpc, &scid).await.ok().flatten();
-    let expected_chan_asset = if is_lbtc(&rec.from_asset) { None } else { Some(rec.from_asset.as_str()) };
-    let budget = rec.leg2_final_cltv + p.state().config.safety_blocks + p.state().config.min_hop_budget;
-    if chan_asset.as_deref() != expected_chan_asset
-        || now_unix() > rec.quote_expiry_unix
-        || cltv_expiry_relative < budget
-    {
+    let expected_chan_asset = if is_lbtc(&priced.from_asset) { None } else { Some(priced.from_asset.as_str()) };
+    let budget = leg2_final_cltv + p.state().config.safety_blocks + p.state().config.min_hop_budget;
+    if chan_asset.as_deref() != expected_chan_asset || cltv_expiry_relative < budget {
         return Ok(fail_incorrect_details());
     }
 
-    // Live-price recheck: has the market moved past the ceiling the payer
-    // pre-approved for this tier since the quote was issued? Ask
-    // pricetiers-plugin again (amount is irrelevant here, only its
-    // rate_ppm is used) rather than trusting the quote-time snapshot.
-    match fetch_price_tiers(&mut rpc, &rec.to_asset, 1).await {
-        Ok(priced) if priced.from_asset == rec.from_asset && tier.rate_ppm >= priced.rate_ppm => {}
-        _ => return Ok(fail_incorrect_details()),
-    }
-
+    let rec = QuoteRecord {
+        state: "claimed".into(), // claim_quote_atomically always writes this state regardless
+        from_asset: priced.from_asset.clone(),
+        to_asset: meta.to_asset.clone(),
+        final_bolt11: meta.final_bolt11.clone(),
+    };
     let Some(claimed_generation) = claim_quote_atomically(&mut rpc, &payment_hash, &rec)
         .await
         .unwrap_or(None)
     else {
-        return Ok(fail_incorrect_details()); // replay: someone already claimed this quote
+        return Ok(fail_incorrect_details()); // replay: someone already claimed this hash
     };
 
-    let maxdelay = cltv_expiry_relative.saturating_sub(rec.leg2_final_cltv + p.state().config.safety_blocks);
+    let maxdelay = cltv_expiry_relative.saturating_sub(leg2_final_cltv + p.state().config.safety_blocks);
     let to_asset_sha = match asset_sha(&rec.to_asset) {
         Ok(a) => a,
         Err(_) => {
