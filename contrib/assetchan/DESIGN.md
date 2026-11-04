@@ -214,10 +214,14 @@ Branch: `git checkout -b asset-channels master`. Commits:
    on C paid from A (2 hops, route hint), wrong-asset payment refused, mutual close,
    assets land at the elementsd close addresses. Harness pieces reused from
    `tests/test_liquid_asset_poc.py` (`explicit_tx`, `unconfidential`, `explicit_utxo`).
-5. **C5** + `test_unilateral_close[opener|peer]` (no HTLC in flight; the HTLC, penalty
-   and HTLC-tx sweep kinds are ported but exercised only by the branch's tests so far);
-   stretch: `test_htlc_onchain`,
-   `test_penalty` (adapted from the branch).
+5. **C5** + `test_unilateral_close[opener|peer]` (no HTLC in flight),
+   `test_htlc_onchain[timeout|success-payer|payee]` (an HTLC in flight, resolved by
+   the closer's HTLC-timeout or HTLC-success tx and the delayed sweep of its output,
+   or by the other side's direct spend after the timeout or with the preimage; the
+   payer's payment fails or completes from what it sees on-chain) and
+   `test_penalty[opener|peer]` (a revoked commitment with an HTLC in it: the victim
+   penalizes `to_local` and the HTLC and sweeps its `to_remote`). All sweep kinds of
+   C5 are covered.
 6. `git diff --stat master` → real numbers into DESIGN.md §4; port `run-tests.sh` for
    macOS Docker runs.
 
@@ -232,8 +236,11 @@ Reuse map (`git show liquid-merged:<path>`): `common/liquid_asset.[ch]`,
 
 - `make && make check-units`; `TEST_NETWORK=liquid-regtest pytest -n 4 tests/test_assetchan.py`
   (Linux with `elementsd` on PATH, or the Docker runner).
-- Upstream regression on Elements: `TEST_NETWORK=liquid-regtest pytest tests/test_closing.py -k anchor`
-  after C4, since anchors were disabled there.
+- Upstream regression on Elements (ordinary channels there stay non-anchor; C4 enables
+  anchors only with a channel asset): `contrib/assetchan/run-tests.sh tests/test_closing.py
+  -k "test_closing_simple or test_closing_id or test_penalty_inhtlc or test_onchain_unwatch
+  or test_onchaind_replay or test_onchain_their_unilateral_out"` passes (the `anchors`
+  variants skip on Elements, as upstream has them).
 - On-chain (elements-cli): funding vout 0 asset/units, vout 1 L-BTC/reserve, same script,
   both explicit; commitment has two inputs, anchors in L-BTC, fee output = reserve −
   anchors; sweeps pay fees from wallet L-BTC; assets at close addresses.
