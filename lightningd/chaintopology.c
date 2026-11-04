@@ -3,6 +3,7 @@
 #include <ccan/array_size/array_size.h>
 #include <ccan/io/io.h>
 #include <ccan/tal/str/str.h>
+#include <common/channel_asset.h>
 #include <common/htlc_tx.h>
 #include <common/memleak.h>
 #include <common/timeout.h>
@@ -993,15 +994,19 @@ static void topo_add_utxos(struct chain_topology *topo, struct block *b)
 			if (!is_p2wsh(output->script, output->script_len, NULL))
 				continue; /* We only care about p2wsh utxos */
 
+			/* Explicit outputs only (blinded ones have no amount
+			 * we can read); any asset, as asset channels
+			 * (common/channel_asset.h) gossip their funding output
+			 * with the asset's units as the capacity. */
+			if (!elements_output_is_explicit(output))
+				continue;
 			struct amount_asset amt = bitcoin_tx_output_get_amount(tx, n);
-			if (!amount_asset_is_main(&amt))
-				continue; /* Ignore non-policy asset outputs */
 
 			struct bitcoin_outpoint outpoint = { b->txids[i], n };
 			wallet_utxoset_add(topo->ld->wallet, &outpoint,
 					   b->height, i,
 					   output->script, output->script_len,
-					   amount_asset_to_sat(&amt));
+					   amount_sat(amt.value));
 		}
 	}
 }

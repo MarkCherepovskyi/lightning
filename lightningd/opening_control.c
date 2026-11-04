@@ -1451,12 +1451,6 @@ static struct command_result *json_fundchannel_start(struct command *cmd,
 		if (!fee_reserve)
 			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
 					    "fee_reserve is required with asset");
-		/* There is no gossip for assets: the amounts would be read
-		 * as sats. */
-		if (*announce_channel)
-			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-					    "asset channels must be private"
-					    " (announce=false)");
 	} else if (fee_reserve)
 		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
 				    "fee_reserve only applies with asset");

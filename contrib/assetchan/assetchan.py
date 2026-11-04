@@ -11,7 +11,10 @@ plugin does the rest, with an elementsd wallet holding the assets:
   channel close to an address of that wallet, so swept assets are spendable;
 - `assetchan-invoice` ties an invoice to an asset, and the `htlc_accepted`
   hook refuses payments that arrive in another one;
-- `assetchan-pay` pays over channels in the invoice's asset only.
+- `assetchan-pay` pays over channels in the invoice's asset only: gossip
+  doesn't say which asset a channel is in, so the plugin reads it off the
+  funding output (`assetchan-listchannels` shows that) and keeps an askrene
+  layer per asset.
 
 Amounts are in the asset's base units; on the wire a unit is 1000 msat.
 """
@@ -21,7 +24,6 @@ from pyln.client import Plugin, RpcError, RpcException
 import base64
 import hashlib
 import json
-import struct
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -30,6 +32,7 @@ plugin = Plugin()
 plugin.elements = None       # ElementsRpc, built on first use
 plugin.lbtc = None           # L-BTC's asset id
 plugin.channel_assets = {}   # scid or alias -> asset of that channel of ours
+plugin.gossip_assets = {}    # gossiped scid -> asset of its funding output
 
 COIN = 10**8
 LBTC = 'lbtc'                           # the "asset" of an ordinary channel
@@ -97,6 +100,12 @@ def check_asset(asset):
         ok = False
     if not ok:
         raise RpcException('{!r} is not an asset id (64 hex digits)'.format(asset))
+
+
+def check_asset_or_lbtc(asset):
+    """An asset id, or 'lbtc' for ordinary channels."""
+    if asset != LBTC:
+        check_asset(asset)
 
 
 # ---------------------------------------------------------------- elementsd
@@ -248,6 +257,27 @@ def channel_asset(plugin, scid):
     return plugin.channel_assets.get(scid)
 
 
+def gossiped_channel_asset(plugin, scid):
+    """The asset a gossiped channel is in: gossip doesn't say, its funding
+    output's asset tag does (read from elementsd, cached).  'lbtc' for an
+    ordinary channel, None if we can't tell."""
+    if scid in plugin.gossip_assets:
+        return plugin.gossip_assets[scid]
+    asset = None
+    try:
+        height, index, outnum = (int(x) for x in scid.split('x'))
+        ed = elements(plugin)
+        txid = ed.call('getblock', ed.call('getblockhash', height), 1)['tx'][index]
+        out = ed.call('gettxout', txid, outnum, False)
+        if out and 'asset' in out:
+            asset = LBTC if out['asset'] == lbtc_asset(plugin) else out['asset']
+    except (ElementsError, IndexError, ValueError, KeyError) as e:
+        plugin.log("can't tell the asset of channel {}: {}".format(scid, e), 'info')
+    if asset is not None:
+        plugin.gossip_assets[scid] = asset
+    return asset
+
+
 def find_channel(plugin, id):
     """The one channel `id` names (channel id, scid, alias, or a peer with a
     single channel), or None."""
@@ -396,6 +426,24 @@ def assetchan_send(plugin, addr, asset, amount):
     return {'txid': txid}
 
 
+@plugin.method('assetchan-listchannels')
+def assetchan_listchannels(plugin, asset=None):
+    """The gossiped channels with the asset each is in ('lbtc' for an
+    ordinary channel; from the funding output, as gossip doesn't say),
+    only those in {asset} if given."""
+    if asset is not None:
+        check_asset_or_lbtc(asset)
+    out = []
+    for c in plugin.rpc.listchannels()['channels']:
+        found = gossiped_channel_asset(plugin, c['short_channel_id'])
+        if asset is None or found == asset:
+            out.append({'short_channel_id': c['short_channel_id'],
+                        'direction': c['direction'], 'source': c['source'],
+                        'destination': c['destination'],
+                        'amount_msat': c['amount_msat'], 'asset': found})
+    return {'channels': out}
+
+
 @plugin.method('assetchan-newaddr')
 def assetchan_newaddr(plugin):
     """A fresh unconfidential address of elementsd's wallet."""
@@ -424,9 +472,10 @@ def asset_hints(plugin, asset):
 
 @plugin.method('assetchan-invoice')
 def assetchan_invoice(plugin, amount, asset, label, description, expiry=None):
-    """An invoice for {amount} units of {asset}: it must be paid over a
-    channel in that asset, and it hints at our channels in it."""
-    check_asset(asset)
+    """An invoice for {amount} units of {asset} ('lbtc' for an ordinary
+    one): it must be paid over a channel in that asset, and it hints at our
+    channels in it."""
+    check_asset_or_lbtc(asset)
     inv = plugin.rpc.invoice(int(amount) * 1000, label, description, expiry=expiry,
                              exposeprivatechannels=asset_hints(plugin, asset))
     plugin.rpc.datastore(key=INVOICE_KEY + [inv['payment_hash']], string=asset,
@@ -436,28 +485,40 @@ def assetchan_invoice(plugin, amount, asset, label, description, expiry=None):
 
 
 def asset_layer(plugin, asset):
-    """The askrene layer `assetchan.<asset>`: our channels in other assets
-    disabled, so a payment in `asset` can't leave over them."""
+    """The askrene layer `assetchan.<asset>`: every channel we know to be
+    in another asset disabled (ours, and the gossiped ones by their funding
+    output), so a payment in `asset` is only routed over channels in it."""
     layer = 'assetchan.' + asset
     if layer not in [lay['layer'] for lay in plugin.rpc.call('askrene-listlayers', {})['layers']]:
         plugin.rpc.call('askrene-create-layer', {'layer': layer, 'persistent': False})
-    for c in channels(plugin):
-        # (what askrene calls the channel: its scid, or its local alias)
-        scid = c.get('short_channel_id') or c.get('alias', {}).get('local')
-        if c.get('asset', LBTC) == asset or scid is None:
-            continue
+
+    def disable(scid):
         for direction in (0, 1):
             plugin.rpc.call('askrene-update-channel',
                             {'layer': layer, 'enabled': False,
                              'short_channel_id_dir': '{}/{}'.format(scid, direction)})
+
+    for c in channels(plugin):
+        # (what askrene calls the channel: its scid, or its local alias)
+        scid = c.get('short_channel_id') or c.get('alias', {}).get('local')
+        if scid is not None and c.get('asset', LBTC) != asset:
+            disable(scid)
+    for scid in {c['short_channel_id'] for c in plugin.rpc.listchannels()['channels']}:
+        other = gossiped_channel_asset(plugin, scid)
+        if other is not None and other != asset:
+            disable(scid)
     return layer
 
 
 @plugin.method('assetchan-pay')
-def assetchan_pay(plugin, bolt11, asset):
-    """Pay {bolt11} in {asset}: xpay, kept off our channels in other assets."""
-    check_asset(asset)
-    res = plugin.rpc.call('xpay', {'invstring': bolt11, 'layers': [asset_layer(plugin, asset)]})
+def assetchan_pay(plugin, bolt11, asset, maxfee=None):
+    """Pay {bolt11} in {asset} ('lbtc' for an ordinary payment): xpay, kept
+    off every channel known to be in another asset; {maxfee} as xpay's."""
+    check_asset_or_lbtc(asset)
+    params = {'invstring': bolt11, 'layers': [asset_layer(plugin, asset)]}
+    if maxfee is not None:
+        params['maxfee'] = maxfee
+    res = plugin.rpc.call('xpay', params)
     res['asset'] = asset
     return res
 
@@ -498,9 +559,11 @@ def on_htlc_accepted(plugin, htlc, onion, **kwargs):
         return {'result': 'continue'}
     plugin.log('HTLC for {} arrived in {} but the invoice is in {}: failing it'
                .format(htlc['payment_hash'], got, want))
-    # BOLT 4 incorrect_or_unknown_payment_details: htlc_msat, height
-    data = struct.pack('>QI', int(htlc['amount_msat']), plugin.rpc.getinfo()['blockheight'])
-    return {'result': 'fail', 'failure_message': '400f' + data.hex()}
+    # BOLT 4 temporary_channel_failure, without a channel_update: the
+    # channel it came by can't carry this invoice, and payers route around
+    # that channel (incorrect_or_unknown_payment_details would make them
+    # give up on the invoice).
+    return {'result': 'fail', 'failure_message': '10070000'}
 
 
 # ------------------------------------------------------------ notifications

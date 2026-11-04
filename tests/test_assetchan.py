@@ -5,7 +5,9 @@ A, a wrong-asset payment refused, a mutual close that lands the asset at the
 elementsd close addresses; a unilateral close by either side, each sweeping
 its asset output with L-BTC from its wallet for the fee; a unilateral close
 with an HTLC in flight, resolved on-chain by HTLC txs or direct spends; and
-a revoked commitment, penalized by the victim.
+a revoked commitment, penalized by the victim.  test_gossip (step 7): five
+nodes with announced and private asset channels next to L-BTC ones, what
+gossip makes of them and what payers with and without the plugin do.
 
     TEST_NETWORK=liquid-regtest pytest tests/test_assetchan.py
 """
@@ -226,9 +228,12 @@ def test_open_pay_close(node_factory, bitcoind):
     #    asset channel.
     inv = l3.rpc.invoice(1000, 'lbtc-wrong', 'in L-BTC',
                          exposeprivatechannels=[channel(l3, funding[l2])['short_channel_id']])
-    with pytest.raises(RpcError, match='incorrect_or_unknown_payment_details'):
+    #    l3 fails the HTLC as a temporary failure of the channel it came by
+    #    (so a payer with other paths would try them); here there is none.
+    with pytest.raises(RpcError, match='Failed after'):
         l1.rpc.call('assetchan-pay', {'bolt11': inv['bolt11'], 'asset': asset})
     l3.daemon.wait_for_log('arrived in {} but the invoice is in lbtc'.format(asset))
+    l1.daemon.wait_for_log('Unexpected error .* from final node: disabling')
     assert only_one(l3.rpc.listinvoices('lbtc-wrong')['invoices'])['status'] == 'unpaid'
     settled(l1, l2, l3)
 
@@ -568,3 +573,152 @@ def test_penalty(node_factory, bitcoind, cheater):
 
     bitcoind.generate_block(100)
     victim.daemon.wait_for_log('onchaind complete, forgetting peer')
+
+
+@unittest.skipIf(TEST_NETWORK != 'liquid-regtest', 'Liquid only')
+def test_gossip(node_factory, bitcoind):
+    """Five nodes.  Asset channels l1-l2, l2-l3 and l3-l4 announced, l2-l4
+    private; L-BTC channels l1-l5 and l5-l4 announced.  What gossip makes of
+    asset channels, and what payers, with and without the plugin, do with
+    that."""
+    asset = bitcoind.rpc.issueasset(1000, 0, False)['asset']
+    bitcoind.generate_block(1)
+    # l5 charges 50 sat a forward (the others 1), see 3.
+    opts = [node_opts(bitcoind, asset) for _ in range(5)]
+    opts[4]['fee-base'] = 50000
+    nodes = l1, l2, l3, l4, l5 = node_factory.get_nodes(5, opts=opts)
+    for a, b in ((l1, l2), (l2, l3), (l3, l4), (l2, l4), (l1, l5), (l5, l4)):
+        a.rpc.connect(b.info['id'], 'localhost', b.port)
+    chans = {}
+    for opener, peer, announce in ((l1, l2, True), (l2, l3, True), (l3, l4, True), (l2, l4, False)):
+        res = opener.rpc.call('assetchan-open', {'id': peer.info['id'], 'amount': CHANNEL_UNITS,
+                                                 'asset': asset, 'fee_reserve': FEE_RESERVE,
+                                                 'announce': announce})
+        bitcoind.generate_block(1, wait_for_mempool=res['txid'])
+        chans[(opener, peer)] = res['channel_id']
+    for opener, peer in ((l1, l5), (l5, l4)):
+        opener.fundwallet(10**7)
+        chans[(opener, peer)] = opener.rpc.fundchannel(peer.info['id'], 10**6)['channel_id']
+        bitcoind.generate_block(1, wait_for_mempool=1)
+    bitcoind.generate_block(6)
+    for (opener, peer), chan in chans.items():
+        wait_normal(opener, chan)
+        wait_normal(peer, chan)
+    sync_blockheight(bitcoind, nodes)
+
+    def scid(pair):
+        return channel(pair[0], chans[pair])['short_channel_id']
+
+    def gossiped(node):
+        return [c for c in node.rpc.listchannels()['channels'] if c['short_channel_id'] in public]
+
+    # 1. Gossip.  The announced asset channels reach every node, l5 (which
+    #    has none) included, looking like any other channel: their capacity
+    #    is the asset units, and nothing says which asset.  The private one
+    #    is nowhere.  The plugin tells them apart by the funding output.
+    public = {scid(p) for p in ((l1, l2), (l2, l3), (l3, l4), (l1, l5), (l5, l4))}
+    for n in nodes:
+        wait_for(lambda: len(gossiped(n)) == 2 * len(public))
+    seen = l5.rpc.listchannels(short_channel_id=scid((l1, l2)))['channels']
+    assert len(seen) == 2
+    assert all(c['amount_msat'] == CHANNEL_UNITS * 1000 and 'asset' not in c for c in seen)
+    assert l5.rpc.listchannels(short_channel_id=scid((l2, l4)))['channels'] == []
+    assert scid((l2, l4)) not in {c['short_channel_id']
+                                  for c in l1.rpc.listchannels()['channels']}
+    by_asset = {a: {c['short_channel_id']
+                    for c in l5.rpc.call('assetchan-listchannels', {'asset': a})['channels']}
+                for a in (asset, 'lbtc')}
+    assert by_asset[asset] == {scid(p) for p in ((l1, l2), (l2, l3), (l3, l4))}
+    assert by_asset['lbtc'] == {scid(p) for p in ((l1, l5), (l5, l4))}
+    assert all(c['asset'] in (asset, 'lbtc')
+               for c in l5.rpc.call('assetchan-listchannels', {})['channels'])
+
+    # 2. An asset payment l1 -> l4: over the announced asset channels and
+    #    l4's hint (core picks one of the asset channels the plugin offers,
+    #    the private one by its alias), never the L-BTC ones.
+    wait_for(lambda: len([i for i in l4.rpc.listincoming()['incoming']
+                          if i['id'] in (l2.info['id'], l3.info['id'])]) == 2)
+    inv = l4.rpc.call('assetchan-invoice', {'amount': PAY_UNITS, 'asset': asset,
+                                            'label': 'asset', 'description': 'in the asset'})
+    hints = [h[0] for h in l1.rpc.decode(inv['bolt11'])['routes']]
+    assert hints and {h['pubkey'] for h in hints} <= {l2.info['id'], l3.info['id']}
+    assert all(h['short_channel_id'] in (scid((l2, l4)), scid((l3, l4)),
+                                         channel(l4, chans[(l2, l4)])['alias']['remote'])
+               for h in hints)
+    res = l1.rpc.call('assetchan-pay', {'bolt11': inv['bolt11'], 'asset': asset})
+    assert res['failed_parts'] == 0
+    settled(*nodes)
+    assert channel(l4, chans[(l2, l4)])['to_us_msat'] + channel(l4, chans[(l3, l4)])['to_us_msat'] \
+        == PAY_UNITS * 1000
+    assert channel(l1, chans[(l1, l5)])['to_us_msat'] == 10**6 * 1000
+
+    # 3. An L-BTC invoice on l4 sent over the asset channels, as a payer
+    #    that can't tell them apart might (gossip shows them as the cheapest
+    #    path: l5 charges 50 sat): l1 sends 1,000 units that way, l2 and l3
+    #    forward them (asset to asset), and l4's plugin fails the HTLC as a
+    #    temporary failure of the last channel, which is what makes a payer
+    #    route around it rather than give up on the invoice.
+    wait_for(lambda: [c for c in l1.rpc.listchannels(short_channel_id=scid((l5, l4)))['channels']
+                      if c['source'] == l5.info['id'] and c['base_fee_millisatoshi'] == 50000])
+    l2_before = channel(l2, chans[(l1, l2)])['to_us_msat']
+    inv = l4.rpc.invoice(1000 * 1000, 'lbtc', 'in L-BTC', exposeprivatechannels=False)
+    route = [{'id': l2.info['id'], 'channel': scid((l1, l2)), 'amount_msat': 1002 * 1000, 'delay': 30},
+             {'id': l3.info['id'], 'channel': scid((l2, l3)), 'amount_msat': 1001 * 1000, 'delay': 24},
+             {'id': l4.info['id'], 'channel': scid((l3, l4)), 'amount_msat': 1000 * 1000, 'delay': 18}]
+    l1.rpc.sendpay(route, inv['payment_hash'], payment_secret=inv['payment_secret'],
+                   amount_msat=1000 * 1000, bolt11=inv['bolt11'])
+    with pytest.raises(RpcError) as err:
+        l1.rpc.waitsendpay(inv['payment_hash'])
+    assert err.value.error['data']['failcodename'] == 'WIRE_TEMPORARY_CHANNEL_FAILURE'
+    assert err.value.error['data']['erring_node'] == l4.info['id']
+    l4.daemon.wait_for_log('arrived in {} but the invoice is in lbtc'.format(asset))
+    settled(*nodes)
+    assert channel(l2, chans[(l1, l2)])['to_us_msat'] == l2_before
+    assert only_one(l4.rpc.listinvoices('lbtc')['invoices'])['status'] == 'unpaid'
+    #    Plain xpay gets there whichever path it tries first (50 sat on 1,000
+    #    is over its default fee cap, so one is given): at most one failed
+    #    part, the money over l5, the asset channels untouched.
+    res = l1.rpc.call('xpay', {'invstring': inv['bolt11'], 'maxfee': 100000})
+    assert res['failed_parts'] <= 1 and res['successful_parts'] == 1
+    settled(*nodes)
+    assert channel(l2, chans[(l1, l2)])['to_us_msat'] == l2_before
+    assert channel(l1, chans[(l1, l5)])['to_us_msat'] == (10**6 - 1000 - 50) * 1000
+
+    # 4. The same through the plugin: assetchan-pay in 'lbtc' keeps off every
+    #    channel it knows to be in an asset, so it goes over l5 at once.
+    inv = l4.rpc.invoice(1000 * 1000, 'lbtc2', 'in L-BTC', exposeprivatechannels=False)
+    res = l1.rpc.call('assetchan-pay', {'bolt11': inv['bolt11'], 'asset': 'lbtc', 'maxfee': 100000})
+    assert res['failed_parts'] == 0
+    settled(*nodes)
+    assert channel(l1, chans[(l1, l5)])['to_us_msat'] == (10**6 - 2 * 1050) * 1000
+
+    # 5. l5 has no asset channel, so it can't pay l4's asset invoice: not
+    #    through the plugin (nothing to leave by), nor by plain xpay (l4
+    #    refuses the HTLC that arrives over L-BTC), nor around through l1,
+    #    which refuses to forward from its L-BTC channel into an asset one.
+    inv = l4.rpc.call('assetchan-invoice', {'amount': PAY_UNITS, 'asset': asset,
+                                            'label': 'asset-l5', 'description': 'in the asset'})
+    with pytest.raises(RpcError):
+        l5.rpc.call('assetchan-pay', {'bolt11': inv['bolt11'], 'asset': asset})
+    with pytest.raises(RpcError, match='Failed after'):
+        l5.rpc.call('xpay', {'invstring': inv['bolt11']})
+    l4.daemon.wait_for_log('arrived in lbtc but the invoice is in {}'.format(asset))
+    #    (l5 needs something on its side of l1-l5 to try the way round.)
+    l1.rpc.pay(l5.rpc.invoice(10000 * 1000, 'l5-lbtc', 'in L-BTC')['bolt11'])
+    settled(l1, l5)
+    route = [{'id': l1.info['id'], 'channel': scid((l1, l5)), 'amount_msat': (PAY_UNITS + 2) * 1000, 'delay': 30},
+             {'id': l2.info['id'], 'channel': scid((l1, l2)), 'amount_msat': (PAY_UNITS + 1) * 1000, 'delay': 24},
+             {'id': l4.info['id'], 'channel': scid((l2, l4)), 'amount_msat': PAY_UNITS * 1000, 'delay': 18}]
+    l5.rpc.sendpay(route, inv['payment_hash'], payment_secret=inv['payment_secret'],
+                   amount_msat=PAY_UNITS * 1000, bolt11=inv['bolt11'])
+    with pytest.raises(RpcError) as err:
+        l5.rpc.waitsendpay(inv['payment_hash'])
+    assert err.value.error['data']['failcodename'] == 'WIRE_UNKNOWN_NEXT_PEER'
+    assert err.value.error['data']['erring_node'] == l1.info['id']
+    l1.daemon.wait_for_log('Refusing to forward between different assets')
+    settled(*nodes)
+    assert only_one(l4.rpc.listinvoices('asset-l5')['invoices'])['status'] == 'unpaid'
+
+    # Nobody crashed processing all that.
+    for n in nodes:
+        n.rpc.getinfo()

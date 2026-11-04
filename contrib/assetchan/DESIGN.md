@@ -137,6 +137,7 @@ Explicit (unblinded) outputs only.
 | C5 | Asset sweeps: one builder (asset in → asset out to the close script, wallet L-BTC for the fee) behind every spend kind; `to_remote` swept (`onchaind_spend_asset_to_remote`) instead of handed to the wallet; L-BTC outputs kept out of the asset account; `anchorspend` off | `lightningd/onchain_control.c`, `onchaind/onchaind.c`, `onchaind_wire.csv`, `lightningd/anchorspend.c` | 550 | `onchaind` + channel keys |
 | C6 | `fundchannel_complete` verifies output n (asset, amount, explicit) and n+1 (L-BTC, reserve); funding watch by asset | `lightningd/opening_control.c`, `lightningd/watch.c` | 60 | safety |
 | C7 | `liquid-testnet` chainparams | `bitcoin/chainparams.c` | 35 | |
+| C8 | Gossip can verify an asset channel: the block scan records every explicit P2WSH output (any asset, its units as the amount) in the utxoset and filtered blocks, and `fundchannel_start` no longer insists on `announce=false` | `lightningd/{chaintopology,bitcoind,opening_control}.c` | 10 | gossip verification is in lightningd |
 
 Target was ≈ 1,500 lines (vs 4,370 on `liquid-merged`). **Measured** (`git diff --stat
 master`, 2026-11-04, without `contrib/assetchan`, the pytest and the generated
@@ -145,7 +146,7 @@ lightningd +1,103 (C5's sweeps ≈ 700 of it), common +404, onchaind +175, openi
 bitcoin +133, closingd +122, hsmd +77, channeld +74, doc +36, wallet +19, wire +16.
 The table's per-change numbers are the estimates. **Not in core** (vs the branch): asset wallet (`withdrawasset`, `listassetfunds`,
 `our_asset_outputs`), `invoice asset=`, per-asset gossip (gossipd/connectd/gossmap,
-~600 lines; POC uses private channels), askrene/xpay/topology `asset=`, the custom
+~600 lines; see Gossip in §7), askrene/xpay/topology `asset=`, the custom
 non-anchor zero-fee HTLC scheme, the fee-reserve change-output logic, macOS fd fixes.
 
 ## 5. Plugin spec — `contrib/assetchan/assetchan.py` (Python, pyln-client)
@@ -185,14 +186,20 @@ build context and in `run-tests.sh`.
     channels) + datastore `["assetchan","invoice",<payment_hash>] → asset`; v2 = asset
     as an unassigned bolt11 tagged field via `createinvoice` (CLN keeps unknown fields:
     `common/bolt11.c:144,1393`).
-  - `assetchan-pay bolt11 asset`: creates/updates askrene layer `assetchan.<asset>`
-    disabling every local channel of another asset (`askrene-update-channel
-    enabled=false`), then `xpay layers=[...]`; private hops come from the invoice's route
-    hints.
+  - `assetchan-pay bolt11 asset [maxfee]`: creates/updates askrene layer `assetchan.<asset>`
+    disabling every channel known to be in another asset (`askrene-update-channel
+    enabled=false`): our own (`listpeerchannels`) and the gossiped ones, whose asset the
+    plugin reads from their funding output (`gossiped_channel_asset`: scid → block → tx →
+    `gettxout` asset tag, cached), then `xpay layers=[...]`; private hops come from the
+    invoice's route hints. `asset` may be `lbtc` for an ordinary payment that must keep
+    off asset channels. `assetchan-listchannels [asset]` is `listchannels` with that
+    classification.
 - **Hooks**: `openchannel` — reject if asset not allowed or reserve outside
   [min,max], else `continue` with `close_to`; `htlc_accepted` — final hop only: incoming
   channel's asset (cache from `listpeerchannels` by scid/alias) must equal the invoice's
-  asset, else `fail` with `incorrect_or_unknown_payment_details`.
+  asset, else `fail` with `temporary_channel_failure` (no `channel_update`): the payer
+  then disables the channel it used for the last hop and tries other paths, where
+  `incorrect_or_unknown_payment_details` would make it give up on the invoice.
 - **Notifications**: `channel_state_changed`/`channel_opened` (cache), `invoice_payment`
   (drop datastore entry). Runs as `important-plugin`; loaded before `htlcs_resubmit`
   (`lightningd/lightningd.c:1422-1437`).
@@ -224,6 +231,8 @@ Branch: `git checkout -b asset-channels master`. Commits:
    C5 are covered.
 6. `git diff --stat master` → real numbers into DESIGN.md §4; port `run-tests.sh` for
    macOS Docker runs.
+7. `test_gossip`: five nodes, announced asset channels l1-l2-l3-l4, a private one l2-l4,
+   announced L-BTC channels l1-l5-l4; see "Gossip" in §7.
 
 Reuse map (`git show liquid-merged:<path>`): `common/liquid_asset.[ch]`,
 `bitcoin/tx.c`, `bitcoin/psbt.c`, `bitcoin/tx_parts.c`, `bitcoin/chainparams.c`
@@ -240,7 +249,9 @@ Reuse map (`git show liquid-merged:<path>`): `common/liquid_asset.[ch]`,
   anchors only with a channel asset): `contrib/assetchan/run-tests.sh tests/test_closing.py
   -k "test_closing_simple or test_closing_id or test_penalty_inhtlc or test_onchain_unwatch
   or test_onchaind_replay or test_onchain_their_unilateral_out"` passes (the `anchors`
-  variants skip on Elements, as upstream has them).
+  variants skip on Elements, as upstream has them); with C8, `tests/test_gossip.py -k
+  "test_gossip_jsonrpc or test_announce_and_connect or test_gossip_persistence"` too
+  (the `_via_dns` variant needs name resolution the container lacks).
 - On-chain (elements-cli): funding vout 0 asset/units, vout 1 L-BTC/reserve, same script,
   both explicit; commitment has two inputs, anchors in L-BTC, fee output = reserve −
   anchors; sweeps pay fees from wallet L-BTC; assets at close addresses.
@@ -270,7 +281,22 @@ Reuse map (`git show liquid-merged:<path>`): `common/liquid_asset.[ch]`,
   units the opener can't spend. Harmless, but wrong by 660 units; a later cleanup.
 - Dust limit / `htlc_minimum` are negotiated in "satoshis" but mean asset units:
   plugin policy per asset later.
-- Without gossip, asset channels are private (route hints); per-asset gossip is a later
-  core PR or a plugin layer.
+- **Gossip** (`test_gossip`). Announced asset channels propagate like any other once
+  lightningd's block scan keeps explicit asset outputs for gossip verification (C8; before
+  it, every node rejected the announcement with "no unspent txout"): the 2-of-2 script
+  matches and the amount read is the asset's units, so every node lists them with
+  capacity = units and nothing in
+  `channel_announcement`/`channel_update` says which asset they are in; private ones are
+  reachable only through the invoice's hints. The plugin tells gossiped channels apart by
+  their funding output's asset tag and keeps its per-asset askrene layers accordingly, so
+  `assetchan-pay` (in an asset or in `lbtc`) is routed over the right channels at once.
+  A payer without the plugin (or plain `xpay`) may take an asset path for an L-BTC
+  payment when gossip makes it look cheapest: its units travel asset-to-asset through
+  the intermediates, the recipient's hook fails the HTLC as a temporary failure of the
+  last channel, and the payer routes around it (one failed part); a wrong-asset forward
+  is refused by core (`unknown_next_peer`), so funds never cross assets. A node with no
+  channel in the asset cannot pay an asset invoice at all. Proper per-asset gossip (an
+  asset in `channel_update`, or a `channel_announcement` TLV) stays a later core PR; until
+  then announcing asset channels is a choice (`assetchan-open announce=true`), default off.
 - Upstream review will ask about TLV numbers, the reserve, and anchors on Elements;
   the plugin is unaffected by whichever protocol detail changes.
