@@ -85,8 +85,9 @@ Explicit (unblinded) outputs only.
 
 ## 3. Asset channel protocol (Level 2 delta)
 
-- **Negotiation**: feature `option_channel_asset` (odd bit in the custom range, number
-  TBD), advertised only when `--channel-asset` is configured. `open_channel` TLVs
+- **Negotiation**: feature `option_channel_asset` (odd bit in the custom range: 233 in
+  the POC, `OPT_CHANNEL_ASSET` = 232, provisional until upstream assigns one), advertised
+  only when `--channel-asset` is configured. `open_channel` TLVs
   `channel_asset` (4243, 33-byte explicit asset tag) and `fee_reserve` (4245, sats);
   `accept_channel` echoes `channel_asset` or the open fails. Channel type must be
   `anchors_zero_fee_htlc_tx`. v2 (dual-fund) and splicing: refused for asset channels.
@@ -102,14 +103,23 @@ Explicit (unblinded) outputs only.
   covers the largest commitment; anchors + CPFP cover urgency).
 - **HTLC txs**: upstream anchors behaviour (zero fee, `SIGHASH_SINGLE|ANYONECANPAY`,
   broadcaster adds wallet L-BTC); output 0 carries the asset tag.
-- **Mutual close**: legacy `closing_signed` only; fee = whole reserve, so negotiation is
-  immediate; TLV `fee_reserve_sig` carries input 1's signature. Outputs: asset to each
-  side's close script.
+- **Mutual close**: legacy `closing_signed` only (`option_simple_close` is skipped for
+  asset channels even when negotiated); fee = whole reserve, so negotiation is
+  immediate; TLV `fee_reserve_sig` carries input 1's signature; lightningd's closing-tx
+  check (`close_tx_check`) expects the reserve as input 1. Outputs: asset to each side's
+  close script.
 - **Unilateral close**: `onchaind` recognizes outputs by script as today and reads
-  asset amounts. Every asset output we own (`to_local` after CSV, `to_remote`, HTLC
-  outputs and HTLC-tx outputs, penalties) is spent zero-fee to the channel's close script
-  and funded with wallet L-BTC through the same routine as HTLC txs. Anchors: upstream
-  `anchorspend.c` (they are L-BTC).
+  asset amounts (its L-BTC outputs, anchors and fee, stay out of the channel's
+  asset-denominated account). Every asset output we own (`to_local` after CSV,
+  `to_remote`, HTLC outputs and HTLC-tx outputs, penalties) goes through one "asset
+  sweep" builder in lightningd: the asset output is input 0 and goes in full to output 0
+  (the channel's close script, or the HTLC-tx output for HTLC txs), wallet L-BTC inputs
+  pay the fee and the rest comes back to the wallet as P2WPKH change; rebuilt before
+  every rebroadcast with whatever L-BTC the wallet has. `to_remote` is swept too
+  (`onchaind_spend_asset_to_remote`, signed like a wallet to_remote UTXO) instead of
+  being handed to the wallet, which can't hold assets. The fee is capped at the
+  channel's reserve (we can't price the asset in L-BTC). Anchors: `anchorspend.c` is off
+  for asset channels (the commitment pays its own fee; it isn't Elements-aware).
 - **Invariants (core)**: one asset per channel; `forward_htlc` refuses a different asset
   in/out and `best_channel` matches the asset (`lightningd/peer_htlcs.c`, ~20 lines).
 - **Operational**: every node holding asset channels needs some L-BTC in its CLN wallet
@@ -124,12 +134,16 @@ Explicit (unblinded) outputs only.
 | C2 | Asset tags on channel tx outputs; fee computation counts only the fee asset; tx parser reads asset amounts instead of asserting L-BTC | `bitcoin/{tx,psbt,tx_parts}.c`, `common/{initial_commit_tx,htlc_tx,close_tx}.c`, `channeld/commit_tx.c` | 150 | tx builders live in daemons |
 | C3 | Reserve input + second signature + `hsmd` signing both inputs; `sign_last_tx` | `openingd`, `channeld`, `closingd`, `hsmd/{hsmd,libhsmd}.c`, `hsmd_wire.csv`, `lightningd/peer_control.c` | 400 | protocol + signer |
 | C4 | Allow anchors on Elements for asset channels (`lightningd/options.c:1854`); skip fee subtraction; fee output = reserve − anchors; ignore `update_fee` | `lightningd/options.c`, `channeld/{commit_tx,channeld}.c` | 40 | |
-| C5 | Asset sweeps: zero-fee spend to close script + reuse the HTLC-tx wallet-funding routine; `to_remote` swept instead of handed to the wallet | `lightningd/onchain_control.c`, `onchaind/onchaind.c`, `onchaind_wire.csv` | 400 | `onchaind` + channel keys |
+| C5 | Asset sweeps: one builder (asset in → asset out to the close script, wallet L-BTC for the fee) behind every spend kind; `to_remote` swept (`onchaind_spend_asset_to_remote`) instead of handed to the wallet; L-BTC outputs kept out of the asset account; `anchorspend` off | `lightningd/onchain_control.c`, `onchaind/onchaind.c`, `onchaind_wire.csv`, `lightningd/anchorspend.c` | 550 | `onchaind` + channel keys |
 | C6 | `fundchannel_complete` verifies output n (asset, amount, explicit) and n+1 (L-BTC, reserve); funding watch by asset | `lightningd/opening_control.c`, `lightningd/watch.c` | 60 | safety |
 | C7 | `liquid-testnet` chainparams | `bitcoin/chainparams.c` | 35 | |
 
-Target ≈ 1,500 lines (vs 4,370 on `liquid-merged`); measured after the POC. **Not in
-core** (vs the branch): asset wallet (`withdrawasset`, `listassetfunds`,
+Target was ≈ 1,500 lines (vs 4,370 on `liquid-merged`). **Measured** (`git diff --stat
+master`, 2026-11-04, without `contrib/assetchan`, the pytest and the generated
+`msggen/schema.json`): 62 files, +2,625/−152, of which unit/fuzz tests +297; by area:
+lightningd +1,103 (C5's sweeps ≈ 700 of it), common +404, onchaind +175, openingd +169,
+bitcoin +133, closingd +122, hsmd +77, channeld +74, doc +36, wallet +19, wire +16.
+The table's per-change numbers are the estimates. **Not in core** (vs the branch): asset wallet (`withdrawasset`, `listassetfunds`,
 `our_asset_outputs`), `invoice asset=`, per-asset gossip (gossipd/connectd/gossmap,
 ~600 lines; POC uses private channels), askrene/xpay/topology `asset=`, the custom
 non-anchor zero-fee HTLC scheme, the fee-reserve change-output logic, macOS fd fixes.
@@ -141,26 +155,36 @@ Location rationale: `plugins/` Python plugins become built-ins
 build context and in `run-tests.sh`.
 
 - **elementsd client**: stdlib `urllib`; credentials from `listconfigs`
-  (`bitcoin-rpcuser/-rpcpassword/-rpcconnect/-rpcport`, plain strings in
-  `plugins/bcli.c:895-905`); override `assetchan-elements-rpc`, wallet
-  `assetchan-elements-wallet`.
+  (`bitcoin-rpcuser/-rpcconnect/-rpcport`; `bitcoin-rpcpassword` is concealed as `...`,
+  so the plugin reads it back from the config file line `listconfigs` points at, or
+  needs the override); override `assetchan-elements-rpc=http://user:pw@host:port`,
+  wallet `assetchan-elements-wallet`.
 - **Options**: `assetchan-min-fee-reserve` (1000), `assetchan-max-fee-reserve` (10000),
   `assetchan-default-fee-reserve` (2000), `assetchan-close-to` (`elements`|`none`).
   Allowed assets come from core's `--channel-asset` via `listconfigs`.
 - **RPCs**:
   - `assetchan-open id amount asset [fee_reserve] [announce=false] [close_to]`:
-    `connect` → `fundchannel_start(asset=, fee_reserve=, close_to=<elementsd
-    unconfidential addr>)` → `walletcreatefundedpsbt([], [{addr: units, "asset": id},
-    {addr: reserve}], 0, {"changePosition": 2, "lockUnspents": true})` → `decodepsbt`
-    sanity → `walletprocesspsbt` (sign + blind change **before** CLN sees it) →
-    `fundchannel_complete` → `finalizepsbt` → `sendrawtransaction`; on failure
-    `fundchannel_cancel` + `lockunspent`. Fallback: `listunspent` + `createpsbt`.
+    `fundchannel_start(asset=, fee_reserve=, close_to=<elementsd unconfidential addr>)`
+    → an **explicit** funding transaction: one unblinded UTXO of the asset and one of
+    L-BTC (`listunspent`; if the wallet has none big enough it pays itself one with
+    `sendtoaddress` to an unconfidential address first — a transaction with blinded
+    inputs can't have all-explicit outputs), `createpsbt([asset_in, lbtc_in], [{addr:
+    units, "asset": id}, {addr: reserve}, asset change, L-BTC change, {"fee": ...}])`
+    (the shape Liquid testnet case T1 proved) → `walletprocesspsbt` → `finalizepsbt`
+    → `decoderawtransaction` sanity (outputs 0/1 explicit, right asset/amount/script)
+    → `fundchannel_complete(withhold=false)` → `sendrawtransaction`; on failure
+    `fundchannel_cancel` + `lockunspent`. `walletcreatefundedpsbt` was dropped: it
+    places change at a random position (which can land between outputs n and n+1)
+    and blinds it.
   - `assetchan-close id [destination]`, `assetchan-list [asset]`, `assetchan-funds`
     (elementsd balances + channel balances), `assetchan-send addr asset amount`,
     `assetchan-newaddr`.
-  - `assetchan-invoice amount asset label desc [expiry]`: POC = `invoice` + datastore
-    `["assetchan","invoice",<payment_hash>] → asset`; v2 = asset as an unassigned bolt11
-    tagged field via `createinvoice` (CLN keeps unknown fields: `common/bolt11.c:144,1393`).
+  - `assetchan-invoice amount asset label desc [expiry]`: POC = `invoice` with
+    `exposeprivatechannels=[our channels in the asset]` (explicit hints: core would
+    otherwise hint channels in any asset, and none through a peer without public
+    channels) + datastore `["assetchan","invoice",<payment_hash>] → asset`; v2 = asset
+    as an unassigned bolt11 tagged field via `createinvoice` (CLN keeps unknown fields:
+    `common/bolt11.c:144,1393`).
   - `assetchan-pay bolt11 asset`: creates/updates askrene layer `assetchan.<asset>`
     disabling every local channel of another asset (`askrene-update-channel
     enabled=false`), then `xpay layers=[...]`; private hops come from the invoice's route
@@ -190,7 +214,9 @@ Branch: `git checkout -b asset-channels master`. Commits:
    on C paid from A (2 hops, route hint), wrong-asset payment refused, mutual close,
    assets land at the elementsd close addresses. Harness pieces reused from
    `tests/test_liquid_asset_poc.py` (`explicit_tx`, `unconfidential`, `explicit_utxo`).
-5. **C5** + `test_unilateral_close[opener|peer]`; stretch: `test_htlc_onchain`,
+5. **C5** + `test_unilateral_close[opener|peer]` (no HTLC in flight; the HTLC, penalty
+   and HTLC-tx sweep kinds are ported but exercised only by the branch's tests so far);
+   stretch: `test_htlc_onchain`,
    `test_penalty` (adapted from the branch).
 6. `git diff --stat master` → real numbers into DESIGN.md §4; port `run-tests.sh` for
    macOS Docker runs.
@@ -220,10 +246,17 @@ Reuse map (`git show liquid-merged:<path>`): `common/liquid_asset.[ch]`,
 - Elements relay policy: min relay fee and absence of package relay (ask the Elements
   team). If package relay exists/lands, the reserve shrinks to the anchors alone and the
   commitment fee can be 0.
-- `walletcreatefundedpsbt` with asset outputs + blinded change; `fundchannel_complete`
-  accepting the PSET; `createinvoice` preserving an unknown tagged field (v2 invoices).
+- ~~`walletcreatefundedpsbt` with asset outputs + blinded change~~ (replaced by the
+  explicit `createpsbt` flow, §5); `fundchannel_complete` accepts the PSET (verified on
+  liquid-regtest); `createinvoice` preserving an unknown tagged field (v2 invoices).
 - Fixed fee wastes reserve − anchors on every close: acceptable at 2,000 sat; a change
-  output to the opener (as on the branch) is a later refinement.
+  output to the opener (as on the branch) is a later refinement. Core only requires
+  reserve > 660 sat (the anchors); whether the rest relays is the plugin's policy
+  (`assetchan-min-fee-reserve`), so a node must not accept reserves below Liquid's
+  relay floor for the largest commitment it allows.
+- The affordability checks (`full_channel.c`, `channeld`, `openingd`) still reserve
+  660 "sat" for anchors out of the opener's balance; on an asset channel those are asset
+  units the opener can't spend. Harmless, but wrong by 660 units; a later cleanup.
 - Dust limit / `htlc_minimum` are negotiated in "satoshis" but mean asset units:
   plugin policy per asset later.
 - Without gossip, asset channels are private (route hints); per-asset gossip is a later
