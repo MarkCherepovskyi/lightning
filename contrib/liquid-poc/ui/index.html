@@ -239,12 +239,13 @@ pre.log { margin: 12px 0 0; padding: 12px 16px; background: var(--bg); border-to
         <label>From<select id="payinvoice-node" name="node"></select></label>
         <label>Invoice string<textarea id="payinvoice-invoice" name="invoice" rows="3" spellcheck="false" autocomplete="off" placeholder="paste the invoice from Request invoice" required></textarea></label>
         <p class="hint mono" id="payinvoice-rate"></p>
+        <label>Asset to pay with<select id="payinvoice-asset" name="from_asset"></select></label>
         <label>Tier<select id="payinvoice-tier" name="tier">
           <option value="low">Low</option>
           <option value="medium" selected>Medium</option>
           <option value="high">High</option>
         </select></label>
-        <p class="hint">Pays an invoice from Request invoice. If this node doesn't hold the asset
+        <p class="hint" id="payinvoice-asset-hint">Pays an invoice from Request invoice. If this node doesn't hold the asset
           it requires, it swaps through bob (the configured provider) at this tier.</p>
         <button class="btn" type="submit">Pay invoice</button>
       </form>
@@ -543,6 +544,11 @@ function renderSelects() {
   fill('#invoice-asset', swapAssets);
   $('#invoice-rate').textContent = swapQuoteAllTiers($('#invoice-asset').value,
     Number($('#invoice-units').value) * 1000);
+  // Same narrow L-BTC/PoC-asset list as #invoice-asset, plus "Auto": direct
+  // payment if it matches the invoice's own asset, swap priced in it
+  // otherwise -- see assetswap-plugin/src/pay.rs's payassetinvoice doc
+  // comment for the full from_asset contract.
+  fill('#payinvoice-asset', [['', 'Auto (recommended)']].concat(swapAssets));
   renderPayInvoiceRate();
   fill('#close-chan', S.channels.filter(c => c.state === 'open').map(c => [c.id, `${c.a} ⇄ ${c.b} · ${label(c.asset)} · ${n(c.a_units)} | ${n(c.b_units)}`]));
   $('#open-hint').textContent = $('#open-asset').value === 'lbtc'
@@ -558,9 +564,11 @@ function renderSelects() {
 
 function renderPayInvoiceRate() {
   const el = $('#payinvoice-rate'), dec = decodeAssetInvoice($('#payinvoice-invoice').value);
-  el.textContent = dec
-    ? `Requires ${n(dec.amount_msat)} msat of ${swapLabel(dec.asset)}. ${swapQuoteLine(dec.asset, dec.amount_msat, $('#payinvoice-tier').value)}`
-    : '';
+  if (!dec) { el.textContent = ''; return; }
+  const chosen = $('#payinvoice-asset').value, base = `Requires ${n(dec.amount_msat)} msat of ${swapLabel(dec.asset)}.`;
+  el.textContent = chosen && chosen === dec.asset
+    ? `${base} Paying directly in ${swapLabel(chosen)} -- no swap.`
+    : `${base} ${swapQuoteLine(dec.asset, dec.amount_msat, $('#payinvoice-tier').value)}`;
 }
 
 const fmtTime = s => s >= 60 ? `${Math.floor(s / 60)} min ${Math.round(s % 60)} s` : `${Math.round(s)} s`;
@@ -616,6 +624,7 @@ document.addEventListener('change', e => { if (S && e.target.matches('#open-asse
 document.addEventListener('input', e => { if (S && e.target.matches('#invoice-units')) renderSelects(); });
 $('#payinvoice-invoice').addEventListener('input', () => { if (S) renderPayInvoiceRate(); });
 $('#payinvoice-tier').addEventListener('change', () => { if (S) renderPayInvoiceRate(); });
+$('#payinvoice-asset').addEventListener('change', () => { if (S) renderPayInvoiceRate(); });
 document.addEventListener('click', e => {
   const c = e.target.closest('[data-close]');
   if (c) { showTab('close'); $('#close-chan').value = c.dataset.close; $('#close-chan').focus(); }

@@ -766,15 +766,24 @@ def cmd_quoteassetinvoice(args):
 
 
 def cmd_payassetinvoice(args):
-    """Pay an assetinvoice string from node, swapping via a configured
-    provider if node doesn't hold the required asset directly. node's own
-    local pricetiers-plugin can't price the swap unless node is itself a
-    provider (see assetswap-plugin/src/pay.rs's doc comment), so unless
-    --from-asset/--from-amount-msat were given explicitly, ask a real
-    provider for one via swap_quote() instead of leaving it to fail."""
+    """Pay an assetinvoice string from node. --from-asset (optional) is
+    which asset to pay WITH: omitted, automatic (direct payment in the
+    invoice's own asset, falling back to a swap only if that fails);
+    given and it's the invoice's own asset, direct-only, no swap fallback;
+    given and it's something else, swap-only, priced in that asset (see
+    assetswap-plugin/src/pay.rs's doc comment for the full RPC contract).
+    node's own local pricetiers-plugin can't price a swap unless node is
+    itself a provider, so unless --from-amount-msat was given explicitly,
+    ask a real provider for one via swap_quote() -- used for a swap
+    (automatic, or an explicitly different --from-asset), ignored for a
+    direct payment, which needs no amount at all."""
     from_asset, from_amount_msat = getattr(args, 'from_asset', None), getattr(args, 'from_amount_msat', None)
-    if from_asset is None and from_amount_msat is None:
-        from_asset, from_amount_msat = swap_quote(args.assetinvoice, args.tier)
+    if from_amount_msat is None:
+        quoted_asset, quoted_amount = swap_quote(args.assetinvoice, args.tier)
+        if from_asset is None:
+            from_asset, from_amount_msat = quoted_asset, quoted_amount
+        elif from_asset == quoted_asset:
+            from_amount_msat = quoted_amount
     res = ln(args.node, 'payassetinvoice', assetinvoice=args.assetinvoice, tier=args.tier,
              from_asset=from_asset, from_amount_msat=from_amount_msat)
     print(f"paid {res['amount_msat']} msat, preimage {res['payment_preimage']}")
@@ -1147,8 +1156,10 @@ def main():
     sp.add_argument('node', choices=NODES)
     sp.add_argument('assetinvoice')
     sp.add_argument('--tier', choices=['low', 'medium', 'high'], default='medium')
-    sp.add_argument('--from-asset', help="skip node's own local pricetiers lookup: asset id, or 'lbtc'")
-    sp.add_argument('--from-amount-msat', type=int, help='paired with --from-asset')
+    sp.add_argument('--from-asset', help="which asset to pay with: asset id, or 'lbtc'. "
+                    "Omit for automatic (direct, falling back to a swap).")
+    sp.add_argument('--from-amount-msat', type=int, help='exact leg-1 amount for --from-asset, '
+                    'skipping the quote lookup')
     sp = add('swap', cmd_swap,
              'invoice on `to` requiring asset, pay it from `frm` (swapping via its provider if needed)')
     sp.add_argument('frm', choices=NODES)
