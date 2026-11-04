@@ -207,6 +207,12 @@ struct channel {
 	struct bitcoin_outpoint funding;
 	struct amount_sat funding_sats;
 
+	/* asset channel: funding_sats are units of this asset
+	 * (33-byte tag, NULL for an ordinary channel), and the opener put
+	 * fee_reserve of L-BTC at funding.n + 1 to pay fees. */
+	u8 *asset;
+	struct amount_sat fee_reserve;
+
 	/* Watch we have on funding output. */
 	struct txowatch *funding_spend_watch;
 

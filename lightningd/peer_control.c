@@ -6,6 +6,7 @@
 #include <ccan/tal/str/str.h>
 #include <channeld/channeld_wiregen.h>
 #include <common/addr.h>
+#include <common/channel_asset.h>
 #include <common/channel_id.h>
 #include <common/features.h>
 #include <common/htlc_trim.h>
@@ -251,7 +252,7 @@ static struct bitcoin_tx *sign_last_tx(const tal_t *ctx,
 				       const struct bitcoin_signature *last_sig)
 {
 	struct lightningd *ld = channel->peer->ld;
-	struct bitcoin_signature sig;
+	struct bitcoin_signature sig, reserve_sig, *their_reserve_sig;
 	const u8 *msg;
 	u8 **witness;
 	u64 commit_index = channel->next_index[LOCAL] - 1;
@@ -267,7 +268,38 @@ static struct bitcoin_tx *sign_last_tx(const tal_t *ctx,
 					     commit_index);
 
 	msg = hsm_sync_req(tmpctx, ld, take(msg));
-	if (!fromwire_hsmd_sign_commitment_tx_reply(msg, &sig))
+	/* Asset channel txs also spend the fee reserve (input 1), and hsmd
+	 * signs that too. */
+	if (fromwire_hsmd_sign_asset_commitment_tx_reply(msg, &sig,
+							 &reserve_sig)) {
+		/* A mutual close tx comes with input 1 complete (closingd
+		 * does it, and from the db it's only in the PSBT); a
+		 * commitment tx has their sig in the PSBT. */
+		if (tx->psbt->inputs[1].final_witness
+		    && !tx->wtx->inputs[1].witness) {
+			tal_wally_start();
+			wally_tx_set_input_witness(tx->wtx, 1,
+						   tx->psbt->inputs[1].final_witness);
+			tal_wally_end(tx->wtx);
+		} else if (!tx->wtx->inputs[1].witness) {
+			if (!psbt_input_get_ecdsa_sig(tmpctx, tx->psbt, 1,
+						      &channel->channel_info.remote_fundingkey,
+						      &their_reserve_sig)
+			    || !their_reserve_sig)
+				log_broken(channel->log,
+					   "No peer signature for the fee"
+					   " reserve input of %s: it won't"
+					   " be accepted!",
+					   fmt_bitcoin_tx(tmpctx, tx));
+			else
+				bitcoin_tx_input_set_witness(tx, 1,
+					take(bitcoin_witness_2of2(NULL,
+								  their_reserve_sig,
+								  &reserve_sig,
+								  &channel->channel_info.remote_fundingkey,
+								  &channel->local_funding_pubkey)));
+		}
+	} else if (!fromwire_hsmd_sign_commitment_tx_reply(msg, &sig))
 		fatal("HSM gave bad sign_commitment_tx_reply %s",
 		      tal_hex(tmpctx, msg));
 
@@ -1068,6 +1100,12 @@ static void NON_NULL_ARGS(1, 2, 4, 5) json_add_channel(struct command *cmd,
 			fmt_channel_id(tmpctx, &channel->cid));
 	json_add_txid(response, "funding_txid", &channel->funding.txid);
 	json_add_num(response, "funding_outnum", channel->funding.n);
+	if (channel->asset) {
+		json_add_string(response, "asset",
+				fmt_channel_asset(tmpctx, channel->asset));
+		json_add_amount_sat_msat(response, "fee_reserve_msat",
+					 channel->fee_reserve);
+	}
 
 	has_valid_inflights = false;
 	if (!list_empty(&channel->inflights)) {
@@ -2836,12 +2874,13 @@ void channel_watch_funding(struct lightningd *ld, struct channel *channel)
 								&channel->local_funding_pubkey,
 								&channel->channel_info.remote_fundingkey);
 
-		watch_scriptpubkey(channel, ld->topology,
-				   take(scriptpubkey_p2wsh(NULL, funding_wscript)),
-				   &channel->funding,
-				   channel->funding_sats,
-				   channel_funding_found,
-				   channel);
+		watch_scriptpubkey_asset(channel, ld->topology,
+					 take(scriptpubkey_p2wsh(NULL, funding_wscript)),
+					 &channel->funding,
+					 channel->funding_sats,
+					 channel->asset,
+					 channel_funding_found,
+					 channel);
 	}
 
 	/* We watch for closing of course. */

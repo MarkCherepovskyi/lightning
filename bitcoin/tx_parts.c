@@ -48,12 +48,11 @@ struct tx_parts *tx_parts_from_wally_tx(const tal_t *ctx,
 		 * number of times */
 		if (chainparams->is_elements) {
 			struct amount_asset asset;
-			struct amount_sat sats;
 			asset = wally_tx_output_get_amount(txp->outputs[i]);
-			/* FIXME: non l-btc assets */
-			assert(amount_asset_is_main(&asset));
-			sats = amount_asset_to_sat(&asset);
-			txp->outputs[i]->satoshi = sats.satoshis; /* Raw: wally conversion */
+			/* Outputs in other (issued) assets keep their own value:
+			 * asserting here would let anyone spending a watched
+			 * output crash us. */
+			txp->outputs[i]->satoshi = asset.value;
 		}
 	}
 	tal_wally_end(txp);

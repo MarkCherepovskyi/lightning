@@ -107,6 +107,11 @@ struct funding_channel {
 
 	/* Were we told to withhold the commitment tx? */
 	bool withheld;
+
+	/* asset channel (NULL: ordinary L-BTC channel), and the
+	 * L-BTC fee reserve we put at funding output + 1. */
+	const u8 *asset;
+	struct amount_sat fee_reserve;
 };
 
 struct uncommitted_channel *new_uncommitted_channel(struct peer *peer);

@@ -1513,7 +1513,8 @@ static void handle_onchaind_spend_htlc_success(struct channel *channel,
 	 * * locktime: `0` for HTLC-success, `cltv_expiry` for HTLC-timeout
 	 */
 	tx = htlc_tx(NULL, chainparams, &out, info->wscript, out_sats, htlc_wscript, fee,
-		     0, option_anchor_outputs, option_anchors_zero_fee_htlc_tx);
+		     0, option_anchor_outputs, option_anchors_zero_fee_htlc_tx,
+		     channel->asset);
 	tal_free(htlc_wscript);
 	if (!tx) {
 		/* Can only happen if fee > out_sats */
@@ -1593,7 +1594,8 @@ static void handle_onchaind_spend_htlc_timeout(struct channel *channel,
 	 * * locktime: `0` for HTLC-success, `cltv_expiry` for HTLC-timeout
 	 */
 	tx = htlc_tx(NULL, chainparams, &out, info->wscript, out_sats, htlc_wscript, fee,
-		     cltv_expiry, option_anchor_outputs, option_anchors_zero_fee_htlc_tx);
+		     cltv_expiry, option_anchor_outputs, option_anchors_zero_fee_htlc_tx,
+		     channel->asset);
 	tal_free(htlc_wscript);
 	if (!tx) {
 		/* Can only happen if fee > out_sats */
@@ -1919,7 +1921,8 @@ enum watch_result onchaind_funding_spent(struct channel *channel,
 				  channel->static_remotekey_start[REMOTE],
 				   channel_has(channel, OPT_ANCHOR_OUTPUTS_DEPRECATED),
 				   channel_has(channel, OPT_ANCHORS_ZERO_FEE_HTLC_TX),
-				  feerate_min(ld, NULL));
+				  feerate_min(ld, NULL),
+				  channel->asset);
 	subd_send_msg(channel->owner, take(msg));
 
 	/* If we're replaying, we just watch this */

@@ -5,6 +5,7 @@
 #include <ccan/tal/str/str.h>
 #include <closingd/simpleclosed_wiregen.h>
 #include <common/features.h>
+#include <common/channel_asset.h>
 #include <common/fee_states.h>
 #include <common/memleak.h>
 #include <common/shutdown_scriptpubkey.h>
@@ -44,7 +45,18 @@ const char *close_tx_check(const tal_t *ctx,
 {
 	bool local_matched = false, remote_matched = false;
 
-	if (tx->wtx->num_inputs != 1)
+	if (channel->asset) {
+		/* Asset channel: input 1 spends the L-BTC fee reserve. */
+		struct bitcoin_outpoint reserve
+			= fee_reserve_outpoint(&channel->funding);
+
+		if (tx->wtx->num_inputs != 2)
+			return tal_fmt(ctx, "expected 2 inputs, got %zu",
+				       tx->wtx->num_inputs);
+		if (!wally_tx_input_spends(&tx->wtx->inputs[1], &reserve))
+			return tal_fmt(ctx, "input 1 does not spend fee reserve %s",
+				       fmt_bitcoin_outpoint(ctx, &reserve));
+	} else if (tx->wtx->num_inputs != 1)
 		return tal_fmt(ctx, "expected 1 input, got %zu",
 			tx->wtx->num_inputs);
 

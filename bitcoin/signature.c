@@ -128,7 +128,9 @@ void bitcoin_tx_hash_for_sig(const struct bitcoin_tx *tx, unsigned int in,
 	struct amount_sat input_amt;
 	int flags = WALLY_TX_FLAG_USE_WITNESS;
 
-	input_amt = psbt_input_get_amount(tx->psbt, in);
+	/* Elements: the input may be in an issued asset, signatures commit
+	 * to its value either way. */
+	input_amt = psbt_input_get_value(tx->psbt, in);
 	input_val_sats = input_amt.satoshis; /* Raw: type conversion */
 
 	/* Wally can allocate here, iff tx doesn't fit on stack */

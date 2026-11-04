@@ -48,6 +48,9 @@ msgdata,onchaind_init,option_anchor_outputs,bool,
 msgdata,onchaind_init,option_anchors_zero_fee_htlc_tx,bool,
 # We need this for BIP125 rule 4
 msgdata,onchaind_init,min_relay_feerate,u32,
+# Asset channel: the channel asset tag (empty for an ordinary channel)
+msgdata,onchaind_init,asset_len,u16,
+msgdata,onchaind_init,asset,u8,asset_len
 
 # This says we're ready; give us htlcs and preimages.
 msgtype,onchaind_init_reply,5101

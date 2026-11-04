@@ -582,18 +582,24 @@ static struct msg_revoke_and_ack *fromwire_struct_revoke_and_ack(const tal_t *ct
 static void *towire_struct_funding_signed(const tal_t *ctx,
 					  const struct msg_funding_signed *s)
 {
+	struct tlv_funding_signed_tlvs *tlvs;
+
+	tlvs = tlv_funding_signed_tlvs_new(ctx);
 	return towire_funding_signed(ctx,
 				     &s->temporary_channel_id,
-				     &s->signature);
+				     &s->signature,
+				     tlvs);
 }
 
 static struct msg_funding_signed *fromwire_struct_funding_signed(const tal_t *ctx, const void *p)
 {
 	struct msg_funding_signed *s = tal(ctx, struct msg_funding_signed);
+	struct tlv_funding_signed_tlvs *tlvs;
 
-	if (fromwire_funding_signed(p,
+	if (fromwire_funding_signed(ctx, p,
 				    &s->temporary_channel_id,
-				    &s->signature))
+				    &s->signature,
+				    &tlvs))
 		return s;
 	return tal_free(s);
 }
@@ -649,22 +655,28 @@ static struct msg_shutdown *fromwire_struct_shutdown(const tal_t *ctx, const voi
 static void *towire_struct_funding_created(const tal_t *ctx,
 					  const struct msg_funding_created *s)
 {
+	struct tlv_funding_created_tlvs *tlvs;
+
+	tlvs = tlv_funding_created_tlvs_new(ctx);
 	return towire_funding_created(ctx,
 				      &s->temporary_channel_id,
 				      &s->txid,
 				      s->output_index,
-				      &s->signature);
+				      &s->signature,
+				      tlvs);
 }
 
 static struct msg_funding_created *fromwire_struct_funding_created(const tal_t *ctx, const void *p)
 {
 	struct msg_funding_created *s = tal(ctx, struct msg_funding_created);
+	struct tlv_funding_created_tlvs *tlvs;
 
-	if (fromwire_funding_created(p,
+	if (fromwire_funding_created(ctx, p,
 				     &s->temporary_channel_id,
 				     &s->txid,
 				     &s->output_index,
-				     &s->signature))
+				     &s->signature,
+				     &tlvs))
 		return s;
 	return tal_free(s);
 }

@@ -15,6 +15,7 @@
 #include <ccan/tal/str/str.h>
 #include <common/fee_states.h>
 #include <common/initial_channel.h>
+#include <common/channel_asset.h>
 #include <common/memleak.h>
 #include <common/peer_billboard.h>
 #include <common/peer_failed.h>
@@ -316,6 +317,24 @@ static u8 *funder_channel_start(struct state *state, u8 channel_flags,
 		state->feerate_per_kw = nonanchor_feerate;
 	}
 
+	/* Asset channels are built on anchors (common/channel_asset.h), and
+	 * the peer must know what they are. */
+	if (channel_asset()) {
+		if (!feature_negotiated(state->our_features,
+					state->their_features,
+					OPT_CHANNEL_ASSET)) {
+			negotiation_failed(state,
+					   "Peer does not support asset channels");
+			return NULL;
+		}
+		if (!channel_type_has(state->channel_type,
+				      OPT_ANCHORS_ZERO_FEE_HTLC_TX)) {
+			negotiation_failed(state,
+					   "Asset channels need option_anchors");
+			return NULL;
+		}
+	}
+
 	/* If they use the same settings as us, would we fail?  If so, do that now. */
 	if (!check_config_bounds(tmpctx, state->funding_sats,
 				 state->feerate_per_kw,
@@ -343,6 +362,16 @@ static u8 *funder_channel_start(struct state *state, u8 channel_flags,
 	 *       negotiated.
 	 */
 	open_tlvs->channel_type = state->channel_type->features;
+
+	/* Asset channel: tell them the asset and the size of the fee reserve
+	 * we'll put in. */
+	if (channel_asset()) {
+		open_tlvs->channel_asset
+			= tal_dup_arr(open_tlvs, u8, channel_asset(),
+				      ELEMENTS_ASSET_LEN, 0);
+		open_tlvs->fee_reserve = tal(open_tlvs, struct amount_sat);
+		*open_tlvs->fee_reserve = channel_fee_reserve();
+	}
 
 	msg = towire_open_channel(NULL,
 				  &chainparams->genesis_blockhash,
@@ -419,6 +448,19 @@ static u8 *funder_channel_start(struct state *state, u8 channel_flags,
 	if (!accept_tlvs->channel_type) {
 		negotiation_failed(state,
 				   "accept_channel without a channel_type");
+	}
+
+	/* An asset channel only works if they build the same transactions,
+	 * so they must echo the asset back. */
+	if (!channel_asset_eq(channel_asset(),
+			      channel_asset_or_null(accept_tlvs->channel_asset))) {
+		negotiation_failed(state,
+				   "Peer did not accept asset channel"
+				   " (asset %s)",
+				   channel_asset()
+				   ? fmt_channel_asset(tmpctx,
+						      channel_asset())
+				   : "none");
 	}
 
 	/* BOLT #2:
@@ -546,6 +588,33 @@ static u8 *funder_channel_start(struct state *state, u8 channel_flags,
 						  state->channel_type);
 }
 
+/* Read hsmd's reply to hsmd_sign_remote_commitment_tx.  For asset channels
+ * hsmd also signs the fee reserve input; that signature goes to the peer in
+ * a TLV. */
+static void read_remote_commitment_sigs(const tal_t *ctx,
+					struct bitcoin_signature *sig,
+					secp256k1_ecdsa_signature **fee_reserve_sig)
+{
+	const u8 *msg = wire_sync_read(tmpctx, HSM_FD);
+	struct bitcoin_signature reserve_sig;
+
+	*fee_reserve_sig = NULL;
+	if (!channel_asset()) {
+		if (!fromwire_hsmd_sign_tx_reply(msg, sig))
+			status_failed(STATUS_FAIL_HSM_IO, "Bad sign_tx_reply %s",
+				      tal_hex(tmpctx, msg));
+		return;
+	}
+
+	if (!fromwire_hsmd_sign_asset_commitment_tx_reply(msg, sig,
+							  &reserve_sig))
+		status_failed(STATUS_FAIL_HSM_IO,
+			      "Bad sign_asset_commitment_tx_reply %s",
+			      tal_hex(tmpctx, msg));
+	*fee_reserve_sig = tal_dup(ctx, secp256k1_ecdsa_signature,
+				   &reserve_sig.s);
+}
+
 static bool funder_finalize_channel_setup(struct state *state,
 					  struct amount_msat local_msat,
 					  struct bitcoin_signature *sig,
@@ -558,6 +627,9 @@ static bool funder_finalize_channel_setup(struct state *state,
 	struct channel_id cid;
 	char *err_reason;
 	struct wally_tx_output *direct_outputs[NUM_SIDES];
+	struct tlv_funding_created_tlvs *created_tlvs
+		= tlv_funding_created_tlvs_new(tmpctx);
+	struct tlv_funding_signed_tlvs *signed_tlvs;
 
 	/*~ Channel is ready; Report the channel parameters to the signer. */
 	msg = towire_hsmd_setup_channel(NULL,
@@ -661,10 +733,8 @@ static bool funder_finalize_channel_setup(struct state *state,
 						    feerate);
 
 	wire_sync_write(HSM_FD, take(msg));
-	msg = wire_sync_read(tmpctx, HSM_FD);
-	if (!fromwire_hsmd_sign_tx_reply(msg, sig))
-		status_failed(STATUS_FAIL_HSM_IO, "Bad sign_tx_reply %s",
-			      tal_hex(tmpctx, msg));
+	read_remote_commitment_sigs(created_tlvs, sig,
+				    &created_tlvs->fee_reserve_sig);
 
 	/* You can tell this has been a problem before, since there's a debug
 	 * message here: */
@@ -679,7 +749,8 @@ static bool funder_finalize_channel_setup(struct state *state,
 	msg = towire_funding_created(state, &state->channel_id,
 				     &state->funding.txid,
 				     state->funding.n,
-				     &sig->s);
+				     &sig->s,
+				     created_tlvs);
 	peer_write(state->pps, msg);
 
 	/* BOLT #2:
@@ -702,7 +773,8 @@ static bool funder_finalize_channel_setup(struct state *state,
 		goto fail;
 
 	sig->sighash_type = SIGHASH_ALL;
-	if (!fromwire_funding_signed(msg, &id_in, &sig->s))
+	if (!fromwire_funding_signed(tmpctx, msg, &id_in, &sig->s,
+				     &signed_tlvs))
 		peer_failed_err(state->pps, &state->channel_id,
 				"Parsing funding_signed: %s", tal_hex(msg, msg));
 	/* BOLT #2:
@@ -776,6 +848,15 @@ static bool funder_finalize_channel_setup(struct state *state,
 		status_failed(STATUS_FAIL_INTERNAL_ERROR,
 			      "Unable to set signature internally");
 
+	/* asset channel: and their sig for the fee reserve. */
+	if (channel_asset()
+	    && !check_fee_reserve_sig(*tx, wscript,
+					     &state->their_funding_pubkey,
+					     signed_tlvs->fee_reserve_sig))
+		peer_failed_err(state->pps, &state->channel_id,
+				"Bad or missing fee_reserve_sig on tx %s",
+				fmt_bitcoin_tx(tmpctx, *tx));
+
 	peer_billboard(false, "Funding channel: opening negotiation succeeded");
 
 	return true;
@@ -847,6 +928,8 @@ static u8 *fundee_channel(struct state *state, const u8 *open_channel_msg)
 	struct penalty_base *pbase;
 	struct tlv_accept_channel_tlvs *accept_tlvs;
 	struct tlv_open_channel_tlvs *open_tlvs;
+	struct tlv_funding_created_tlvs *created_tlvs;
+	struct tlv_funding_signed_tlvs *signed_tlvs;
 	struct amount_sat *reserve;
 	u32 min_feerate, max_feerate;
 
@@ -882,6 +965,28 @@ static u8 *fundee_channel(struct state *state, const u8 *open_channel_msg)
 				    "Parsing open_channel %s", tal_hex(tmpctx, open_channel_msg));
 	set_remote_upfront_shutdown(state, open_tlvs->upfront_shutdown_script);
 
+	/* Asset channel?  Its balance is in the asset, and the opener puts up
+	 * a fee reserve next to the funding output (common/channel_asset.h). */
+	if (open_tlvs->channel_asset) {
+		if (!feature_offered(state->our_features->bits[INIT_FEATURE],
+				     OPT_CHANNEL_ASSET)) {
+			negotiation_failed(state,
+					   "Asset channels not enabled"
+					   " (channel-asset)");
+			return NULL;
+		}
+		if (!chainparams->is_elements
+		    || !channel_asset_or_null(open_tlvs->channel_asset)
+		    || !open_tlvs->fee_reserve) {
+			negotiation_failed(state,
+					   "Bad asset channel request");
+			return NULL;
+		}
+		channel_asset_set(open_tlvs->channel_asset,
+				  *open_tlvs->fee_reserve);
+	} else
+		channel_asset_set(NULL, AMOUNT_SAT(0));
+
 	/* BOLT #2:
 	 *  - if the message doesn't include a `channel_type`:
 	 *    - fail the channel.
@@ -912,6 +1017,14 @@ static u8 *fundee_channel(struct state *state, const u8 *open_channel_msg)
 							   open_tlvs->channel_type));
 			return NULL;
 		}
+	}
+
+	/* Asset channels are built on anchors (common/channel_asset.h). */
+	if (channel_asset()
+	    && !channel_type_has(state->channel_type,
+				 OPT_ANCHORS_ZERO_FEE_HTLC_TX)) {
+		negotiation_failed(state, "Asset channels need option_anchors");
+		return NULL;
 	}
 
 	/* BOLT #2:
@@ -1032,7 +1145,10 @@ static u8 *fundee_channel(struct state *state, const u8 *open_channel_msg)
 				       state->remoteconf.max_accepted_htlcs,
 				       channel_flags,
 				       state->upfront_shutdown_script[REMOTE],
-				       state->channel_type);
+				       state->channel_type,
+				       channel_asset_dup(tmpctx, channel_asset()),
+				       channel_asset()
+				       ? channel_fee_reserve() : AMOUNT_SAT(0));
 	wire_sync_write(REQ_FD, take(msg));
 	msg = wire_sync_read(tmpctx, REQ_FD);
 
@@ -1085,6 +1201,11 @@ static u8 *fundee_channel(struct state *state, const u8 *open_channel_msg)
 	 *  - MUST set `channel_type` to the `channel_type` from `open_channel`
 	 */
 	accept_tlvs->channel_type = state->channel_type->features;
+	/* confirm we'll run it as an asset channel. */
+	if (channel_asset())
+		accept_tlvs->channel_asset
+			= tal_dup_arr(accept_tlvs, u8, channel_asset(),
+				      ELEMENTS_ASSET_LEN, 0);
 
 	msg = towire_accept_channel(NULL, &state->channel_id,
 				    state->localconf.dust_limit,
@@ -1115,10 +1236,11 @@ static u8 *fundee_channel(struct state *state, const u8 *open_channel_msg)
 	/* The message should be "funding_created" which tells us what funding
 	 * tx they generated; the sighash type is implied, so we set it here. */
 	theirsig.sighash_type = SIGHASH_ALL;
-	if (!fromwire_funding_created(msg, &id_in,
+	if (!fromwire_funding_created(tmpctx, msg, &id_in,
 				      &state->funding.txid,
 				      &funding_txout,
-				      &theirsig.s))
+				      &theirsig.s,
+				      &created_tlvs))
 		peer_failed_err(state->pps, &state->channel_id,
 			    "Parsing funding_created");
 	/* We only allow 16 bits for this on the wire. */
@@ -1224,6 +1346,16 @@ static u8 *fundee_channel(struct state *state, const u8 *open_channel_msg)
 					       &their_funding_pubkey));
 	}
 
+	/* asset channel: check their sig for the fee reserve too,
+	 * and keep it with our first commitment tx. */
+	if (channel_asset()
+	    && !check_fee_reserve_sig(local_commit, wscript,
+					     &their_funding_pubkey,
+					     created_tlvs->fee_reserve_sig))
+		peer_failed_err(state->pps, &state->channel_id,
+				"Bad or missing fee_reserve_sig on tx %s",
+				fmt_bitcoin_tx(tmpctx, local_commit));
+
 	/* BOLT #2:
 	 *
 	 * This message introduces the `channel_id` to identify the
@@ -1271,15 +1403,15 @@ static u8 *fundee_channel(struct state *state, const u8 *open_channel_msg)
 						   feerate);
 
 	wire_sync_write(HSM_FD, take(msg));
-	msg = wire_sync_read(tmpctx, HSM_FD);
-	if (!fromwire_hsmd_sign_tx_reply(msg, &sig))
-		status_failed(STATUS_FAIL_HSM_IO,
-			      "Bad sign_tx_reply %s", tal_hex(tmpctx, msg));
+	signed_tlvs = tlv_funding_signed_tlvs_new(tmpctx);
+	read_remote_commitment_sigs(signed_tlvs, &sig,
+				    &signed_tlvs->fee_reserve_sig);
 
 	/* We don't send this ourselves: channeld does, because master needs
 	 * to save state to disk before doing so. */
 	assert(sig.sighash_type == SIGHASH_ALL);
-	msg = towire_funding_signed(state, &state->channel_id, &sig.s);
+	msg = towire_funding_signed(state, &state->channel_id, &sig.s,
+				    signed_tlvs);
 
 	if (direct_outputs[LOCAL] != NULL)
 		pbase = penalty_base_new(tmpctx, 0, remote_commit,
@@ -1307,7 +1439,11 @@ static u8 *fundee_channel(struct state *state, const u8 *open_channel_msg)
 				     state->localconf.channel_reserve,
 				     state->upfront_shutdown_script[LOCAL],
 				     state->upfront_shutdown_script[REMOTE],
-				     state->channel_type);
+				     state->channel_type,
+				     channel_asset_dup(tmpctx,
+						      channel_asset()),
+				     channel_asset()
+				     ? channel_fee_reserve() : AMOUNT_SAT(0));
 }
 
 /*~ Standard "peer sent a message, handle it" demuxer.  Though it really only
@@ -1374,6 +1510,8 @@ static u8 *handle_master_in(struct state *state)
 	u16 funding_txout;
 	u32 nonanchor_feerate, anchor_feerate;
 	struct channel_type *ctype;
+	u8 *asset;
+	struct amount_sat fee_reserve;
 
 	switch (t) {
 	case WIRE_OPENINGD_FUNDER_START:
@@ -1387,8 +1525,13 @@ static u8 *handle_master_in(struct state *state)
 						    &state->channel_id,
 						    &channel_flags,
 						    &state->reserve,
-						    &ctype))
+						    &ctype,
+						    &asset,
+						    &fee_reserve))
 			master_badmsg(WIRE_OPENINGD_FUNDER_START, msg);
+		channel_asset_set(channel_asset_or_null(asset),
+					 fee_reserve);
+		tal_free(asset);
 		msg = funder_channel_start(state, channel_flags, nonanchor_feerate, anchor_feerate, ctype);
 		tal_free(ctype);
 

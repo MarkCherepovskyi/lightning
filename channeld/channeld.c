@@ -26,6 +26,7 @@
 #include <common/ecdh_hsmd.h>
 #include <common/interactivetx.h>
 #include <common/key_derive.h>
+#include <common/channel_asset.h>
 #include <common/memleak.h>
 #include <common/msg_queue.h>
 #include <common/onionreply.h>
@@ -1064,13 +1065,14 @@ static struct bitcoin_signature *calc_commitsigs(const tal_t *ctx,
 						  u64 commit_index,
 						  const struct pubkey *remote_per_commit,
 						  struct bitcoin_signature *commit_sig,
+						  secp256k1_ecdsa_signature **fee_reserve_sig,
 						  struct pubkey remote_funding_pubkey)
 {
 	struct hsm_htlc *htlcs;
 	size_t i;
 	struct pubkey local_htlckey;
 	const u8 *msg;
-	struct bitcoin_signature *htlc_sigs;
+	struct bitcoin_signature *htlc_sigs, reserve_sig;
 
 	status_debug("calc_commitsigs(%p, %p, %p, %p, %p, %d, %p, %p)",
 		     ctx, peer, txs, funding_wscript, htlc_map,
@@ -1087,7 +1089,19 @@ static struct bitcoin_signature *calc_commitsigs(const tal_t *ctx,
 						    channel_feerate(peer->channel, REMOTE));
 
 	msg = hsm_req(tmpctx, take(msg));
-	if (!fromwire_hsmd_sign_tx_reply(msg, commit_sig))
+	/* For asset channels hsmd also signs the fee reserve input, and
+	 * that signature goes to the peer in a TLV. */
+	*fee_reserve_sig = NULL;
+	if (channel_asset()) {
+		if (!fromwire_hsmd_sign_asset_commitment_tx_reply(msg,
+								  commit_sig,
+								  &reserve_sig))
+			status_failed(STATUS_FAIL_HSM_IO,
+				      "Reading sign_remote_commitment_tx reply: %s",
+				      tal_hex(tmpctx, msg));
+		*fee_reserve_sig = tal_dup(ctx, secp256k1_ecdsa_signature,
+					   &reserve_sig.s);
+	} else if (!fromwire_hsmd_sign_tx_reply(msg, commit_sig))
 		status_failed(STATUS_FAIL_HSM_IO,
 			      "Reading sign_remote_commitment_tx reply: %s",
 			      tal_hex(tmpctx, msg));
@@ -1308,6 +1322,7 @@ static u8 *send_commit_part(const tal_t *ctx,
 	htlc_sigs =
 	    calc_commitsigs(tmpctx, peer, txs, funding_wscript, htlc_map,
 			    remote_index, remote_per_commit, &commit_sig,
+			    &cs_tlv->fee_reserve_sig,
 			    remote_funding_pubkey);
 
 	if (direct_outputs[LOCAL] != NULL) {
@@ -2251,6 +2266,16 @@ static struct commitsig_info *handle_peer_commit_sig(struct peer *peer,
 				      &commit_sig))
 		status_failed(STATUS_FAIL_INTERNAL_ERROR,
 			      "Unable to set signature internally");
+
+	/* Asset channel: and their sig for the fee reserve input. */
+	if (channel_asset()
+	    && !check_fee_reserve_sig(txs[0], funding_wscript,
+				      &remote_funding,
+				      cs_tlv->fee_reserve_sig))
+		peer_failed_warn(peer->pps, &peer->channel_id,
+				 "Bad or missing fee_reserve_sig %"PRIu64
+				 " for tx %s",
+				 local_index, fmt_bitcoin_tx(msg, txs[0]));
 
 	if (!derive_simple_key(&peer->channel->basepoints[REMOTE].htlc,
 			       local_per_commit, &remote_htlckey))
@@ -4344,6 +4369,12 @@ static void splice_accepter(struct peer *peer, const u8 *inmsg)
 	enum peer_wire type;
 	struct tlv_tx_init_rbf_tlvs *init_rbf_tlvs;
 	struct tlv_tx_ack_rbf_tlvs *ack_rbf_tlvs;
+
+	/* Asset channels fund two outputs (common/channel_asset.h), which
+	 * splicing doesn't rebuild. */
+	if (channel_asset())
+		peer_failed_warn(peer->pps, &peer->channel_id,
+				 "Asset channels cannot be spliced");
 
 	if (peer->splicing)
 		peer_failed_warn(peer->pps, &peer->channel_id, "You can't start"
@@ -7042,6 +7073,8 @@ static void init_channel(struct peer *peer)
 	struct penalty_base *pbases;
 	struct channel_type *channel_type;
 	bool found_locked_inflight;
+	u8 *asset;
+	struct amount_sat fee_reserve;
 
 	assert(!(fcntl(MASTER_FD, F_GETFL) & O_NONBLOCK));
 
@@ -7102,9 +7135,14 @@ static void init_channel(struct peer *peer)
 				    &peer->dev_disable_commit,
 				    &pbases,
 				    &peer->splice_state->inflights,
-				    &peer->local_alias)) {
+				    &peer->local_alias,
+				    &asset,
+				    &fee_reserve)) {
 		master_badmsg(WIRE_CHANNELD_INIT, msg);
 	}
+	/* Asset channel (if any) for the tx builders. */
+	channel_asset_set(channel_asset_or_null(asset), fee_reserve);
+	tal_free(asset);
 
 	peer->final_index = tal_dup(peer, u32, &final_index);
 	peer->final_ext_key = tal_dup(peer, struct ext_key, &final_ext_key);

@@ -4,6 +4,7 @@
 #include <common/htlc_trim.h>
 #include <common/htlc_tx.h>
 #include <common/keyset.h>
+#include <common/channel_asset.h>
 #include <common/permute_tx.h>
 
 #ifndef SUPERVERBOSE
@@ -75,7 +76,8 @@ static void add_offered_htlc_out(struct bitcoin_tx *tx, size_t n,
 				       option_anchor_outputs,
 				       option_anchors_zero_fee_htlc_tx);
 	p2wsh = scriptpubkey_p2wsh(tx, wscript);
-	bitcoin_tx_add_output(tx, p2wsh, wscript, amount);
+	bitcoin_tx_add_asset_output(tx, p2wsh, wscript, amount,
+				    channel_asset());
 	SUPERVERBOSE("# HTLC #%" PRIu64 " offered amount %"PRIu64" wscript %s\n", htlc->id,
 		     amount.satoshis, /* Raw: BOLT 3 output match */
 		     tal_hex(wscript, wscript));
@@ -99,7 +101,8 @@ static void add_received_htlc_out(struct bitcoin_tx *tx, size_t n,
 	p2wsh = scriptpubkey_p2wsh(tx, wscript);
 	amount = amount_msat_to_sat_round_down(htlc->amount);
 
-	bitcoin_tx_add_output(tx, p2wsh, wscript, amount);
+	bitcoin_tx_add_asset_output(tx, p2wsh, wscript, amount,
+				    channel_asset());
 
 	SUPERVERBOSE("# HTLC #%"PRIu64" received amount %"PRIu64" wscript %s\n",
 		     htlc->id,
@@ -147,6 +150,9 @@ struct bitcoin_tx *commit_tx(const tal_t *ctx,
 							remote_funding_key);
 	u32 csv_lock = lease_expiry > blockheight ?
 		lease_expiry - blockheight : 1;
+	/* Asset channel?  Then the fee comes from the fee reserve. */
+	const u8 *asset = channel_asset();
+	int outnum[NUM_SIDES] = { -1, -1 };
 
 	if (!amount_msat_add(&total_pay, self_pay, other_pay))
 		abort();
@@ -192,7 +198,9 @@ struct bitcoin_tx *commit_tx(const tal_t *ctx,
 	 * 3. Subtract this base fee from the funder (either `to_local` or
 	 * `to_remote`).
 	 */
-	try_subtract_fee(opener, side, base_fee, &self_pay, &other_pay);
+	/* Asset channels pay the fee (and anchors) from the fee reserve. */
+	if (!asset)
+		try_subtract_fee(opener, side, base_fee, &self_pay, &other_pay);
 
 #ifdef PRINT_ACTUAL_FEE
 	{
@@ -215,8 +223,9 @@ struct bitcoin_tx *commit_tx(const tal_t *ctx,
 	}
 #endif
 
-	/* Worst-case sizing: both to-local and to-remote outputs, and anchors. */
-	tx = bitcoin_tx(ctx, chainparams, 1, untrimmed + 2 + 2, 0);
+	/* Worst-case sizing: both to-local and to-remote outputs, and anchors
+	 * (asset channels also spend the fee reserve). */
+	tx = bitcoin_tx(ctx, chainparams, asset ? 2 : 1, untrimmed + 2 + 2, 0);
 
 	/* We keep track of which outputs have which HTLCs */
 	*htlcmap = tal_arr(tx, const struct htlc *, tx->wtx->outputs_allocation_len);
@@ -289,7 +298,8 @@ struct bitcoin_tx *commit_tx(const tal_t *ctx,
 		u8 *p2wsh = scriptpubkey_p2wsh(tx, wscript);
 		struct amount_sat amount = amount_msat_to_sat_round_down(self_pay);
 
-		bitcoin_tx_add_output(tx, p2wsh, wscript, amount);
+		outnum[side] = bitcoin_tx_add_asset_output(tx, p2wsh, wscript,
+							   amount, asset);
 		/* Add a dummy entry to the htlcmap so we can recognize it later */
 		(*htlcmap)[n] = direct_outputs ? dummy_to_local : NULL;
 		/* We don't assign cltvs[n]: if we use it, order doesn't matter.
@@ -349,8 +359,10 @@ struct bitcoin_tx *commit_tx(const tal_t *ctx,
 			scriptpubkey = scriptpubkey_p2wpkh(tmpctx,
 							   &keyset->other_payment_key);
 		}
-		pos = bitcoin_tx_add_output(tx, scriptpubkey, redeem, amount);
+		pos = bitcoin_tx_add_asset_output(tx, scriptpubkey, redeem,
+						  amount, asset);
 		assert(pos == n);
+		outnum[!side] = pos;
 		(*htlcmap)[n] = direct_outputs ? dummy_to_remote : NULL;
 		/* We don't assign cltvs[n]: if we use it, order doesn't matter.
 		 * However, valgrind will warn us something wierd is happening */
@@ -364,6 +376,12 @@ struct bitcoin_tx *commit_tx(const tal_t *ctx,
 		to_remote = false;
 		redeem = NULL;
 	}
+
+	/* Asset channel: the asset leftovers (trimmed HTLCs, rounding) go to
+	 * the opener, not to fees. */
+	if (asset)
+		channel_asset_finish_tx(tx, funding_sats,
+					outnum[opener], outnum[!opener]);
 
 	/* BOLT #3:
 	 *
@@ -433,8 +451,11 @@ struct bitcoin_tx *commit_tx(const tal_t *ctx,
 	 *    * `txin[0]` sequence: upper 8 bits are 0x80, lower 24 bits are upper 24 bits of the obscured commitment number
 	 */
 	u32 sequence = (0x80000000 | ((obscured_commitment_number>>24) & 0xFFFFFF));
-	bitcoin_tx_add_input(tx, funding,
-			     sequence, NULL, funding_sats, NULL, funding_wscript);
+	bitcoin_tx_add_asset_input(tx, funding,
+				   sequence, NULL, funding_sats, NULL,
+				   funding_wscript, asset);
+	if (asset)
+		add_fee_reserve_input(tx, funding, sequence, funding_wscript);
 
 	/* Identify the direct outputs (to_us, to_them), and the local anchor */
 	if (direct_outputs != NULL)

@@ -8,6 +8,7 @@
 #include <common/ecdh.h>
 #include <common/json_command.h>
 #include <common/json_parse.h>
+#include <common/channel_asset.h>
 #include <common/onion_decode.h>
 #include <common/onionreply.h>
 #include <common/timeout.h>
@@ -838,6 +839,10 @@ struct channel *best_channel(struct lightningd *ld,
 			if (hint->feerate_base != channel->feerate_base
 			    || hint->feerate_ppm != channel->feerate_ppm)
 				continue;
+			/* ... or it's a different asset! */
+			if (!channel_asset_eq(hint->asset,
+					     channel->asset))
+				continue;
 		}
 
 		/* Or if this would be below min for channel! */
@@ -889,6 +894,19 @@ static void forward_htlc(struct htlc_in *hin,
 					 FORWARD_LOCAL_FAILED,
 					 WIRE_UNKNOWN_NEXT_PEER);
 		return;
+	}
+
+	/* Asset channels: amounts are in each channel's asset, so forwarding
+	 * between different assets would swap them 1:1. */
+	if (!channel_asset_eq(hin->key.channel->asset,
+			     next->asset)) {
+		log_info(hin->key.channel->log,
+			 "Refusing to forward between different assets"
+			 " (to %s)",
+			 fmt_short_channel_id(tmpctx,
+					      channel_scid_or_local_alias(next)));
+		failmsg = towire_unknown_next_peer(tmpctx);
+		goto fail;
 	}
 
 	/* BOLT #7:

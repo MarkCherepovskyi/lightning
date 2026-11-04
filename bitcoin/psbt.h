@@ -145,6 +145,11 @@ struct wally_psbt_input *psbt_append_input(struct wally_psbt *psbt,
 void psbt_input_set_wit_utxo(struct wally_psbt *psbt, size_t in,
 			     const u8 *scriptPubkey, struct amount_sat amt);
 
+/* Elements: as above, for an output in @asset (NULL means the fee asset). */
+void psbt_input_set_wit_utxo_asset(struct wally_psbt *psbt, size_t in,
+				   const u8 *scriptPubkey, struct amount_sat amt,
+				   const u8 *asset);
+
 /* psbt_input_set_utxo - Set the non-witness utxo field for this PSBT input */
 void psbt_input_set_utxo(struct wally_psbt *psbt, size_t in,
 			 const struct wally_tx *prev_tx);
@@ -268,6 +273,11 @@ void psbt_output_set_unknown(const tal_t *ctx,
  * */
 struct amount_sat psbt_input_get_amount(const struct wally_psbt *psbt,
 					size_t in);
+
+/* psbt_input_get_value - Like psbt_input_get_amount, but on Elements the input
+ * may be in any (explicit) asset: this is what signatures commit to. */
+struct amount_sat psbt_input_get_value(const struct wally_psbt *psbt,
+				       size_t in);
 
 enum PSBT_GUESS {
 	PSBT_GUESS_ZERO = 0x0, /* Assume unknown is 0 bytes (fallback) */

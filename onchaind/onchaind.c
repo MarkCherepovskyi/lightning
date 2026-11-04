@@ -5,6 +5,7 @@
 #include <ccan/cast/cast.h>
 #include <ccan/mem/mem.h>
 #include <ccan/tal/str/str.h>
+#include <common/channel_asset.h>
 #include <common/htlc_tx.h>
 #include <common/initial_commit_tx.h>
 #include <common/keyset.h>
@@ -3434,6 +3435,7 @@ int main(int argc, char *argv[])
 	struct amount_sat funding_sats;
 	u8 *scriptpubkey[NUM_SIDES];
 	u32 locktime, tx_blockheight;
+	u8 *asset;
 
 	subdaemon_setup(argc, argv);
 
@@ -3472,9 +3474,15 @@ int main(int argc, char *argv[])
 				   &static_remotekey_start[REMOTE],
 				   &option_anchor_outputs,
 				   &option_anchors_zero_fee_htlc_tx,
-				   &min_relay_feerate)) {
+				   &min_relay_feerate,
+				   &asset)) {
 		master_badmsg(WIRE_ONCHAIND_INIT, msg);
 	}
+
+	/* Asset channel (if any): the HTLC tx builders tag their outputs.
+	 * We don't need the fee reserve amount. */
+	channel_asset_set(channel_asset_or_null(asset), AMOUNT_SAT(0));
+	tal_free(asset);
 
 	/* We need to keep tx around, but there's only one: not really a leak */
 	tal_steal(ctx, notleak(tx));

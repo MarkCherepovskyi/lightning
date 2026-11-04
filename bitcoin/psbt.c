@@ -415,6 +415,13 @@ bool psbt_input_get_ecdsa_sig(const tal_t *ctx,
 void psbt_input_set_wit_utxo(struct wally_psbt *psbt, size_t in,
 			     const u8 *scriptPubkey, struct amount_sat amt)
 {
+	psbt_input_set_wit_utxo_asset(psbt, in, scriptPubkey, amt, NULL);
+}
+
+void psbt_input_set_wit_utxo_asset(struct wally_psbt *psbt, size_t in,
+				   const u8 *scriptPubkey, struct amount_sat amt,
+				   const u8 *asset)
+{
 	struct wally_tx_output *tx_out;
 	int wally_err;
 
@@ -431,7 +438,7 @@ void psbt_input_set_wit_utxo(struct wally_psbt *psbt, size_t in,
 		wally_err =
 			wally_tx_elements_output_init_alloc(scriptPubkey,
 						      tal_bytelen(scriptPubkey),
-						      chainparams->fee_asset_tag,
+						      asset ? asset : chainparams->fee_asset_tag,
 						      ELEMENTS_ASSET_LEN,
 						      value, sizeof(value),
 						      NULL, 0, NULL, 0,
@@ -612,6 +619,18 @@ struct amount_sat psbt_input_get_amount(const struct wally_psbt *psbt,
 		abort();
 
 	return val;
+}
+
+struct amount_sat psbt_input_get_value(const struct wally_psbt *psbt,
+				       size_t in)
+{
+	assert(in < psbt->num_inputs);
+	if (is_elements(chainparams) && psbt->inputs[in].witness_utxo) {
+		struct amount_asset amt_asset =
+			wally_tx_output_get_amount(psbt->inputs[in].witness_utxo);
+		return amount_sat(amt_asset.value);
+	}
+	return psbt_input_get_amount(psbt, in);
 }
 
 size_t psbt_input_get_weight(const struct wally_psbt *psbt,

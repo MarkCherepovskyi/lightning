@@ -2,6 +2,7 @@
 #ifndef LIGHTNING_COMMON_INITIAL_COMMIT_TX_H
 #define LIGHTNING_COMMON_INITIAL_COMMIT_TX_H
 #include "config.h"
+#include <common/channel_asset.h>
 #include <bitcoin/pubkey.h>
 #include <bitcoin/tx.h>
 #include <common/htlc.h>
@@ -64,6 +65,11 @@ static inline struct amount_sat commit_tx_base_fee(u32 feerate_per_kw,
 						   bool option_anchor_outputs,
 						   bool option_anchors_zero_fee_htlc_tx)
 {
+	/* Asset channels pay the fee from the fee reserve, not from the
+	 * balances (common/channel_asset.h): no fee, and `update_fee` does
+	 * nothing. */
+	if (channel_asset())
+		return AMOUNT_SAT(0);
 	return amount_tx_fee(feerate_per_kw,
 			     commit_tx_base_weight(num_untrimmed_htlcs,
 						   option_anchor_outputs,
