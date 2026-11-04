@@ -1,13 +1,13 @@
-//! The swap-quote wire protocol (carried over `custommsg`) and the
-//! datastore-backed quote record a provider keeps for each one it offers.
+//! What a payer packs into leg 1's `payment_metadata` to tell the provider
+//! what to pay for leg 2 (no prior negotiation -- the provider prices and
+//! accepts/rejects live, in `htlc.rs`'s `htlc_accepted` hook), and the
+//! datastore-backed record of a swap the provider has committed to.
 
 use anyhow::{anyhow, Error};
 use cln_rpc::primitives::Sha256;
 use cln_rpc::ClnRpc;
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Every asset string this plugin's own protocol/config carries (quote
 /// messages, datastore records, `--assetswap-pair`/`-provider`, the
@@ -37,67 +37,42 @@ pub(crate) struct Tier {
     pub(crate) from_amount_msat: u64,
 }
 
+/// What a payer embeds in leg 1's `payment_metadata` (hex-encoded JSON) --
+/// everything the provider needs to look up leg 2 and price it live. No
+/// request/reply round trip beforehand: the provider either accepts this
+/// on arrival (profitable at its current price) or fails the HTLC.
 #[derive(Serialize, Deserialize, Debug)]
-pub(crate) struct QuoteRequest {
-    pub(crate) req_id: String,
+pub(crate) struct SwapMetadata {
     pub(crate) final_bolt11: String,
     pub(crate) to_asset: String,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
-pub(crate) struct QuoteReply {
-    pub(crate) req_id: String,
-    pub(crate) ok: bool,
-    #[serde(default)]
-    pub(crate) reason: Option<String>,
-    #[serde(default)]
-    pub(crate) from_asset: Option<String>,
-    #[serde(default)]
-    pub(crate) to_asset: Option<String>,
-    #[serde(default)]
-    pub(crate) payment_hash: Option<String>,
-    #[serde(default)]
-    pub(crate) tiers: Option<Vec<Tier>>,
-    #[serde(default)]
-    pub(crate) quote_expiry_unix: Option<u64>,
-    /// The minimum cltv_expiry_relative leg 1 must carry for the provider's
-    /// up-front CLTV sanity gate to ever pass (leg2_final_cltv +
-    /// safety_blocks + min_hop_budget) — the payer must request at least
-    /// this as its own `final_cltv` when routing leg 1.
-    #[serde(default)]
-    pub(crate) min_leg1_cltv: Option<u32>,
+pub(crate) fn encode_swap_metadata(m: &SwapMetadata) -> Result<String, Error> {
+    Ok(hex::encode(serde_json::to_vec(m)?))
 }
 
-/// What a swap provider remembers about a quote it offered, keyed by the
-/// final recipient's payment_hash in the datastore (see `quote_key`).
+pub(crate) fn decode_swap_metadata(payload_hex: &str) -> Result<SwapMetadata, Error> {
+    let bytes = hex::decode(payload_hex)?;
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
+/// What a swap provider remembers about a swap it has committed to, keyed
+/// by the final recipient's payment_hash in the datastore (see
+/// `quote_key`). Only ever written once leg 1's HTLC has already been
+/// validated and accepted -- not a pre-negotiated offer, just a durable
+/// record of a decision already made, so a restart-replay of the same HTLC
+/// re-derives its outcome instead of re-deciding or re-running leg 2 (see
+/// `htlc.rs::resolve_from_leg2_status`).
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub(crate) struct QuoteRecord {
-    pub(crate) state: String, // "quoted" | "claimed" | "failed"
+    pub(crate) state: String, // "claimed" | "failed"
     pub(crate) from_asset: String,
     pub(crate) to_asset: String,
     pub(crate) final_bolt11: String,
-    pub(crate) quote_expiry_unix: u64,
-    pub(crate) leg2_final_cltv: u32,
-    pub(crate) tiers: Vec<Tier>,
 }
 
 pub(crate) fn quote_key(payment_hash: &str) -> Vec<String> {
     vec!["assetswap".into(), "quote".into(), payment_hash.into()]
-}
-
-pub(crate) fn now_unix() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
-
-static REQ_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-pub(crate) fn new_req_id() -> String {
-    let n = REQ_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let t = now_unix();
-    format!("{t:x}-{n:x}")
 }
 
 /// What `plugins/pricetiers-plugin`'s `pricetiers` RPC returns: tiers for
@@ -105,11 +80,10 @@ pub(crate) fn new_req_id() -> String {
 /// its own matching configured pair and the reference `rate_ppm` behind
 /// those tiers (used for the `htlc_accepted` hook's live-price recheck,
 /// which only needs the rate, not a concrete amount).
-#[derive(Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug)]
 pub(crate) struct PriceTiers {
     pub(crate) from_asset: String,
     pub(crate) rate_ppm: u64,
-    #[allow(dead_code)]
     pub(crate) fee_base_msat: u64,
     pub(crate) tiers: Vec<Tier>,
 }
@@ -139,18 +113,4 @@ pub(crate) async fn fetch_price_tiers(
     )
     .await
     .map_err(|e| anyhow!("pricetiers-plugin: {e}"))
-}
-
-pub(crate) fn encode_custommsg(msgtype: u16, body: &impl Serialize) -> Result<String, Error> {
-    let mut bytes = msgtype.to_be_bytes().to_vec();
-    bytes.extend_from_slice(&serde_json::to_vec(body)?);
-    Ok(hex::encode(bytes))
-}
-
-pub(crate) fn decode_custommsg(payload_hex: &str) -> Result<(u16, Vec<u8>), Error> {
-    let bytes = hex::decode(payload_hex)?;
-    if bytes.len() < 2 {
-        return Err(anyhow!("custommsg payload too short"));
-    }
-    Ok((u16::from_be_bytes([bytes[0], bytes[1]]), bytes[2..].to_vec()))
 }

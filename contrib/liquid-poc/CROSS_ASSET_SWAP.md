@@ -117,26 +117,33 @@ each only ever touch one asset network:
     │       (bolt11 + asset,    │                           │
     │        out-of-band)       │                           │
     │                           │                           │
-    │ 2. "I want to pay H,      │                           │
-    │     what will it cost     │                           │
-    │     in asset A?"          │                           │
-    │ ─────── quote request ──►│                           │
-    │ ◄── 3 tiers: low/med/hi ──┤                           │
-    │     (each a worse-case    │                           │
-    │      price ceiling);      │                           │
-    │     Alice picks one,      │                           │
-    │     fixing amount X       │                           │
-    │         (custommsg)       │                           │
+    │ 2. Alice estimates what   │                           │
+    │    it'll cost in asset A  │                           │
+    │    -- her own local       │                           │
+    │    pricetiers-plugin, or  │                           │
+    │    any other source she   │                           │
+    │    trusts. NOT a message  │                           │
+    │    to Carol, and not      │                           │
+    │    binding on anyone.     │                           │
     │                           │                           │
     │ 3. sendpay: HTLC for      │                           │
     │    amount X, asset A,     │                           │
-    │    locked to hash H       │                           │
+    │    locked to hash H,      │                           │
+    │    carrying Bob's bolt11  │                           │
+    │    + asset B in the       │                           │
+    │    HTLC's own             │                           │
+    │    payment_metadata       │                           │
     │ ─────────────────────────►│                           │
     │                           │  [HTLC HELD — Carol        │
-    │                           │   checks the LIVE price   │
-    │                           │   against Alice's chosen  │
-    │                           │   cap. Over cap → fail,   │
-    │                           │   no leg 2 attempted.]    │
+    │                           │   decodes payment_metadata,│
+    │                           │   decodes Bob's bolt11     │
+    │                           │   herself, and checks the  │
+    │                           │   LIVE price: does X cover │
+    │                           │   Y at today's rate? No    │
+    │                           │   quote was pre-approved —  │
+    │                           │   this IS the only check.  │
+    │                           │   Short → fail, no leg 2   │
+    │                           │   attempted.]              │
     │                           │                           │
     │                           │ 4. xpay: pay Bob's real   │
     │                           │    invoice, amount Y,     │
@@ -247,15 +254,16 @@ required:
 - `pricetiers-plugin`'s `--pricetiers-pair=<from_asset>:<to_asset>:<rate_ppm>:<fee_base_msat>`
   (repeatable) — which asset pairs are quotable, and at what reference
   price. **As implemented, this `rate_ppm` is the live price source** —
-  the "fixed" source described below, not an external feed. The
-  live-price recheck in `assetswap-plugin`'s `htlc_accepted` hook calls
-  `pricetiers-plugin` again and therefore always compares a tier's cap
-  against this same configured number, so (as noted in Limits) it's a
-  permanently-satisfied check in this increment, not yet a real defense
-  against price movement.
-- `assetswap-plugin`'s `--assetswap-provider=<node_id>` (repeatable,
-  payer side) — which providers to query. Onion-message-based discovery
-  is a natural v2; not needed for v1.
+  the "fixed" source described below, not an external feed. There's no
+  separate "recheck": with no pre-negotiated quote to recheck against (see
+  §3), this is simply *the* price check, run once, live, when the HTLC
+  arrives — so (as noted in Limits) it's a permanently-satisfied-by-a-
+  static-number check in this increment, not yet a real defense against
+  price movement.
+- `assetswap-plugin`'s `--assetswap-provider=<node_id>` (repeatable, payer
+  side) — which node leg 1 gets routed to when a direct, same-asset
+  payment isn't possible. Onion-message-based discovery is a natural v2;
+  not needed for v1.
 - **Not yet implemented**: a second pricing-policy plugin, implementing
   the same `pricetiers` RPC contract but backed by
   `plugins/currencyrate-plugin`'s `currencyconvert` RPC (already in this
@@ -265,78 +273,85 @@ required:
   This is the natural next step for making the price-tier mechanism's
   protection real rather than theoretical — see Limits.
 
-### 3. Quote protocol — `custommsg` / `sendcustommsg`, with three price tiers
+### 3. No pre-negotiation: `payment_metadata` + a live price check
 
-The payer must already be `connect`ed (not channel-opened) to the
-provider — `custommsg` is direct-peer-only, no multi-hop. The hook/send
-pattern mirrors
-[`plugins/lsps-plugin/src/cln_adapters/hooks.rs`](../../plugins/lsps-plugin/src/cln_adapters/hooks.rs)
-(parse `{peer_id, payload}`, hex-decode, deserialize JSON) and
-[`sender.rs`](../../plugins/lsps-plugin/src/cln_adapters/sender.rs)
-(`ClnRpc::call_typed(&SendcustommsgRequest { .. })`) already in this repo.
-Two odd message types (configurable via `--assetswap-msgtype-request`/
-`-reply` to avoid collisions with other plugins), raw bytes = 2-byte type +
-UTF-8 JSON:
+**Revised from the original design below.** The first implementation pass
+used a `custommsg` request/reply round trip here — the payer asked the
+provider for a quote, the provider pre-approved a price ceiling and
+recorded it, and the payer's leg-1 HTLC was checked against that
+pre-approval. That had a real cost: `sendcustommsg` only delivers to an
+already-`connect`ed peer, so every payer needed a direct connection to
+every provider it might use, regardless of whether their leg-1 payment
+would ever route through anyone else. That doesn't scale, and there's no
+other reason the two ever needed to talk ahead of time.
 
-- **Request** (payer→provider):
-  `{"req_id": <nonce>, "final_bolt11": "...", "to_asset": "<id>"}` — the
-  provider decodes the bolt11 itself via `decode` rather than trusting a
-  separate amount field.
-- **Reply** (provider→payer): instead of one quote, the provider returns
-  **three price-ceiling tiers** — this is what makes "pay more, succeed
-  more often" concrete. Each tier names the worst exchange rate the payer
-  is pre-approving (a ceiling, always at or above the current reference
-  price from `currencyrate-plugin`), and the leg-1 amount computed at that
-  ceiling — e.g. for a BTC→USDt swap of a fixed 1 BTC-equivalent invoice,
-  something like:
+The replacement: the payer packs what the provider needs directly into leg
+1's own HTLC, via `sendpay`/`xpay`'s existing `payment_metadata` field —
+arbitrary bytes riding in the final-hop onion TLV, which `htlc_accepted`'s
+hook payload already surfaces back out (`onion.payment_metadata`, see
+`cln-rpc/src/hooks.rs`'s `HtlcAcceptedOnion`). No new wire protocol, no
+`custommsg` hook, no requirement that payer and provider ever be directly
+peered — leg 1 is routed exactly like any other multi-hop payment, through
+whatever path the asset's announced channels provide.
 
-  ```json
-  {"req_id": "<echoed>", "ok": true, "payment_hash": "<hex>",
-   "from_asset": "<id>", "to_asset": "<id>",
-   "tiers": [
-     {"name": "low",    "price_cap": 81000, "from_amount_msat": ...},
-     {"name": "medium", "price_cap": 82500, "from_amount_msat": ...},
-     {"name": "high",   "price_cap": 84000, "from_amount_msat": ...}
-   ],
-   "quote_expiry_unix": T,
-   "min_leg1_cltv": 62}
-  ```
-  `min_leg1_cltv` matters more than it looks: it's `leg2_final_cltv +
-  safety_blocks + min_hop_budget`, and the payer *must* route leg 1 with at
-  least this as its own `final_cltv`. A first implementation pass hardcoded
-  a plausible-looking `final_cltv` on the payer side instead of asking the
-  provider — every swap failed, because the provider's own up-front CLTV
-  gate (step 8) rejected a margin smaller than what it itself requires.
-  The provider is the only one who knows that number; it has to be part of
-  the quote.
-
-  A reply can also be `{"ok": false, "reason": "..."}`. A **tighter** cap (`low`) is closer
-  to today's real price, so a small market move during the HTLC hold
-  window can push the live rate past it, aborting the swap. A **looser**
-  cap (`high`) leaves more room, so it's more likely to still hold by
-  settlement time — at the cost of the payer pre-approving a worse
-  worst-case rate. This is the actual "fee": not a separate cash amount,
-  but how much margin-above-market the payer is willing to concede for a
-  better success probability.
-
-The `custommsg` hook itself must **always** return `{"result": "continue"}`
-per its schema — it can't be used to "answer"; the quote reply is a
-separate `sendcustommsg` call sent from inside the handler. The payer picks
-one tier (`payassetinvoice`'s `tier` param, default `"medium"`) and sends
-leg 1 sized at that tier's `from_amount_msat`. On a good quote, the
-provider writes to `datastore`:
-
-```
-key = ["assetswap", "quote", <payment_hash hex>]   mode = "must-create"
-value = {"state": "quoted", "tiers": [...], "from_asset", "to_asset", "final_bolt11",
-         "quote_expiry_unix", "payer_node_id", "leg2_final_cltv"}
+```rust
+// protocol.rs
+#[derive(Serialize, Deserialize)]
+struct SwapMetadata {
+    final_bolt11: String,
+    to_asset: String,
+}
 ```
 
-The chosen tier (and its `from_amount_msat`/`price_cap`) is only pinned
-down once the leg-1 HTLC actually arrives — the hook handler (step 5)
-matches the HTLC's amount against whichever tier it equals.
+The payer encodes this as hex JSON and sets it as leg 1's
+`payment_metadata` (`pay.rs`). There is no reply, no pre-approval, and
+nothing written to the provider's `datastore` until the HTLC actually
+lands — the provider decides live:
 
-### 4. `payassetinvoice` RPC (payer side)
+1. Decode `onion.payment_metadata` → `SwapMetadata`. Missing or
+   undecodable means this isn't a swap HTLC at all — `{"result":
+   "continue"}`, not ours to second-guess.
+2. Decode `final_bolt11` itself (`decode`) to learn the real
+   `amount_msat`, `payment_hash`, and `min_final_cltv_expiry` — never
+   trust a field the payer could have gotten wrong or lied about when a
+   decode is one local call away.
+3. **The hash-link check, now explicit.** In the old design this was
+   implicit: the provider could only ever *find* a quote record by looking
+   it up under the leg-1 HTLC's own `payment_hash`, so a mismatched invoice
+   simply found nothing. With no pre-written record to look up by, the
+   check has to be explicit: `decoded.payment_hash != htlc.payment_hash` →
+   fail. Skipping this would let a leg-1 HTLC reference a `final_bolt11`
+   whose hash doesn't match what leg 1 itself will resolve with — the
+   provider could pay leg 2, learn a preimage, and then be unable to use it
+   to claim leg 1 at all (lightningd itself will only resolve an HTLC with
+   a preimage that hashes to *its own* `payment_hash`), leaving the
+   provider paid out on leg 2 with nothing collected on leg 1.
+4. **Live pricing is the only check, not a recheck.** Call
+   `pricetiers-plugin`'s `pricetiers` RPC for `to_asset`/`amount_msat` and
+   require the leg-1 amount received to cover at least the cheapest
+   returned tier. There's no prior quote to compare against — this single
+   live call *is* the provider's entire pricing decision, made at the
+   moment it matters. Anything above the floor is accepted; the provider
+   just keeps the surplus. (Tiers still exist — see §8/pricetiers-plugin —
+   but now describe margins a payer might choose to overpay by for a
+   better chance of clearing the floor if the price moves between when
+   they estimated and when the HTLC lands, not a menu the provider
+   validates an exact match against.)
+5. Channel-asset and CLTV-budget checks, unchanged in substance from the
+   original design (§5 below).
+
+How much the payer actually sends for leg 1 is therefore *its own*
+decision, made with no help from the provider: either an explicit
+`(from_asset, from_amount_msat)` the caller already knows (see
+`payassetinvoice`'s own doc comment in `pay.rs` — `contrib/liquid-poc`'s
+`lqui.py` computes this from config it reads directly off every node's
+container), or a same-node `pricetiers-plugin` lookup, which only returns
+real numbers if this particular node happens to hold a `pricetiers-pair=`
+matching the provider's. Underestimating isn't a protocol violation, just
+a failed HTLC the payer can retry with more — exactly the same failure
+shape as misjudging the CLTV margin (§8).
+
+### 4. `payassetinvoice`/`quoteassetinvoice` RPCs (payer side)
 
 ```rust
 async fn payassetinvoice(p: Plugin<State>, args: PayAssetInvoiceArgs) -> Result<Value, Error> {
@@ -345,34 +360,66 @@ async fn payassetinvoice(p: Plugin<State>, args: PayAssetInvoiceArgs) -> Result<
 
     // 1. try the direct, no-swap path first — a payer may hold channels in
     //    several asset networks, so don't assume a swap is even needed.
-    if let Ok(res) = rpc.call_typed(&XpayRequest { bolt11: wrapper.bolt11.clone(),
-                                                     asset: Some(wrapper.asset.clone()), .. }).await {
-        return Ok(json!(res));
-    }
+    let direct_err = match rpc.call_typed(&XpayRequest { bolt11: wrapper.bolt11.clone(),
+                                                           asset: Some(wrapper.asset.clone()), .. }).await {
+        Ok(res) => return Ok(json!(res)),
+        Err(e) => e,
+    };
 
-    // 2. get a tiered quote, pick the requested tier (default "medium")
-    let quote = get_quote(&p, provider_node_id, &wrapper.bolt11, &wrapper.asset).await?;
-    let tier = quote.tiers.iter().find(|t| t.name == args.tier.unwrap_or("medium".into()))
-        .ok_or_else(|| anyhow!("provider didn't offer tier {:?}", args.tier))?;
+    // 2. decide how much to send for leg 1: either the caller already told
+    //    us (an explicit from_asset/from_amount_msat — e.g. lqui.py, which
+    //    reads every node's config directly, not just this one's), or this
+    //    node's own local pricetiers-plugin, if it happens to hold a
+    //    matching pricetiers-pair= (only true for a node that's also a
+    //    provider). Either way this is an ESTIMATE, not a commitment —
+    //    nobody has approved it yet.
+    let (from_asset, from_amount_msat) = match args.from_override() {
+        Some(o) => o,
+        None => {
+            let priced = fetch_price_tiers(&mut rpc, &wrapper.asset, wrapper.amount_msat).await
+                .map_err(|e| anyhow!("direct payment failed ({direct_err}); can't price a swap locally: {e}"))?;
+            let tier = priced.tiers.iter().find(|t| t.name == args.tier.unwrap_or("medium".into()))
+                .ok_or_else(|| anyhow!("no {:?} tier for this pair", args.tier))?;
+            (priced.from_asset, tier.from_amount_msat)
+        }
+    };
 
-    // 3. pathfind leg 1, in the payer's own asset network, to the provider
+    // 3. a generous CLTV margin over the invoice's own min_final_cltv_expiry
+    //    -- not negotiated (there's no quote reply to learn the provider's
+    //    exact requirement from anymore); too little just fails the HTLC,
+    //    same failure shape as sending too little for the price.
+    let decoded = rpc.call_typed(&DecodeRequest { string: wrapper.bolt11.clone() }).await?;
+    let final_cltv = decoded.min_final_cltv_expiry.unwrap() + LEG1_CLTV_MARGIN;
+
+    // 4. pathfind leg 1, in from_asset's network, to the provider
     let routes: GetroutesResponse = rpc.call_typed(&GetroutesRequest {
         source: my_id, destination: provider_node_id,
-        amount_msat: tier.from_amount_msat, asset: Some(quote.from_asset.clone()),
+        amount_msat: from_amount_msat, asset: Some(from_asset.clone()),
         layers: vec!["auto.localchans".into(), "auto.sourcefree".into()],
-        final_cltv: 18, ..
+        final_cltv, ..
     }).await?;
     let route = getroutes_path_to_sendpay_route(&routes.routes[0].path);
 
-    // 4. send with the FINAL recipient's payment_hash, not a fresh one
+    // 5. send with the FINAL recipient's payment_hash (not a fresh one) and
+    //    the invoice + to_asset packed into payment_metadata -- this is
+    //    the provider's ONLY source of truth for what leg 2 should be.
+    let metadata = encode_swap_metadata(&SwapMetadata {
+        final_bolt11: wrapper.bolt11.clone(), to_asset: wrapper.asset.clone(),
+    })?;
     rpc.call_typed(&SendpayRequest { route, payment_hash: wrapper.payment_hash.clone(),
-                                      amount_msat: Some(tier.from_amount_msat), .. }).await?;
+                                      amount_msat: Some(from_amount_msat),
+                                      payment_metadata: Some(metadata), .. }).await?;
     let res: WaitsendpayResponse = rpc.call_typed(&WaitsendpayRequest {
-        payment_hash: wrapper.payment_hash, timeout: Some(args.retry_for.unwrap_or(60)), ..
+        payment_hash: wrapper.payment_hash, timeout: Some(60), ..
     }).await?;
     Ok(json!(res))
 }
 ```
+
+`quoteassetinvoice` is just step 2's local-pricetiers branch, exposed on
+its own, for a caller that wants an estimate without paying — see its doc
+comment in `pay.rs` for why it's explicitly *not* a quote from the
+provider.
 
 `getroutes_path_to_sendpay_route()` is a small required conversion —
 `getroutes`' `path` shape (`node_id_in/out`, `amount_out_msat`, `cltv_out`,
@@ -394,36 +441,60 @@ lightningd replays HTLCs with no final verdict on startup.
 ```rust
 async fn on_htlc_accepted(p: Plugin<State>, v: Value) -> Result<Value, Error> {
     let htlc = HtlcAccepted::parse(v)?;
-    let Some(rec) = lookup_quote_record(&p, &htlc.payment_hash).await? else {
-        return Ok(json!({"result": "continue"}));   // not ours — don't interfere with other traffic
-    };
-    let Some(tier) = rec.tiers.iter().find(|t| t.from_amount_msat == htlc.amount_msat) else {
-        return Ok(fail_incorrect_details());         // amount doesn't match any quoted tier
-    };
 
-    if channel_asset(&htlc.short_channel_id).await? != rec.from_asset
-        || now() > rec.quote_expiry_unix
-        || htlc.cltv_expiry_relative < rec.leg2_final_cltv + SAFETY_BLOCKS + MIN_HOP_BUDGET {
+    // Restart-replay idempotency (§7): a "claimed" record means we already
+    // decided before a prior process exited -- re-derive the verdict from
+    // leg 2's own status rather than re-decide. "failed" means we already
+    // gave lightningd a verdict in a past run; let a fresh HTLC for the
+    // same hash (e.g. the payer retrying with more) be judged again.
+    if let Some(rec) = lookup_quote_record(&p, &htlc.payment_hash).await? {
+        if rec.state == "claimed" {
+            return Ok(resolve_from_leg2_status(&p, &rec).await);
+        }
+    }
+
+    // No prior negotiation -- decode what the payer packed into leg 1
+    // itself. Missing/undecodable: not a swap HTLC, not ours to
+    // second-guess.
+    let Some(meta) = decode_swap_metadata(&htlc.onion.payment_metadata) else {
+        return Ok(json!({"result": "continue"}));
+    };
+    let decoded = decode_bolt11(&p, &meta.final_bolt11).await?;
+
+    // The hash-link check, now explicit (it used to be implicit in how the
+    // quote record was looked up -- see §3): leg 1 must be for the SAME
+    // payment_hash as the invoice it claims to settle, or we could pay leg
+    // 2 and be left holding a preimage leg 1 won't accept.
+    if decoded.payment_hash != htlc.payment_hash {
         return Ok(fail_incorrect_details());
     }
 
-    // Live-price recheck: has the market moved past the ceiling the payer
-    // pre-approved for this tier since the quote was issued?
-    let live_price = current_price(&p, &rec.from_asset, &rec.to_asset).await?;
-    if live_price > tier.price_cap {
-        return Ok(fail_incorrect_details());          // abort — would now execute at a loss beyond the agreed cap
+    // Live pricing: the ONLY check that decides whether we'd lose money,
+    // since nothing was pre-approved. Today's rate, right now -- not a
+    // recheck against an earlier snapshot.
+    let priced = fetch_price_tiers(&p, &meta.to_asset, decoded.amount_msat).await?;
+    let floor_msat = priced.tiers.iter().map(|t| t.from_amount_msat).min().unwrap();
+    if htlc.amount_msat < floor_msat {
+        return Ok(fail_incorrect_details());   // we'd lose money at our own current price
     }
 
+    if channel_asset(&htlc.short_channel_id).await? != priced.from_asset
+        || htlc.cltv_expiry_relative < decoded.min_final_cltv_expiry + SAFETY_BLOCKS + MIN_HOP_BUDGET {
+        return Ok(fail_incorrect_details());
+    }
+
+    let rec = QuoteRecord { state: "claimed".into(), from_asset: priced.from_asset,
+                             to_asset: meta.to_asset, final_bolt11: meta.final_bolt11 };
     if !claim_quote_atomically(&p, &htlc.payment_hash, &rec).await? {
-        return Ok(fail_incorrect_details());          // replay: someone already claimed this quote
+        return Ok(fail_incorrect_details());          // replay: someone already claimed this hash
     }
 
     // No manual threading needed: just await the leg-2 call. tokio keeps
-    // servicing other hooks/custommsg/RPC calls while this one is pending —
-    // this request simply isn't answered until the match arm below returns.
+    // servicing other hooks/RPC calls while this one is pending -- this
+    // request simply isn't answered until the match arm below returns.
     match p.rpc().call_typed(&XpayRequest {
         bolt11: rec.final_bolt11.clone(), asset: Some(rec.to_asset.clone()),
-        maxdelay: Some(htlc.cltv_expiry_relative - rec.leg2_final_cltv - SAFETY_BLOCKS), ..
+        maxdelay: Some(htlc.cltv_expiry_relative - decoded.min_final_cltv_expiry - SAFETY_BLOCKS), ..
     }).await {
         Ok(res) => Ok(json!({"result": "resolve", "payment_key": res.payment_preimage})),
         Err(_) => Ok(fail_incorrect_details()),
@@ -433,26 +504,36 @@ async fn on_htlc_accepted(p: Plugin<State>, v: Value) -> Result<Value, Error> {
 
 Every rejection uses `incorrect_or_unknown_payment_details` (hex `400f`)
 uniformly — it needs no extra data (unlike `expiry_too_soon`) and doesn't
-leak which check failed (bad amount, wrong asset, expired/replayed quote,
-insufficient CLTV margin, live-price-cap breach, or leg-2 failure all look
+leak which check failed (bad amount, wrong asset, insufficient CLTV
+margin, a live price we no longer clear, or leg-2 failure all look
 identical to the payer).
 
 ### 6. Replay protection
 
-`datastore`'s `mode="must-replace", generation=N` gives exactly the atomic
-claim needed (same RPC either language — `cln_rpc::model::requests::DatastoreRequest`):
+In the original design a `"quoted"` record always already existed by the
+time a claim was attempted (written during the quote step), so the claim
+was always a `must-replace`. With nothing written until first accept,
+`claim_quote_atomically` now has two cases: nothing on disk yet
+(`must-create`), or an earlier `"failed"` record from a previous attempt
+for the same hash, which a fresh retry is allowed to overwrite
+(`must-replace` with its generation as the CAS check). Either way, exactly
+one concurrent/replayed HTLC for a given hash wins:
 
 ```rust
 async fn claim_quote_atomically(p: &Plugin<State>, payment_hash: &str, rec: &QuoteRecord) -> Result<bool> {
     let mut rpc = ClnRpc::new(p.configuration().rpc_file).await?;
-    let cur = rpc.call_typed(&ListdatastoreRequest { key: quote_key(payment_hash) }).await?;
+    let existing = rpc.call_typed(&ListdatastoreRequest { key: quote_key(payment_hash) }).await?.datastore.into_iter().next();
+    let (mode, generation) = match &existing {
+        None => (DatastoreMode::MUST_CREATE, None),
+        Some(d) => (DatastoreMode::MUST_REPLACE, d.generation),
+    };
     let claimed = QuoteRecord { state: "claimed".into(), ..rec.clone() };
     match rpc.call_typed(&DatastoreRequest {
         key: quote_key(payment_hash), string: Some(serde_json::to_string(&claimed)?),
-        mode: Some(DatastoreMode::MUST_REPLACE), generation: cur.datastore[0].generation, ..
+        mode: Some(mode), generation, ..
     }).await {
         Ok(_) => Ok(true),
-        Err(_) => Ok(false),   // a concurrent/replayed HTLC already claimed this quote
+        Err(_) => Ok(false),   // a concurrent/replayed HTLC already claimed this hash
     }
 }
 ```
@@ -552,13 +633,21 @@ rather than inventing new numbers:
   per-HTLC from its actual `cltv_expiry_relative`, letting `xpay`/`askrene`'s
   own multi-hop budget enforcement do the real work rather than hand-summing
   hop deltas.
+- `LEG1_CLTV_MARGIN` (payer side, `pay.rs`, **60**): with no quote reply to
+  learn the provider's exact `min_leg1_cltv` from anymore (§3), the payer
+  just requests a margin generous enough to cover the provider's *default*
+  `SAFETY_BLOCKS` + `MIN_HOP_BUDGET` + slack when routing leg 1. Not
+  negotiated — a provider configured with a bigger budget just rejects an
+  insufficient margin, same failure shape as an insufficient price, and
+  the payer retries with more.
 
 ## Files
 
 - **New**: `plugins/assetswap-plugin/` — a Cargo crate (`Cargo.toml`,
-  `src/main.rs` + modules for the quote protocol, the hold-hook, the
-  datastore-backed quote record, and a thin client for
-  `currencyrate-plugin`'s `currencyconvert` RPC), with its own `README.md`
+  `src/main.rs` + modules for the invoice wrapper (`assetinvoice.rs`), the
+  payer-side RPCs (`pay.rs`), the provider-side `htlc_accepted` hook
+  (`htlc.rs`), the shared `payment_metadata`/datastore-record types
+  (`protocol.rs`), and small RPC/config helpers), with its own `README.md`
   mirroring this directory's.
 - **New**: `plugins/pricetiers-plugin/` (Rust crate `cln-pricetiers`,
   binary `pricetiers-plugin`) — the standalone, swap-agnostic pricing
@@ -587,109 +676,154 @@ rather than inventing new numbers:
     `x-cln` entrypoint, so alice/bob/carol all load both plugins from
     their very first startup — see §7's restart-idempotency requirement.
   - `lnpoc.py`: `swap-provider`/`swap-payer`/`assetinvoice`/
-    `payassetinvoice`/`swap`/`swap-demo` subcommands (see its own
-    docstring), which only ever need to write the `pricetiers-pair=`/
-    `assetswap-provider=` config lines — both plugins are already loaded.
+    `quoteassetinvoice`/`payassetinvoice`/`swap`/`swap-demo` subcommands
+    (see its own docstring). `swap-provider`/`swap-payer` only ever need
+    to write the `pricetiers-pair=`/`assetswap-provider=` config lines —
+    both plugins are already loaded, and (since §3's redesign) no
+    `connect()` step is needed either, as there's no longer a custommsg
+    round trip requiring one. `swap_quote()` asks a real provider's own
+    `quoteassetinvoice` for the `(from_asset, from_amount_msat)` a plain
+    payer needs to pass as `payassetinvoice`'s explicit override, since
+    only a provider's own local `pricetiers-plugin` has real pricing —
+    `cmd_swap`/`cmd_payassetinvoice` and `lqui.py`'s `payinvoice` action
+    all use it.
 - **Unchanged**: everything under `lightningd/`, `gossipd/`, `channeld/`,
   `common/`, `wire/`. The only reuse of existing core features is the
   already-shipped `invoice ... asset=` and `xpay ... asset=` support, plus
-  `plugins/currencyrate-plugin`'s existing `currencyconvert` RPC as the
-  live price oracle.
+  `sendpay`/`xpay`'s existing `payment_metadata` field and
+  `htlc_accepted`'s existing `onion.payment_metadata` (§3) — no new core
+  capability needed for either. `plugins/currencyrate-plugin`'s
+  `currencyconvert` RPC is *not* wired in anywhere yet, despite being
+  mentioned as the natural next step for a real price oracle (§2) — still
+  not yet implemented.
 
 ## Implementation & testing sequence
 
-Each step is a separate, reviewable unit; step 4 is the real go/no-go
-milestone — it proves the zero-core-change claim end-to-end. **Status**
-reflects manual verification against a live `contrib/liquid-poc` Docker
-environment (`lnpoc.py start`), not yet the automated `tests/test_assetswap.py`
-suite (see Verification).
+**This section (and Verification, below) documents the testing pass run
+against the *original* `custommsg` quote-protocol implementation,
+before §3's redesign.** Steps 1, 2, 4, 5, 8 and 9 exercised mechanics
+(invoice wrapper, direct-payment fallback, the hash-linked two-leg
+happy/failure paths, restart-replay) that are still structurally the same
+after the redesign, just reached without a quote step — they have *not*
+been re-run end-to-end against a live Docker environment since (the
+redesign is currently verified only by `cargo check`/`cargo clippy`
+against the plugin crate, not by a live swap). Steps 3 and 7's
+quote-specific checks (quote-tier reply format, `quote_expiry_unix`) no
+longer apply at all — there's no quote to check. Re-running the full
+sequence against a live stack is the natural next step before trusting
+this as more than a design sketch again.
 
 1. **`assetinvoice` only.** ✅ Verified: wrapper round-trips to the right
    `invoice` fields (asset, amount, payment_hash all match the real bolt11).
+   Unaffected by the redesign.
 2. **Same-asset fallback path.** ✅ Verified: `payassetinvoice` resolves via
    the direct-`xpay` branch when payer and payee share an asset channel;
    channel balances moved by exactly the paid amount on both sides.
-3. **Quote protocol in isolation.** ✅ Verified (via raw `sendcustommsg`):
-   correct tiered reply + `datastore` record for a configured pair;
-   rejection path exists for an unconfigured pair (not separately exercised).
-4. **Single swap-provider happy path.** ✅ Verified end-to-end: leg 1 and
-   leg 2 shared one payment_hash, the preimage only became known after leg
-   2 settled (confirmed via `listinvoices`/`listsendpays`), and balances on
-   all three nodes moved by exactly the expected amounts including the
-   provider's margin.
-   - **Bug found and fixed in this pass**: leg 1 was originally routed with
-     a hardcoded `final_cltv`, smaller than the provider's own required
-     safety budget — every swap failed. Fixed by having the quote reply
-     carry the provider's required `min_leg1_cltv` (§3), which the payer
-     now uses directly.
-5. **Leg-2 failure / refund path.** ✅ Verified (by deleting the payee's
-   invoice between quoting and leg 1, forcing `xpay` to fail): leg 1 also
-   failed, no funds moved on either leg, and the quote record correctly
-   reached the terminal `"failed"` state (not left stuck in `"claimed"`).
+   Unaffected by the redesign — still the first thing `payassetinvoice`
+   tries, still a verified-unchanged code path (`tests/test_assetswap.py`
+   also still covers exactly this).
+3. ~~Quote protocol in isolation.~~ **Removed by the redesign** — there's
+   no `custommsg` quote request/reply to test anymore (§3).
+4. **Single swap-provider happy path.** ✅ Verified *against the original
+   design*: leg 1 and leg 2 shared one payment_hash, the preimage only
+   became known after leg 2 settled (confirmed via
+   `listinvoices`/`listsendpays`), and balances on all three nodes moved
+   by exactly the expected amounts including the provider's margin. ⚠️ Not
+   yet re-verified against the `payment_metadata`-based redesign.
+   - **Bug found and fixed in the original pass**: leg 1 was originally
+     routed with a hardcoded `final_cltv`, smaller than the provider's own
+     required safety budget — every swap failed. Fixed at the time by
+     having the quote reply carry the provider's required `min_leg1_cltv`;
+     the redesign replaces that with a generous fixed payer-side margin
+     instead (`LEG1_CLTV_MARGIN`, §8) — the same class of bug (insufficient
+     CLTV budget) is worth specifically re-checking once re-verified live.
+5. **Leg-2 failure / refund path.** ✅ Verified *against the original
+   design* (by deleting the payee's invoice between quoting and leg 1,
+   forcing `xpay` to fail): leg 1 also failed, no funds moved on either
+   leg, and the record correctly reached the terminal `"failed"` state
+   (not left stuck in `"claimed"`). The redesign's `mark_quote_failed`
+   path is the same code, just reached without a prior `"quoted"` state —
+   ⚠️ not yet re-verified live.
 6. **Price-tier / live-price edge cases.** ⚠️ Partially covered — the tier
    math itself is verified (exact tier amounts match hand-computed
-   values), but a genuine live-price-moved-the-cap scenario isn't
+   values), but a genuine live-price-moved-the-floor scenario isn't
    exercised, since only the "fixed" price source exists so far (see
-   Limits). Revisit once a real oracle is wired in.
-7. **Quote-expiry / replay edge cases.** ✅ Expiry verified (manually aged a
-   quote's `quote_expiry_unix` into the past; rejected with no state
-   mutation). ✅ CLTV-too-tight verified (undersized `delay` on leg 1;
-   rejected immediately, `xpay` never reached, no state mutation).
-   ⚠️ Concurrent double-claim *not* directly forced — `sendpay`'s own
-   dedup-by-payment_hash blocks the obvious way to simulate it from a
-   single sender, and MPP parts need a `payment_secret` this scenario
-   doesn't have. The `datastore` generation CAS itself is still verified
-   correct (exactly one write wins per quote, in every test above).
-8. **Restart/idempotency.** ✅ Verified against a real mid-flight restart
-   (hold leg 2 at the payee with a throwaway test plugin, restart the
-   provider's `lightningd` while leg 1 is `"claimed"` and leg 2 still
-   pending). Two real findings came out of this, both now fixed/documented
-   in §7 above: (a) a `"claimed"`-but-not-yet-resolved record needs to
+   Limits). Revisit once a real oracle is wired in. The redesign makes
+   this check the *only* price gate (§3), so it's worth more scrutiny
+   than before, not less.
+7. **Replay edge cases.** ✅ CLTV-too-tight verified *against the original
+   design* (undersized `delay` on leg 1; rejected immediately, `xpay`
+   never reached, no state mutation) — the equivalent check still exists
+   post-redesign, ⚠️ not yet re-verified. ~~Quote-expiry~~ no longer
+   applies (no `quote_expiry_unix` anymore). ⚠️ Concurrent double-claim
+   still *not* directly forced — `sendpay`'s own dedup-by-payment_hash
+   blocks the obvious way to simulate it from a single sender, and MPP
+   parts need a `payment_secret` this scenario doesn't have. The
+   `datastore` generation CAS itself is still verified correct in every
+   test above (exactly one write wins); the redesign's version of it
+   additionally needs its `must-create`-vs-`must-replace` branch (§6)
+   exercised, which wasn't relevant before (a record always already
+   existed by claim time in the original design).
+8. **Restart/idempotency.** ✅ Verified *against the original design*
+   against a real mid-flight restart (hold leg 2 at the payee with a
+   throwaway test plugin, restart the provider's `lightningd` while leg 1
+   is `"claimed"` and leg 2 still pending). Two real findings came out of
+   this, both documented in §7 above and both structurally unaffected by
+   the redesign: (a) a `"claimed"`-but-not-yet-resolved record needs to
    *wait* on leg 2 via `waitsendpay`, not just check once and give up; (b)
-   the plugin must be loaded before lightningd can replay a pending HTLC —
-   fixed structurally for `contrib/liquid-poc` by baking the plugin into
-   the `cln` image and its startup command line (§7), not left as an
-   operator-remembered step.
+   the plugin must be loaded before lightningd can replay a pending HTLC.
+   ⚠️ Not yet re-verified against the redesigned code.
 9. **(Optional) hand-driven demo** on real `elementsd`-backed
    `liquid-regtest` nodes — effectively what steps 1-8 already were,
    driven by hand via `lightning-cli` rather than `lnpoc.py` subcommands.
 
 ## Verification
 
-- All of the above was exercised against a live `contrib/liquid-poc`
-  environment (`./lnpoc.py start`), using `lnpoc.py`'s own `swap-provider`/
-  `swap-payer`/`assetinvoice`/`payassetinvoice`/`swap`/`swap-demo`
-  subcommands — the plugin itself needs no separate build or load step
-  (see Files, below); these subcommands only ever write the per-pair/
-  per-provider `assetswap-*` config lines.
+- All of the above (pre-redesign) was exercised against a live
+  `contrib/liquid-poc` environment (`./lnpoc.py start`), using `lnpoc.py`'s
+  own `swap-provider`/`swap-payer`/`assetinvoice`/`payassetinvoice`/
+  `swap`/`swap-demo` subcommands — the plugin itself needs no separate
+  build or load step (see Files, below); these subcommands only ever
+  write the per-pair/per-provider `assetswap-*` config lines.
+- The §3 redesign (this plugin now also has a `quoteassetinvoice`
+  subcommand/RPC, and `payassetinvoice` takes an optional
+  `from_asset`/`from_amount_msat` override — see Files) is currently
+  verified only by `cargo check`/`cargo clippy` against the
+  `assetswap-plugin` crate, not by a live swap. Re-running
+  implementation-sequence steps 2, 4, 5, 7 and 8 against a live
+  `contrib/liquid-poc` stack is the natural next step.
 - **Still to do**: wire up `tests/test_assetswap.py` so this is automated
   rather than driven via `lnpoc.py` — it needs this fork's own built
   `lightningd` and the `pyln` packages installed (`contrib/pyln-client`,
   `contrib/pyln-testing`), neither of which is set up in a fresh checkout.
+  (It currently only covers steps 1-2, which the redesign didn't touch.)
 - Confirm no diffs outside `plugins/assetswap-plugin/`, the root
   `Cargo.toml`'s `members` line, `tests/test_assetswap.py`, and
-  `contrib/liquid-poc/{Dockerfile,docker-compose.yml,lnpoc.py}` — the last
-  three are this PoC's own test harness, not core, so they don't count
-  against the zero-core-change goal.
+  `contrib/liquid-poc/{Dockerfile,docker-compose.yml,lnpoc.py,lqui.py}` —
+  the last four are this PoC's own test harness, not core, so they don't
+  count against the zero-core-change goal.
 
 ## Limits (carried over / new)
 
 - No onion-message-based provider discovery in v1 — payers need a static
   list of provider node_ids.
-- A payer connecting to a provider for a quote reveals intent (who's
-  swapping what) to that provider; no privacy beyond that.
-- Only one provider is queried per payment in v1 — no shopping across
-  multiple providers for the best tier/price. (A natural v1.1: query every
-  configured provider, keep the cheapest tier that still fits the payer's
-  tolerance.)
-- **The live-price recheck isn't live yet.** Only the "fixed" source
-  exists — a pair's `rate_ppm` is a static config value, so the
-  `htlc_accepted` hook's price-cap check is permanently satisfied by
-  construction (every tier's cap is `rate_ppm` times a margin ≥ 1). Wiring
-  up `plugins/currencyrate-plugin`'s `currencyconvert` RPC as a genuine
+- ~~A payer connecting to a provider for a quote reveals intent...~~
+  **Resolved by the §3 redesign**: there's no connection or message to the
+  provider at all anymore, before or during a swap attempt — leg 1 is
+  routed like any other payment, so a provider learns nothing about a
+  payer's intent until (if) an HTLC from them actually arrives.
+- Only one provider is routed to per payment in v1 — no shopping across
+  multiple configured providers for the best price. (A natural v1.1: try
+  each configured provider in turn, or pick by some local preference.)
+- **The price check isn't backed by a real oracle yet.** Only the "fixed"
+  source exists — a pair's `rate_ppm` is a static config value, so the
+  `htlc_accepted` hook's price floor (§3 — no longer a "recheck" against
+  an earlier quote, just the one live check that exists) is
+  permanently satisfied by construction. Wiring up
+  `plugins/currencyrate-plugin`'s `currencyconvert` RPC as a genuine
   oracle (an `--assetswap-price-source=oracle` option) is the natural next
-  step to make this protection real; until then, the three tiers only
-  differ in margin, not in actual risk covered.
+  step to make this protection real; until then the tiers only differ in
+  margin, not in actual risk covered.
 - **A swap-provider must load this plugin before lightningd can replay a
   pending HTLC** — `plugin start`-ing it leaves it unloaded across a
   restart, and a replayed leg-1 HTLC can arrive before a
@@ -701,10 +835,6 @@ suite (see Verification).
   requirement for any other deployment: a `plugin=` line in `config`, not
   `plugin start`. Not a concern for a payer's own instance, only a
   provider's.
-- Only one provider is queried per payment in v1 — no shopping across
-  multiple providers for the best tier/price. (A natural v1.1: query every
-  configured provider, keep the cheapest tier that still fits the payer's
-  tolerance.)
 - Concurrent-replay/double-claim protection (the `datastore` generation
   CAS) is verified correct in isolation, but a genuine two-HTLCs-at-once
   race wasn't forced in testing — `sendpay`'s own payment_hash dedup blocks
