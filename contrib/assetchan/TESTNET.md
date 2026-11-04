@@ -10,8 +10,8 @@ https://blockstream.info/liquidtestnet/tx/TXID
 - `elementsd` on `liquidtestnet` (synced, `-txindex=1`), its RPC on
   `127.0.0.1:7039`, wallet `poc`. Here it is the `liquid-ln-testnet` docker
   stack's elementsd, reached through a socat proxy container (see
-  `testnet.sh`).
-- Two lightningd nodes, A and B, started with `contrib/assetchan/testnet.sh
+  `nodes.sh`).
+- Two lightningd nodes, A and B, started with `contrib/assetchan/nodes.sh
   start A|B`: this tree's build, `--network=liquid-testnet`, the plugin,
   `--channel-asset` = our asset, `--watchtime-blocks=6`,
   `--funding-confirms=2`, `--developer`; they talk over localhost. bcli runs

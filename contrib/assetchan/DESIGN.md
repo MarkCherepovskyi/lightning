@@ -255,10 +255,16 @@ Reuse map (`git show liquid-merged:<path>`): `common/liquid_asset.[ch]`,
 - On-chain (elements-cli): funding vout 0 asset/units, vout 1 L-BTC/reserve, same script,
   both explicit; commitment has two inputs, anchors in L-BTC, fee output = reserve −
   anchors; sweeps pay fees from wallet L-BTC; assets at close addresses.
-- Real Liquid testnet: `contrib/assetchan/testnet.sh` runs two nodes from this tree
-  against a testnet elementsd; `contrib/assetchan/TESTNET.md` records the run of all the
-  cases above (open, payments, cooperative close, force closes with every sweep kind,
-  an HTLC claimed on chain with its preimage, a penalty) with the testnet txids.
+- Real Liquid testnet: `contrib/assetchan/nodes.sh` runs nodes from this tree against
+  a testnet elementsd (`ASSETCHAN_NETWORK=liquid-regtest` for a regtest one, where it
+  also mines); `contrib/assetchan/TESTNET.md` records the run of all the cases above
+  (open, payments, cooperative close, force closes with every sweep kind, an HTLC
+  claimed on chain with its preimage, a penalty) with the testnet txids.
+- By hand: `contrib/assetchan/ui.py` serves a web page (http://127.0.0.1:8765) for those
+  nodes, or any `--node name=lightning-dir` running the plugin: the nodes, peers,
+  wallets and channels, with forms to open (asset or L-BTC), pay, close, force close,
+  send on-chain and fund a node, all through the nodes' RPCs (`assetchan-*` for the
+  asset side); it mines on regtest when given `--elements-rpc`.
 
 ## 7. Verify first (day 1 spikes), risks
 

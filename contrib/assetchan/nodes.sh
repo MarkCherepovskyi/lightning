@@ -1,33 +1,52 @@
 #!/bin/sh
-# Two lightningd nodes from this tree, A and B, on the real Liquid testnet
-# (test coins only), with the assetchan plugin.  elementsd is reached over
-# RPC at $ELEMENTS_RPC; its wallet funds the channels and takes the assets
-# back at close.  The nodes talk to each other over localhost.
+# lightningd nodes from this tree (A, B, C, D) with the assetchan plugin, on
+# the real Liquid testnet (test coins only) by default, or on a Liquid regtest.
+# elementsd is reached over RPC at $ELEMENTS_RPC; its wallet funds the
+# channels and takes the assets back at close.  The nodes talk to each other
+# over localhost.
 #
-#   contrib/assetchan/testnet.sh start A [lightningd options...]
-#   contrib/assetchan/testnet.sh stop A
-#   contrib/assetchan/testnet.sh cli A getinfo        # lightning-cli
-#   contrib/assetchan/testnet.sh ecli getblockcount   # elements-cli, via docker
-#   contrib/assetchan/testnet.sh log A                # tail the log
+#   contrib/assetchan/nodes.sh start A [lightningd options...]
+#   contrib/assetchan/nodes.sh stop A
+#   contrib/assetchan/nodes.sh cli A getinfo        # lightning-cli
+#   contrib/assetchan/nodes.sh ecli getblockcount   # elements-cli
+#   contrib/assetchan/nodes.sh mine [n]             # regtest: mine n (1) blocks
+#   contrib/assetchan/nodes.sh log A                # tail the log
 #
-# Environment: ASSETCHAN_TESTNET_DIR (node data; default ~/.assetchan-testnet,
+# Environment: ASSETCHAN_NETWORK (liquid-testnet, or liquid-regtest),
+# ASSETCHAN_DIR (node data; default ~/.assetchan-testnet or ~/.assetchan-regtest,
 # never inside the source tree), ELEMENTS_RPC (default
-# http://poc:poc@127.0.0.1:7039: the liquid-ln-testnet docker stack's
-# elementsd, exposed with `docker run -d --name assetchan-elements-proxy
+# http://poc:poc@127.0.0.1:7039 on testnet: the liquid-ln-testnet docker
+# stack's elementsd, exposed with `docker run -d --name assetchan-elements-proxy
 # --network liquid-ln-testnet_default -p 127.0.0.1:7039:7039 alpine/socat
-# tcp-listen:7039,fork,reuseaddr tcp:elementsd:7039`), ELEMENTS_WALLET (poc),
-# ELEMENTS_CLI (how to run elements-cli; default: in that docker container;
-# lightningd's bcli plugin gets a wrapper script for it),
-# CHANNEL_ASSET (the asset id the nodes take channels in; see `testnet.sh
-# asset`).  python3 with pyln-client must be on PATH for the plugin.
+# tcp-listen:7039,fork,reuseaddr tcp:elementsd:7039`; on regtest
+# http://poc:poc@127.0.0.1:18884, the liquid-ln-poc stack's, exposed the same
+# way on network liquid-ln-poc_default), ELEMENTS_WALLET (poc), ELEMENTS_CLI
+# (how to run elements-cli; default: in that docker container; lightningd's
+# bcli plugin gets a wrapper script for it), CHANNEL_ASSET (the asset id the
+# nodes take channels in; default: $ASSETCHAN_DIR/asset).  python3 with
+# pyln-client must be on PATH for the plugin.
 set -e
 
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../.." && pwd)
-dir=${ASSETCHAN_TESTNET_DIR:-$HOME/.assetchan-testnet}
-rpc=${ELEMENTS_RPC:-http://poc:poc@127.0.0.1:7039}
+network=${ASSETCHAN_NETWORK:-liquid-testnet}
+case "$network" in
+liquid-testnet)
+	dir=${ASSETCHAN_DIR:-$HOME/.assetchan-testnet}
+	rpc=${ELEMENTS_RPC:-http://poc:poc@127.0.0.1:7039}
+	ecli=${ELEMENTS_CLI:-docker exec liquid-ln-testnet-elementsd-1 elements-cli -chain=liquidtestnet -rpcport=7039 -rpcuser=poc -rpcpassword=poc}
+	;;
+liquid-regtest)
+	dir=${ASSETCHAN_DIR:-$HOME/.assetchan-regtest}
+	rpc=${ELEMENTS_RPC:-http://poc:poc@127.0.0.1:18884}
+	ecli=${ELEMENTS_CLI:-docker exec liquid-ln-poc-elementsd-1 elements-cli -chain=liquid-regtest -rpcport=18884 -rpcuser=poc -rpcpassword=poc}
+	;;
+*)
+	echo "ASSETCHAN_NETWORK must be liquid-testnet or liquid-regtest" >&2
+	exit 1
+	;;
+esac
 wallet=${ELEMENTS_WALLET:-poc}
-ecli=${ELEMENTS_CLI:-docker exec liquid-ln-testnet-elementsd-1 elements-cli -chain=liquidtestnet -rpcport=7039 -rpcuser=poc -rpcpassword=poc}
 
 # user:pass@host:port out of the RPC url
 userpass=$(printf '%s' "$rpc" | sed -E 's|^[a-z]+://([^@]*)@.*|\1|')
@@ -37,6 +56,8 @@ port_of() {
 	case "$1" in
 	A) echo 20741 ;;
 	B) echo 20742 ;;
+	C) echo 20743 ;;
+	D) echo 20744 ;;
 	*) echo "no such node: $1" >&2; exit 1 ;;
 	esac
 }
@@ -57,7 +78,7 @@ start)
 	chmod +x "$dir/elements-cli"
 	# (--daemon: the daemon keeps our stdout, so give it its own)
 	exec "$root/lightningd/lightningd" \
-		--network=liquid-testnet \
+		--network="$network" \
 		--lightning-dir="$dir/$node" \
 		--alias="assetchan-$node" \
 		--bind-addr=127.0.0.1:"$port" \
@@ -79,15 +100,19 @@ start)
 		"$@" > "$dir/$node/stdout" 2>&1
 	;;
 stop)
-	"$root/cli/lightning-cli" --network=liquid-testnet --lightning-dir="$dir/$1" stop
+	"$root/cli/lightning-cli" --network="$network" --lightning-dir="$dir/$1" stop
 	;;
 cli)
 	node=$1
 	shift
-	exec "$root/cli/lightning-cli" --network=liquid-testnet --lightning-dir="$dir/$node" "$@"
+	exec "$root/cli/lightning-cli" --network="$network" --lightning-dir="$dir/$node" "$@"
 	;;
 ecli)
 	exec $ecli -rpcwallet="$wallet" "$@"
+	;;
+mine)
+	[ "$network" = liquid-regtest ] || { echo "nobody mines on $network" >&2; exit 1; }
+	$ecli -rpcwallet="$wallet" generatetoaddress "${1:-1}" "$($ecli -rpcwallet="$wallet" getnewaddress)"
 	;;
 log)
 	exec tail -n "${2:-30}" -f "$dir/$1/log"
