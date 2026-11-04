@@ -136,6 +136,11 @@ struct anchor_details *create_anchor_details(const tal_t *ctx,
 	if (!channel_type_has_anchors(channel->type))
 		return tal_free(adet);
 
+	/* Asset channel commitments pay their fee from the fee reserve, and
+	 * this doesn't build Elements transactions (no fee output). */
+	if (channel->asset)
+		return tal_free(adet);
+
 	if (!hsm_capable(ld, WIRE_HSMD_SIGN_ANCHORSPEND)) {
 		log_broken(ld->log, "hsm not capable of signing anchorspends!");
 		return tal_free(adet);

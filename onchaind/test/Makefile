@@ -18,6 +18,7 @@ onchaind/test/run-grind_feerate-bug:		\
 	wire/fromwire.o				\
 	common/amount.o				\
 	common/autodata.o			\
+	common/channel_asset.o			\
 	common/features.o			\
 	common/psbt_keypath.o			\
 	common/pseudorand.o			\

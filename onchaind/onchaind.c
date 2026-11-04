@@ -211,8 +211,66 @@ static void trim_maximum_feerate(struct amount_sat funding,
 	status_debug("... to %u", max_possible_feerate);
 }
 
+/* Asset channel: the channel's account is in units of its asset, so the
+ * L-BTC outputs of its transactions (anchors, fee outputs) stay out of it. */
+static struct bitcoin_outpoint *lbtc_outpoints;
+
+static bool is_asset_output(const struct wally_tx_output *out)
+{
+	struct amount_asset amt;
+
+	if (!chainparams->is_elements || !out || out->script_len == 0)
+		return false;
+	amt = wally_tx_output_get_amount(out);
+	return !amount_asset_is_main(&amt);
+}
+
+static void note_lbtc_outputs(const struct tx_parts *tx)
+{
+	if (!channel_asset())
+		return;
+	for (size_t i = 0; i < tal_count(tx->outputs); i++) {
+		struct bitcoin_outpoint op;
+
+		if (!tx->outputs[i] || is_asset_output(tx->outputs[i]))
+			continue;
+		op.txid = tx->txid;
+		op.n = i;
+		if (!lbtc_outpoints)
+			lbtc_outpoints = notleak(tal_arr(NULL,
+							 struct bitcoin_outpoint,
+							 0));
+		tal_arr_expand(&lbtc_outpoints, op);
+	}
+}
+
+static bool is_lbtc_outpoint(const struct bitcoin_outpoint *outpoint)
+{
+	for (size_t i = 0; i < tal_count(lbtc_outpoints); i++) {
+		if (bitcoin_outpoint_eq(&lbtc_outpoints[i], outpoint))
+			return true;
+	}
+	return false;
+}
+
+/* The output's amount: on an asset channel, in units of the asset (its
+ * anchors and fee output are L-BTC, which only ever gets recorded in sats). */
+static struct amount_sat output_amount(const struct wally_tx_output *out)
+{
+	struct amount_asset asset = wally_tx_output_get_amount(out);
+
+	if (!channel_asset())
+		assert(amount_asset_is_main(&asset));
+	return amount_sat(asset.value);
+}
+
 static void send_coin_mvt(struct chain_coin_mvt *mvt TAKES)
 {
+	if (channel_asset() && is_lbtc_outpoint(&mvt->outpoint)) {
+		tal_free_if_taken(mvt);
+		return;
+	}
+
 	wire_sync_write(REQ_FD,
 			take(towire_onchaind_notify_coin_mvt(NULL, mvt)));
 
@@ -360,6 +418,16 @@ static void record_coin_movements(struct tracked_output *out,
 						  mk_mvt_tags(MVT_HTLC_FULFILL));
 	}
 
+	/* Asset channel: we sweep our to_remote ourselves (the wallet can't
+	 * hold the asset), so the channel account never gets the deposit
+	 * lightningd's wallet makes for an L-BTC to_remote; without it the
+	 * withdrawal below underflows the account. */
+	if (channel_asset()
+	    && out->tx_type == THEIR_UNILATERAL
+	    && out->output_type == OUTPUT_TO_US)
+		record_channel_deposit(out, out->tx_blockheight,
+				       mk_mvt_tags(MVT_CHANNEL_TO_US));
+
 	if (out->tx_type == THEIR_REVOKED_UNILATERAL
 	    || out->resolved->tx_type == OUR_PENALTY_TX)
 		record_channel_deposit(out, out->tx_blockheight, mk_mvt_tags(MVT_PENALTY));
@@ -447,8 +515,10 @@ static bool set_htlc_timeout_fee(struct bitcoin_tx *tx,
 	struct amount_asset asset = bitcoin_tx_output_get_amount(tx, 0);
 	size_t weight;
 
-	amount = amount_asset_to_sat(&asset);
-	assert(amount_asset_is_main(&asset));
+	/* Asset channel: the HTLC tx pays out the asset. */
+	if (!channel_asset())
+		assert(amount_asset_is_main(&asset));
+	amount = amount_sat(asset.value);
 
 	/* BOLT #3:
 	 *
@@ -1082,7 +1152,6 @@ static void resolve_htlc_tx(struct tracked_output ***outs,
 {
 	struct tracked_output *out;
 	struct amount_sat amt;
-	struct amount_asset asset;
 	struct bitcoin_outpoint outpoint;
 	u8 *msg;
 	u8 *wscript = bitcoin_wscript_htlc_tx(tmpctx, to_self_delay[LOCAL],
@@ -1102,9 +1171,7 @@ static void resolve_htlc_tx(struct tracked_output ***outs,
 	outpoint.txid = htlc_tx->txid;
 	outpoint.n = input_num;
 
-	asset = wally_tx_output_get_amount(htlc_tx->outputs[outpoint.n]);
-	assert(amount_asset_is_main(&asset));
-	amt = amount_asset_to_sat(&asset);
+	amt = output_amount(htlc_tx->outputs[outpoint.n]);
 	out = new_tracked_output(outs, &outpoint,
  				 tx_blockheight,
  				 (*outs)[out_index]->resolved->tx_type,
@@ -1138,7 +1205,6 @@ static void steal_htlc_tx(struct tracked_output *out,
 			  const struct bitcoin_outpoint *htlc_outpoint)
 {
 	struct tracked_output *htlc_out;
-	struct amount_asset asset;
 	struct amount_sat htlc_out_amt;
 	const u8 *msg;
 
@@ -1146,9 +1212,7 @@ static void steal_htlc_tx(struct tracked_output *out,
 					      &keyset->self_revocation_key,
 					      &keyset->self_delayed_payment_key);
 
-	asset = wally_tx_output_get_amount(htlc_tx->outputs[htlc_outpoint->n]);
-	assert(amount_asset_is_main(&asset));
-	htlc_out_amt = amount_asset_to_sat(&asset);
+	htlc_out_amt = output_amount(htlc_tx->outputs[htlc_outpoint->n]);
 
 	htlc_out = new_tracked_output(outs,
 				      htlc_outpoint, htlc_tx_blockheight,
@@ -1693,6 +1757,7 @@ static void wait_for_resolved(struct tracked_output **outs)
 		case WIRE_ONCHAIND_NOTIFY_COIN_MVT:
 		case WIRE_ONCHAIND_NOTIFY_PENALTY_ADJ:
 		case WIRE_ONCHAIND_SPEND_TO_US:
+		case WIRE_ONCHAIND_SPEND_ASSET_TO_REMOTE:
 		case WIRE_ONCHAIND_SPEND_PENALTY:
 		case WIRE_ONCHAIND_SPEND_HTLC_SUCCESS:
 		case WIRE_ONCHAIND_SPEND_HTLC_TIMEOUT:
@@ -1784,6 +1849,7 @@ static void handle_mutual_close(struct tracked_output **outs,
 				const struct tx_parts *tx)
 {
 	/* In this case, we don't care about htlcs: there are none. */
+	note_lbtc_outputs(tx);
 	init_reply(tmpctx, "Tracking mutual close transaction");
 
 	/* Annotate the first input as close. We can currently only have a
@@ -2196,6 +2262,7 @@ static void handle_our_unilateral(const struct tx_parts *tx,
 	size_t i;
 	struct htlcs_info *htlcs_info;
 
+	note_lbtc_outputs(tx);
 	htlcs_info = init_reply(tx, "Tracking our own unilateral close");
 	onchain_annotate_txin(&tx->txid, 0, TX_CHANNEL_UNILATERAL);
 
@@ -2278,15 +2345,11 @@ static void handle_our_unilateral(const struct tx_parts *tx,
 		struct tracked_output *out;
 		const size_t *matches;
 		size_t which_htlc;
-		struct amount_asset asset = wally_tx_output_get_amount(tx->outputs[i]);
-		struct amount_sat amt;
+		struct amount_sat amt = output_amount(tx->outputs[i]);
 		struct bitcoin_outpoint outpoint;
 
 		outpoint.txid = tx->txid;
 		outpoint.n = i;
-
-		assert(amount_asset_is_main(&asset));
-		amt = amount_asset_to_sat(&asset);
 
 		if (chainparams->is_elements
 		    && tx->outputs[i]->script_len == 0) {
@@ -2568,11 +2631,7 @@ static void tell_wallet_to_remote(const struct tx_parts *tx,
 				  bool option_static_remotekey,
 				  u32 csv_lock)
 {
-	struct amount_asset asset = wally_tx_output_get_amount(tx->outputs[outpoint->n]);
-	struct amount_sat amt;
-
-	assert(amount_asset_is_main(&asset));
-	amt = amount_asset_to_sat(&asset);
+	struct amount_sat amt = output_amount(tx->outputs[outpoint->n]);
 
 	/* A NULL per_commit_point is how we indicate the pubkey doesn't need
 	 * changing. */
@@ -2588,6 +2647,47 @@ static void tell_wallet_to_remote(const struct tx_parts *tx,
 						     csv_lock)));
 }
 
+/* Asset channel: our to_remote output is in the asset, which the wallet
+ * can't hold, so lightningd sweeps it to our close script instead. */
+static void their_unilateral_asset_local(struct tracked_output ***outs,
+					 const struct bitcoin_outpoint *outpoint,
+					 u32 tx_blockheight,
+					 struct amount_sat amt,
+					 const u8 *local_scriptpubkey,
+					 enum tx_type tx_type,
+					 const struct pubkey *per_commit_point,
+					 u32 csv_lock)
+{
+	struct tracked_output *out;
+	const u8 *wscript, *msg;
+	u32 sequence;
+
+	out = new_tracked_output(outs, outpoint, tx_blockheight, tx_type, amt,
+				 OUTPUT_TO_US, NULL, NULL, NULL);
+
+	/* With anchors, to_remote is a P2WSH with a CSV lock (see
+	 * scriptpubkey_to_remote), otherwise a P2WPKH. */
+	if (option_anchor_outputs || option_anchors_zero_fee_htlc_tx) {
+		wscript = bitcoin_wscript_to_remote_anchored(tmpctx,
+							     &keyset->other_payment_key,
+							     csv_lock);
+		sequence = csv_lock;
+	} else {
+		wscript = tal_arr(tmpctx, u8, 0);
+		sequence = BITCOIN_TX_RBF_SEQUENCE;
+		csv_lock = 1;
+	}
+
+	msg = towire_onchaind_spend_asset_to_remote(NULL, outpoint, amt,
+						    sequence,
+						    rel_blockheight(out, csv_lock),
+						    per_commit_point,
+						    local_scriptpubkey, wscript);
+	propose_resolution_to_master(out, take(msg),
+				     rel_blockheight(out, csv_lock),
+				     OUR_DELAYED_RETURN_TO_WALLET);
+}
+
 static void their_unilateral_local(struct tracked_output ***outs,
 				   const struct tx_parts *tx,
 				   const struct bitcoin_outpoint *outpoint,
@@ -2598,6 +2698,16 @@ static void their_unilateral_local(struct tracked_output ***outs,
 				   u32 csv_lock)
 {
 	struct tracked_output *out;
+
+	if (channel_asset()) {
+		/* A NULL per_commit_point: the key doesn't need tweaking. */
+		their_unilateral_asset_local(outs, outpoint, tx_blockheight,
+					     amt, local_scriptpubkey, tx_type,
+					     commit_num >= static_remotekey_start[REMOTE]
+					     ? NULL : remote_per_commitment_point,
+					     csv_lock);
+		return;
+	}
 	/* BOLT #5:
 	 *
 	 * - MAY take no action in regard to the associated
@@ -2646,6 +2756,7 @@ static void handle_their_cheat(const struct tx_parts *tx,
 	size_t i;
 	struct htlcs_info *htlcs_info;
 
+	note_lbtc_outputs(tx);
 	htlcs_info = init_reply(tx,
 				"Tracking their illegal close: taking all funds");
 	onchain_annotate_txin(
@@ -2765,15 +2876,11 @@ static void handle_their_cheat(const struct tx_parts *tx,
 		struct tracked_output *out;
 		const size_t *matches;
 		size_t which_htlc;
-		struct amount_asset asset = wally_tx_output_get_amount(tx->outputs[i]);
-		struct amount_sat amt;
+		struct amount_sat amt = output_amount(tx->outputs[i]);
 		struct bitcoin_outpoint outpoint;
 
 		outpoint.txid = tx->txid;
 		outpoint.n = i;
-
-		assert(amount_asset_is_main(&asset));
-		amt = amount_asset_to_sat(&asset);
 
 		if (chainparams->is_elements
 		    && tx->outputs[i]->script_len == 0) {
@@ -2981,6 +3088,7 @@ static void handle_their_unilateral(const struct tx_parts *tx,
 	size_t i;
 	struct htlcs_info *htlcs_info;
 
+	note_lbtc_outputs(tx);
 	htlcs_info = init_reply(tx, "Tracking their unilateral close");
 	onchain_annotate_txin(&tx->txid, 0, TX_CHANNEL_UNILATERAL | TX_THEIRS);
 
@@ -3089,12 +3197,8 @@ static void handle_their_unilateral(const struct tx_parts *tx,
 		struct tracked_output *out;
 		const size_t *matches;
 		size_t which_htlc;
-		struct amount_asset asset = wally_tx_output_get_amount(tx->outputs[i]);
-		struct amount_sat amt;
+		struct amount_sat amt = output_amount(tx->outputs[i]);
 		struct bitcoin_outpoint outpoint;
-
-		assert(amount_asset_is_main(&asset));
-		amt = amount_asset_to_sat(&asset);
 
 		outpoint.txid = tx->txid;
 		outpoint.n = i;
@@ -3314,6 +3418,7 @@ static void handle_unknown_commitment(const struct tx_parts *tx,
 
 	onchain_annotate_txin(&tx->txid, 0, TX_CHANNEL_UNILATERAL | TX_THEIRS);
 
+	note_lbtc_outputs(tx);
 	resolved_by_other(outs[0], &tx->txid, UNKNOWN_UNILATERAL);
 
 	/* Normally, csv is 1, but for option_will_fund, we need to
@@ -3325,7 +3430,6 @@ static void handle_unknown_commitment(const struct tx_parts *tx,
 						      csv);
 
 		for (size_t i = 0; i < tal_count(tx->outputs); i++) {
-			struct amount_asset asset;
 			struct amount_sat amt;
 			struct bitcoin_outpoint outpoint;
 			struct tracked_output *out;
@@ -3334,12 +3438,20 @@ static void handle_unknown_commitment(const struct tx_parts *tx,
 						      local_script))
 				continue;
 
-			asset = wally_tx_output_get_amount(tx->outputs[i]);
-			assert(amount_asset_is_main(&asset));
-			amt = amount_asset_to_sat(&asset);
+			amt = output_amount(tx->outputs[i]);
 
 			outpoint.txid = tx->txid;
 			outpoint.n = i;
+
+			if (channel_asset()) {
+				their_unilateral_asset_local(&outs, &outpoint,
+							     tx_blockheight,
+							     amt, local_script,
+							     UNKNOWN_UNILATERAL,
+							     NULL, csv);
+				to_us_output = i;
+				goto found;
+			}
 
 			/* BOLT #5:
 			 *
@@ -3371,16 +3483,13 @@ found:
 	/* Record every unidentified output on this tx as an external
 	 * 'penalty' */
 	for (size_t i = 0; i < tal_count(tx->outputs); i++) {
-		struct amount_asset asset;
 		struct amount_sat amt;
 		struct bitcoin_outpoint outpoint;
 
 		if (i == to_us_output)
 			continue;
 
-		asset = wally_tx_output_get_amount(tx->outputs[i]);
-		assert(amount_asset_is_main(&asset));
-		amt = amount_asset_to_sat(&asset);
+		amt = output_amount(tx->outputs[i]);
 
 		outpoint.txid = tx->txid;
 		outpoint.n = i;
