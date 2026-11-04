@@ -1,19 +1,29 @@
 //! The `quoteassetinvoice` and `payassetinvoice` RPC methods (payer side).
 //! Neither one negotiates with the provider ahead of time -- there's no
 //! request/reply round trip, so no requirement that this node be directly
-//! connected to it. `payassetinvoice` tries a direct, same-asset payment
-//! first; failing that, it decides how much to send for leg 1 either from
-//! an explicit (`from_asset`, `from_amount_msat`) the caller already knows
-//! (e.g. a harness with cross-node visibility, like
-//! contrib/liquid-poc/lqui.py), or by pricing it from this node's own
-//! local `pricetiers-plugin` -- an estimate, not a commitment, since the
-//! provider makes the real decision live when leg 1 actually lands, in
-//! `htlc.rs`. Either way it sends leg 1 with the invoice packed into its
-//! `payment_metadata`, so the provider learns what to pay for leg 2 from
-//! the HTLC itself. `quoteassetinvoice` runs just the local-pricing half,
-//! for a caller that wants an estimate before deciding to pay -- it only
-//! works if this node happens to hold the same `pricetiers-pair=` config
-//! as the provider (see its own doc comment).
+//! connected to it.
+//!
+//! `payassetinvoice`'s optional `from_asset` is the caller's own choice of
+//! which asset to pay with: omitted, it's automatic (try a direct payment
+//! in the invoice's own asset, falling back to a swap only if that fails);
+//! given and equal to the invoice's own asset, it's a direct payment with
+//! no swap fallback (the caller asked for that asset specifically, so a
+//! failure is reported as such); given and different, it skips the direct
+//! attempt and goes straight to a swap priced in that asset. The
+//! accompanying `from_amount_msat` lets a caller that already knows the
+//! provider's rate (e.g. a harness with cross-node visibility, like
+//! contrib/liquid-poc/lqui.py) skip this node's own local pricing lookup
+//! for the exact leg-1 amount; without it, that amount comes from this
+//! node's own local `pricetiers-plugin` -- an estimate, not a commitment,
+//! since the provider makes the real decision live when leg 1 actually
+//! lands, in `htlc.rs`. Either way it sends leg 1 with the invoice packed
+//! into its `payment_metadata`, so the provider learns what to pay for leg
+//! 2 from the HTLC itself.
+//!
+//! `quoteassetinvoice` runs just the local-pricing half, for a caller that
+//! wants an estimate before deciding to pay -- it only works if this node
+//! happens to hold the same `pricetiers-pair=` config as the provider (see
+//! its own doc comment).
 
 use crate::assetinvoice::decode_wrapper;
 use crate::protocol::{asset_sha, encode_swap_metadata, fetch_price_tiers, SwapMetadata};
@@ -65,76 +75,112 @@ pub(crate) async fn payassetinvoice(p: Plugin<State>, args: Value) -> Result<Val
         .and_then(Value::as_str)
         .unwrap_or("medium")
         .to_string();
-    // An explicit (from_asset, from_amount_msat) lets a caller that already
-    // knows the provider's rate -- e.g. contrib/liquid-poc/lqui.py, which
-    // reads every node's config directly rather than this node's own --
-    // skip the local pricetiers-plugin lookup below entirely. Most payers
-    // won't have a matching `pricetiers-pair=` of their own (that config
-    // means "I'm a provider for this pair", which a plain payer isn't), so
-    // without this the swap fallback would only ever work for a node that
-    // happens to also hold that config.
-    let from_override = match (
-        param(&args, 2, "from_asset").and_then(Value::as_str),
-        param(&args, 3, "from_amount_msat").and_then(Value::as_u64),
-    ) {
-        (Some(a), Some(m)) => Some((a.to_string(), m)),
-        _ => None,
-    };
+    // from_asset: which asset to pay WITH, the payer's/caller's own choice.
+    // Omitted means automatic -- try a direct payment in the invoice's own
+    // asset first, falling back to a swap only if that fails (today's
+    // default). Given and equal to the invoice's own asset, this is just a
+    // direct payment, same as automatic but WITHOUT the swap fallback --
+    // the caller said "pay in this asset", so a failure is reported as
+    // such, not silently retried as a swap. Given and different, this
+    // skips the direct attempt entirely and goes straight to a swap priced
+    // in that asset.
+    //
+    // from_amount_msat (only meaningful alongside a from_asset that
+    // differs from the invoice's own): the exact leg-1 amount, letting a
+    // caller that already knows the provider's rate -- e.g.
+    // contrib/liquid-poc/lqui.py, which reads every node's config
+    // directly rather than this node's own -- skip the local
+    // pricetiers-plugin lookup below entirely. Most payers won't have a
+    // matching `pricetiers-pair=` of their own (that config means "I'm a
+    // provider for this pair", which a plain payer isn't), so without an
+    // amount here too, the swap would only ever price successfully on a
+    // node that happens to also hold that config.
+    let from_asset = param(&args, 2, "from_asset").and_then(Value::as_str).map(str::to_string);
+    let from_amount_override = param(&args, 3, "from_amount_msat").and_then(Value::as_u64);
     let wrapper = decode_wrapper(encoded)?;
 
     let mut rpc = new_rpc(&p).await?;
 
-    // Try the direct, same-asset path first — a payer may already hold
-    // channels in the required asset's network, in which case no swap is
-    // needed at all.
-    let direct_err = match rpc
-        .call_typed(&XpayRequest {
-            invstring: wrapper.bolt11.clone(),
-            asset: asset_sha(&wrapper.asset)?,
-            amount_msat: None,
-            dev_use_shadow: None,
-            label: None,
-            localinvreqid: None,
-            maxdelay: None,
-            maxfee: None,
-            partial_msat: None,
-            payer_note: None,
-            retry_for: None,
-            layers: None,
-        })
-        .await
-    {
-        Ok(res) => return Ok(json!(res)),
-        Err(e) => e,
+    let want_direct = from_asset.as_deref().is_none_or(|a| a == wrapper.asset);
+    let direct_err = if want_direct {
+        match rpc
+            .call_typed(&XpayRequest {
+                invstring: wrapper.bolt11.clone(),
+                asset: asset_sha(&wrapper.asset)?,
+                amount_msat: None,
+                dev_use_shadow: None,
+                label: None,
+                localinvreqid: None,
+                maxdelay: None,
+                maxfee: None,
+                partial_msat: None,
+                payer_note: None,
+                retry_for: None,
+                layers: None,
+            })
+            .await
+        {
+            Ok(res) => return Ok(json!(res)),
+            Err(e) => {
+                // An explicit from_asset == the invoice's own asset means
+                // the caller specifically chose to pay directly -- report
+                // that failure as-is, don't silently fall back to a swap
+                // in some other asset they didn't ask for.
+                if from_asset.is_some() {
+                    return Err(anyhow!("payment in {} failed: {e}", wrapper.asset));
+                }
+                Some(e)
+            }
+        }
+    } else {
+        None
     };
 
-    // No direct route: fall back to a swap-provider.
+    // No direct route (or the caller chose a different asset outright):
+    // fall back to a swap-provider.
     let Some(&provider) = p.state().config.providers.first() else {
         return Err(anyhow!(
-            "direct payment in asset {} failed ({direct_err}), and no \
-             assetswap-provider is configured to attempt a swap",
-            wrapper.asset
+            "{}no assetswap-provider is configured to attempt a swap",
+            direct_err.map(|e| format!("direct payment in asset {} failed ({e}), and ", wrapper.asset)).unwrap_or_default()
         ));
     };
 
     // No negotiation: decide how much to send for leg 1 either from the
-    // caller's own explicit override, or -- failing that -- by pricing it
-    // from this node's own local pricetiers-plugin (an estimate; see this
-    // function's own doc comment and quoteassetinvoice's). Either way the
-    // provider makes the real, binding call live when the HTLC lands
-    // (htlc.rs).
-    let (from_asset, from_amount_msat) = if let Some((a, m)) = from_override {
-        (a, m)
-    } else {
-        let priced = fetch_price_tiers(&mut rpc, &wrapper.asset, wrapper.amount_msat)
-            .await
-            .map_err(|e| anyhow!("direct payment failed ({direct_err}); can't price a swap locally: {e}"))?;
-        let tier = priced
-            .tiers
-            .iter()
-            .find(|t| t.name == tier_name)
-            .ok_or_else(|| anyhow!("no {tier_name:?} tier for this pair"))?;
-        (priced.from_asset, tier.from_amount_msat)
+    // caller's own explicit amount (alongside their chosen from_asset), or
+    // -- failing that -- by pricing it from this node's own local
+    // pricetiers-plugin (an estimate; see this function's own doc comment
+    // and quoteassetinvoice's). Either way the provider makes the real,
+    // binding call live when the HTLC lands (htlc.rs).
+    let (from_asset, from_amount_msat) = match (from_asset, from_amount_override) {
+        (Some(a), Some(m)) => (a, m),
+        (Some(a), None) => {
+            let priced = fetch_price_tiers(&mut rpc, &wrapper.asset, wrapper.amount_msat)
+                .await
+                .map_err(|e| anyhow!("can't price paying in {a}: {e}"))?;
+            if priced.from_asset != a {
+                return Err(anyhow!(
+                    "no pair configured paying {a} for {}: provider prices it in {} instead",
+                    wrapper.asset, priced.from_asset
+                ));
+            }
+            let tier = priced
+                .tiers
+                .iter()
+                .find(|t| t.name == tier_name)
+                .ok_or_else(|| anyhow!("no {tier_name:?} tier for this pair"))?;
+            (priced.from_asset, tier.from_amount_msat)
+        }
+        (None, _) => {
+            let priced = fetch_price_tiers(&mut rpc, &wrapper.asset, wrapper.amount_msat)
+                .await
+                .map_err(|e| anyhow!("direct payment failed; can't price a swap locally: {e}"))?;
+            let tier = priced
+                .tiers
+                .iter()
+                .find(|t| t.name == tier_name)
+                .ok_or_else(|| anyhow!("no {tier_name:?} tier for this pair"))?;
+            (priced.from_asset, tier.from_amount_msat)
+        }
     };
 
     let decoded = rpc

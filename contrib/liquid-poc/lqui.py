@@ -304,13 +304,14 @@ def build_job(body):
         tier = body.get('tier') or 'medium'
         if tier not in ('low', 'medium', 'high'):
             raise BadRequest("tier: pick low, medium or high")
-        # node's own local pricetiers-plugin can't price this unless node
-        # is itself a provider -- ask a real provider's instead (see
-        # assetswap-plugin/src/pay.rs's doc comment for why
-        # payassetinvoice takes this as an explicit override now).
-        from_asset, from_amount_msat = L.swap_quote(invoice, tier)
+        # from_asset: the asset the user picked on the Pay invoice form
+        # ("Auto" sends ''/nothing). cmd_payassetinvoice resolves the
+        # amount itself -- direct-only if this equals the invoice's own
+        # asset, swap priced in it otherwise, fully automatic if omitted
+        # (see its own doc comment and assetswap-plugin/src/pay.rs's).
+        from_asset = (body.get('from_asset') or '').strip() or None
         args = ns(node=node, assetinvoice=invoice, tier=tier,
-                  from_asset=from_asset, from_amount_msat=from_amount_msat)
+                  from_asset=from_asset, from_amount_msat=None)
 
         def do_pay():
             L.cmd_payassetinvoice(args)
