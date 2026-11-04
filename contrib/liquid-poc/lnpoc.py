@@ -119,6 +119,8 @@ def cln_service(name):
         --bitcoin-rpcpassword=poc
         --log-level=debug
         --developer{dev_flags}
+        --plugin=/opt/lightning/libexec/c-lightning/plugins/assetswap-plugin
+        --plugin=/opt/lightning/libexec/c-lightning/plugins/pricetiers-plugin
     volumes:
       - {name}-data:/data
 """
@@ -370,6 +372,41 @@ def cmd_down(args):
         os.remove(STATE_FILE)
 
 
+def swap_providers():
+    """Names of nodes currently configured as a swap provider (any
+    `pricetiers-pair=` line in their config) -- used to wire up a new node
+    as their payer the same way `cmd_setup` wires up alice/bob/carol."""
+    providers = []
+    for name in all_nodes():
+        try:
+            configs = ln(name, 'listconfigs')['configs']
+        except Fail:
+            continue
+        if (configs.get('pricetiers-pair') or {}).get('values_str'):
+            providers.append(name)
+    return providers
+
+
+def swap_quote(assetinvoice, tier):
+    """(from_asset, from_amount_msat) for assetinvoice at tier, computed by
+    asking a swap-provider node's own quoteassetinvoice RPC -- the one node
+    whose local pricetiers-plugin actually has a real answer, since that's
+    the config that makes it a provider in the first place. payassetinvoice
+    doesn't do this lookup itself anymore (see assetswap-plugin/src/pay.rs's
+    doc comment), so anything calling it on a plain payer node needs to
+    supply the result as an explicit override. (None, None) if there's no
+    provider, or it doesn't quote this pair/tier."""
+    providers = swap_providers()
+    if not providers:
+        return None, None
+    try:
+        res = ln(providers[0], 'quoteassetinvoice', assetinvoice=assetinvoice)
+    except Fail:
+        return None, None
+    t = next((t for t in res.get('tiers') or [] if t['name'] == tier), None)
+    return (res.get('from_asset'), t['from_amount_msat']) if t else (None, None)
+
+
 def cmd_add_node(args):
     """Add one more Core Lightning node to the running stack: write its
     service into the overlay compose file, build and start it (reusing the
@@ -391,6 +428,22 @@ def cmd_add_node(args):
     state['extra_nodes'] = extra + [name]
     save_state(state)
     print(f"{name} is up: {node_id(name)}")
+
+    # Same `liquid-gossip-asset=` follow_asset() gives the original nodes in
+    # cmd_setup -- without it this node can open asset channels but can't
+    # announce them ("it's not a liquid-gossip-asset").
+    asset = state.get('asset')
+    if asset:
+        add_config_lines(name, [f'liquid-gossip-asset={asset}'])
+
+    # assetinvoice is just `invoice` wrapped with the required asset, so it
+    # already works on any node (the plugin is baked into the image). But
+    # payassetinvoice's swap fallback needs an `assetswap-provider=` pointing
+    # at a real provider to quote against -- wire that up now so a fresh
+    # node can swap immediately, the same way the original nodes can.
+    for provider in swap_providers():
+        if provider != name:
+            cmd_swap_payer(argparse.Namespace(node=name, provider=provider))
 
     fund_sat = getattr(args, 'fund_sat', 0)
     if fund_sat:
@@ -680,7 +733,11 @@ def cmd_swap_provider(args):
 def cmd_swap_payer(args):
     """Configure node to use provider as its swap provider.  Persistent,
     same as swap-provider (not strictly required on the payer side, but
-    harmless and keeps the two commands symmetric)."""
+    harmless and keeps the two commands symmetric). No connect step needed:
+    assetswap-plugin no longer negotiates a quote over a direct peer
+    connection -- leg 1 is a routed payment like any other, so node only
+    needs a path to provider through the asset's announced channels, not a
+    direct link to it."""
     provider_id = node_id(args.provider)
     add_config_lines(args.node, [f'assetswap-provider={provider_id}'])
     print(f"{args.node}: will use {args.provider} ({provider_id}) as a swap provider")
@@ -697,10 +754,29 @@ def cmd_assetinvoice(args):
     return res
 
 
+def cmd_quoteassetinvoice(args):
+    """Ask node's own local pricetiers-plugin what paying an assetinvoice
+    string would cost, without paying it (quoteassetinvoice RPC). Only
+    returns real numbers if node happens to hold the same pricetiers-pair=
+    config as the swap provider -- see the plugin's own doc comment."""
+    res = ln(args.node, 'quoteassetinvoice', assetinvoice=args.assetinvoice)
+    for t in res.get('tiers') or []:
+        print(f"{t['name']:6} {t['from_amount_msat']:,} msat of {asset_label(res.get('from_asset'))}")
+    return res
+
+
 def cmd_payassetinvoice(args):
     """Pay an assetinvoice string from node, swapping via a configured
-    provider if node doesn't hold the required asset directly."""
-    res = ln(args.node, 'payassetinvoice', assetinvoice=args.assetinvoice, tier=args.tier)
+    provider if node doesn't hold the required asset directly. node's own
+    local pricetiers-plugin can't price the swap unless node is itself a
+    provider (see assetswap-plugin/src/pay.rs's doc comment), so unless
+    --from-asset/--from-amount-msat were given explicitly, ask a real
+    provider for one via swap_quote() instead of leaving it to fail."""
+    from_asset, from_amount_msat = getattr(args, 'from_asset', None), getattr(args, 'from_amount_msat', None)
+    if from_asset is None and from_amount_msat is None:
+        from_asset, from_amount_msat = swap_quote(args.assetinvoice, args.tier)
+    res = ln(args.node, 'payassetinvoice', assetinvoice=args.assetinvoice, tier=args.tier,
+             from_asset=from_asset, from_amount_msat=from_amount_msat)
     print(f"paid {res['amount_msat']} msat, preimage {res['payment_preimage']}")
     return res
 
@@ -714,7 +790,9 @@ def cmd_swap(args):
     inv = ln(args.to, 'assetinvoice', amount_msat=args.amount_msat, label=label,
              description=f"lnpoc swap {asset_label(asset)}", asset=asset)
     print(f"invoiced {args.amount_msat} msat of {asset_label(asset)} on {args.to}, paying from {args.frm} ...")
-    res = ln(args.frm, 'payassetinvoice', assetinvoice=inv['assetinvoice'], tier=args.tier)
+    from_asset, from_amount_msat = swap_quote(inv['assetinvoice'], args.tier)
+    res = ln(args.frm, 'payassetinvoice', assetinvoice=inv['assetinvoice'], tier=args.tier,
+             from_asset=from_asset, from_amount_msat=from_amount_msat)
     print(f"swapped: {args.frm} -> {args.to}, {res['amount_msat']} msat sent, "
           f"preimage {res['payment_preimage']}")
 
@@ -1060,11 +1138,17 @@ def main():
     sp.add_argument('amount_msat', type=int)
     sp.add_argument('asset', help="asset id, or 'lbtc'")
     sp.add_argument('--label')
+    sp = add('quoteassetinvoice', cmd_quoteassetinvoice,
+             'ask the configured provider what paying an assetinvoice string would cost')
+    sp.add_argument('node', choices=NODES)
+    sp.add_argument('assetinvoice')
     sp = add('payassetinvoice', cmd_payassetinvoice,
              'pay an assetinvoice string, swapping via a configured provider if needed')
     sp.add_argument('node', choices=NODES)
     sp.add_argument('assetinvoice')
     sp.add_argument('--tier', choices=['low', 'medium', 'high'], default='medium')
+    sp.add_argument('--from-asset', help="skip node's own local pricetiers lookup: asset id, or 'lbtc'")
+    sp.add_argument('--from-amount-msat', type=int, help='paired with --from-asset')
     sp = add('swap', cmd_swap,
              'invoice on `to` requiring asset, pay it from `frm` (swapping via its provider if needed)')
     sp.add_argument('frm', choices=NODES)
