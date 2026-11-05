@@ -111,15 +111,16 @@ Explicit (unblinded) outputs only.
 - **Unilateral close**: `onchaind` recognizes outputs by script as today and reads
   asset amounts (its L-BTC outputs, anchors and fee, stay out of the channel's
   asset-denominated account). Every asset output we own (`to_local` after CSV,
-  `to_remote`, HTLC outputs and HTLC-tx outputs, penalties) goes through one "asset
-  sweep" builder in lightningd: the asset output is input 0 and goes in full to output 0
-  (the channel's close script, or the HTLC-tx output for HTLC txs), wallet L-BTC inputs
-  pay the fee and the rest comes back to the wallet as P2WPKH change; rebuilt before
-  every rebroadcast with whatever L-BTC the wallet has. `to_remote` is swept too
-  (`onchaind_spend_asset_to_remote`, signed like a wallet to_remote UTXO) instead of
-  being handed to the wallet, which can't hold assets. The fee is capped at the
-  channel's reserve (we can't price the asset in L-BTC). Anchors: `anchorspend.c` is off
-  for asset channels (the commitment pays its own fee; it isn't Elements-aware).
+  `to_remote`, HTLC outputs and HTLC-tx outputs, penalties) is spent through upstream's
+  own sweep path (`onchain_signing_info`, `create_onchain_tx`, rebroadcast): the asset
+  output is input 0 and goes in full to output 0 (the channel's close script, or the
+  HTLC-tx output for HTLC txs), wallet L-BTC inputs pay the fee and the rest comes back
+  to the wallet as P2WPKH change; rebuilt before every rebroadcast with whatever L-BTC
+  the wallet has. `to_remote` is swept too, from the same `onchaind_add_utxo`
+  notification upstream hands the wallet (which can't hold assets). The fee is capped
+  at the channel's reserve (we can't price the asset in L-BTC). Anchors:
+  `anchorspend.c` is off for asset channels (the commitment pays its own fee; it isn't
+  Elements-aware).
 - **Invariants (core)**: one asset per channel; `forward_htlc` refuses a different asset
   in/out and `best_channel` matches the asset (`lightningd/peer_htlcs.c`, ~20 lines).
 - **Operational**: every node holding asset channels needs some L-BTC in its CLN wallet
@@ -134,16 +135,16 @@ Explicit (unblinded) outputs only.
 | C2 | Asset tags on channel tx outputs; fee computation counts only the fee asset; tx parser reads asset amounts instead of asserting L-BTC | `bitcoin/{tx,psbt,tx_parts}.c`, `common/{initial_commit_tx,htlc_tx,close_tx}.c`, `channeld/commit_tx.c` | 150 | tx builders live in daemons |
 | C3 | Reserve input + second signature + `hsmd` signing both inputs; `sign_last_tx` | `openingd`, `channeld`, `closingd`, `hsmd/{hsmd,libhsmd}.c`, `hsmd_wire.csv`, `lightningd/peer_control.c` | 400 | protocol + signer |
 | C4 | Allow anchors on Elements for asset channels (`lightningd/options.c:1854`); skip fee subtraction; fee output = reserve − anchors; ignore `update_fee` | `lightningd/options.c`, `channeld/{commit_tx,channeld}.c` | 40 | |
-| C5 | Asset sweeps: one builder (asset in → asset out to the close script, wallet L-BTC for the fee) behind every spend kind; `to_remote` swept (`onchaind_spend_asset_to_remote`) instead of handed to the wallet; L-BTC outputs kept out of the asset account; `anchorspend` off | `lightningd/onchain_control.c`, `onchaind/onchaind.c`, `onchaind_wire.csv`, `lightningd/anchorspend.c` | 550 | `onchaind` + channel keys |
+| C5 | Asset sweeps on upstream's sweep path (`onchain_signing_info` / `create_onchain_tx` / rebroadcast): `onchaind_tx_unsigned` builds an asset sweep (asset in → asset out to the close script, wallet L-BTC for the fee, capped at the fee reserve, p2wpkh change) and `onchaind_tx` signs it; `to_remote` swept from the upstream `add_utxo` notification; HTLC txs via upstream `htlc_tx` with Elements fixes; `anchorspend` off | `lightningd/onchain_control.c`, `onchaind/onchaind.c`, `onchaind_wire.csv`, `bitcoin/psbt.c`, `lightningd/anchorspend.c` | 350 | `onchaind` + channel keys |
 | C6 | `fundchannel_complete` verifies output n (asset, amount, explicit) and n+1 (L-BTC, reserve); funding watch by asset | `lightningd/opening_control.c`, `lightningd/watch.c` | 60 | safety |
 | C7 | `liquid-testnet` chainparams | `bitcoin/chainparams.c` | 35 | |
 | C8 | Gossip can verify an asset channel: the block scan records every explicit P2WSH output (any asset, its units as the amount) in the utxoset and filtered blocks, and `fundchannel_start` no longer insists on `announce=false` | `lightningd/{chaintopology,bitcoind,opening_control}.c` | 10 | gossip verification is in lightningd |
 
 Target was ≈ 1,500 lines (vs 4,370 on `liquid-merged`). **Measured** (`git diff --stat
-master`, 2026-11-04, without `contrib/assetchan`, the pytest and the generated
-`msggen/schema.json`): 62 files, +2,625/−152, of which unit/fuzz tests +297; by area:
-lightningd +1,103 (C5's sweeps ≈ 700 of it), common +404, onchaind +175, openingd +169,
-bitcoin +133, closingd +122, hsmd +77, channeld +74, doc +36, wallet +19, wire +16.
+master`, 2026-11-05, without `contrib/assetchan`, the pytest and the generated
+`msggen/schema.json`): 81 files, +2,099/−343, of which unit/fuzz tests +307; by area:
+lightningd +676 (C5's sweeps ≈ 340 of it), common +589, openingd +172, bitcoin +146,
+channeld +100, hsmd +99, onchaind +98, closingd +64, doc +42, wire +34, wallet +27.
 The table's per-change numbers are the estimates. **Not in core** (vs the branch): asset wallet (`withdrawasset`, `listassetfunds`,
 `our_asset_outputs`), `invoice asset=`, per-asset gossip (gossipd/connectd/gossmap,
 ~600 lines; see Gossip in §7), askrene/xpay/topology `asset=`, the custom
