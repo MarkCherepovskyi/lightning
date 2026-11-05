@@ -3522,7 +3522,8 @@ int main(int argc, char *argv[])
 		master_badmsg(WIRE_ONCHAIND_INIT, msg);
 	}
 
-	chan_asset = notleak(tal_steal(ctx, asset));
+	/* (Ordinary channels have none, and notleak() can't take NULL.) */
+	chan_asset = asset ? notleak(tal_steal(ctx, asset)) : NULL;
 
 	/* We need to keep tx around, but there's only one: not really a leak */
 	tal_steal(ctx, notleak(tx));
