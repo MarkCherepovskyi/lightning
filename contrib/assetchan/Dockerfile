@@ -67,7 +67,7 @@ RUN python3 -m venv /venv \
       'pytest>=8' pytest-xdist pytest-timeout pytest-rerunfailures \
       ephemeral-port-reserve psycopg2-binary python-bitcoinlib jsonschema \
       Flask 'cheroot<=10' psutil requests mnemonic \
-      base58 bitstring coincurve cryptography PySocks mako
+      base58 bitstring coincurve cryptography PySocks mako websocket-client
 COPY --from=elements /usr/local/bin/elementsd /usr/local/bin/elements-cli /usr/local/bin/
 COPY --from=bitcoin /usr/local/bin/bitcoind /usr/local/bin/bitcoin-cli /usr/local/bin/
 ENV PATH=/venv/bin:${PATH}
