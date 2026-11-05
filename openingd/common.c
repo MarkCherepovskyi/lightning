@@ -21,6 +21,7 @@ bool check_config_bounds(const tal_t *ctx,
 			 const struct channel_config *remoteconf,
 			 const struct channel_config *localconf,
 			 bool option_anchors_zero_fee_htlc_tx,
+			 const struct channel_asset *asset,
 			 char **err_reason)
 {
 	struct amount_sat capacity;
@@ -91,7 +92,7 @@ bool check_config_bounds(const tal_t *ctx,
 
 	/* They have to pay for fees, too.  Assuming HTLC is dust, though,
 	 * we don't account for an HTLC output. */
-	fee = commit_tx_base_fee(feerate_per_kw, 0,
+	fee = commit_tx_base_fee(asset, feerate_per_kw, 0,
 				 false,
 				 option_anchors_zero_fee_htlc_tx);
 	if (!amount_sat_sub(&capacity, capacity, fee)) {

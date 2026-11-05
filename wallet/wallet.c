@@ -2190,8 +2190,11 @@ static struct channel *wallet_stmt2channel(struct wallet *w, struct db_stmt *stm
 
 	/* Asset channel? */
 	if (!db_col_is_null(stmt, "asset"))
-		chan->asset = db_col_arr(chan, stmt, "asset", u8);
-	chan->fee_reserve = db_col_amount_sat(stmt, "fee_reserve");
+		chan->asset = channel_asset_new(chan,
+						db_col_arr(tmpctx, stmt, "asset", u8),
+						db_col_amount_sat(stmt, "fee_reserve"));
+	else
+		db_col_ignore(stmt, "fee_reserve");
 
 	if (!wallet_channel_load_inflights(w, chan)) {
 		tal_free(chan);
@@ -2842,11 +2845,13 @@ void wallet_channel_save(struct wallet *w, struct channel *chan)
 	else
 		db_bind_null(stmt);
 	db_bind_int(stmt, chan->withheld);
-	if (chan->asset)
-		db_bind_blob(stmt, chan->asset, tal_bytelen(chan->asset));
-	else
+	if (chan->asset) {
+		db_bind_blob(stmt, chan->asset->tag, sizeof(chan->asset->tag));
+		db_bind_amount_sat(stmt, chan->asset->fee_reserve);
+	} else {
 		db_bind_null(stmt);
-	db_bind_amount_sat(stmt, chan->fee_reserve);
+		db_bind_amount_sat(stmt, AMOUNT_SAT(0));
+	}
 	db_bind_u64(stmt, chan->dbid);
 	db_exec_prepared_v2(take(stmt));
 

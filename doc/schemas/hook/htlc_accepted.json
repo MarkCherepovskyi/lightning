@@ -179,6 +179,12 @@
             "description": [
               "Optional TLV stream attached to the HTLC."
             ]
+          },
+          "asset": {
+            "type": "string",
+            "description": [
+              "The asset of the channel the HTLC arrived on, when it is an asset channel (the `amount_msat` is then in that asset's units, times 1000)."
+            ]
           }
         }
       },

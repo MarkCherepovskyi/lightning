@@ -1085,8 +1085,7 @@ static struct channel *handle_init(struct info *info, const u8 *init_msg)
 	char *err_reason;
 	struct wally_tx_output *direct_outputs[NUM_SIDES];
 	struct htlc_map *htlc_map;
-	u8 *asset;
-	struct amount_sat fee_reserve;
+	struct channel_asset *asset;
 
 	if (!fromwire_channeld_init(info, init_msg,
 				    &chainparams,
@@ -1145,7 +1144,7 @@ static struct channel *handle_init(struct info *info, const u8 *init_msg)
 				    &pbases,
 				    &inflights,
 				    &local_alias,
-				    &asset, &fee_reserve))
+				    &asset))
 		abort();
 
 	status_debug("Parsed init...");

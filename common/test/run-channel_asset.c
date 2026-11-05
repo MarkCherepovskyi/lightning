@@ -1,5 +1,6 @@
 #include "config.h"
 #include <assert.h>
+#include <ccan/mem/mem.h>
 #include <common/channel_asset.c>
 #include <common/pseudorand.h>
 #include <common/setup.h>
@@ -39,16 +40,20 @@ static void test_hex(void)
 static void test_eq(void)
 {
 	u8 *a = channel_asset_from_hex(tmpctx, ID, strlen(ID));
-	u8 *b = channel_asset_from_hex(tmpctx, ID, strlen(ID));
 	u8 *c = channel_asset_from_hex(tmpctx, OTHER, strlen(OTHER));
+	struct channel_asset *x = channel_asset_new(tmpctx, a, AMOUNT_SAT(1));
+	struct channel_asset *y = channel_asset_new(tmpctx, a, AMOUNT_SAT(2));
+	struct channel_asset *z = channel_asset_new(tmpctx, c, AMOUNT_SAT(1));
 
-	/* NULL is L-BTC */
+	/* NULL is L-BTC; the fee reserve isn't part of the identity. */
 	assert(channel_asset_eq(NULL, NULL));
-	assert(!channel_asset_eq(a, NULL));
-	assert(!channel_asset_eq(NULL, a));
-	assert(channel_asset_eq(a, a));
-	assert(channel_asset_eq(a, b));
-	assert(!channel_asset_eq(a, c));
+	assert(!channel_asset_eq(x, NULL));
+	assert(!channel_asset_eq(NULL, x));
+	assert(channel_asset_eq(x, x));
+	assert(channel_asset_eq(x, y));
+	assert(!channel_asset_eq(x, z));
+	assert(channel_asset_tag(NULL) == NULL);
+	assert(channel_asset_tag(x) == x->tag);
 
 	u8 **list = tal_arr(tmpctx, u8 *, 1);
 	list[0] = c;
@@ -63,33 +68,25 @@ static void test_eq(void)
 static void test_wire(void)
 {
 	u8 *a = channel_asset_from_hex(tmpctx, ID, strlen(ID));
-	u8 *empty = tal_arr(tmpctx, u8, 0);
-	u8 *odd = tal_arr(tmpctx, u8, 5);
-	u8 *dup;
+	struct channel_asset *x = channel_asset_new(tmpctx, a, AMOUNT_SAT(12345));
+	struct channel_asset y;
+	u8 *wire = tal_arr(tmpctx, u8, 0);
+	const u8 *cursor;
+	size_t max;
 
-	/* On the wire an empty array means "none" (an ordinary channel). */
-	assert(channel_asset_or_null(NULL) == NULL);
-	assert(channel_asset_or_null(empty) == NULL);
-	assert(channel_asset_or_null(odd) == NULL);
-	assert(channel_asset_or_null(a) == a);
-
-	assert(channel_asset_dup(tmpctx, NULL) == NULL);
-	dup = channel_asset_dup(tmpctx, a);
-	assert(dup != a);
-	assert(channel_asset_eq(dup, a));
+	towire_channel_asset(&wire, x);
+	assert(tal_bytelen(wire) == ELEMENTS_ASSET_LEN + 8);
+	cursor = wire;
+	max = tal_bytelen(wire);
+	fromwire_channel_asset(&cursor, &max, &y);
+	assert(max == 0);
+	assert(channel_asset_eq(&y, x));
+	assert(y.fee_reserve.satoshis == 12345); /* Raw: test */
 }
 
-static void test_channel_asset(void)
+static void test_fee_reserve_outpoint(void)
 {
-	u8 *a = channel_asset_from_hex(tmpctx, ID, strlen(ID));
 	struct bitcoin_outpoint funding, reserve;
-
-	/* A subdaemon serves one channel: an ordinary one by default. */
-	assert(channel_asset() == NULL);
-
-	channel_asset_set(a, AMOUNT_SAT(12345));
-	assert(channel_asset_eq(channel_asset(), a));
-	assert(channel_fee_reserve().satoshis == 12345); /* Raw: test */
 
 	/* The fee reserve is the output after the funding output. */
 	memset(&funding, 7, sizeof(funding));
@@ -99,9 +96,6 @@ static void test_channel_asset(void)
 	assert(memcmp(&reserve.txid, &funding.txid, sizeof(funding.txid)) == 0);
 	funding.n = 41;
 	assert(fee_reserve_outpoint(&funding).n == 42);
-
-	channel_asset_set(NULL, AMOUNT_SAT(0));
-	assert(channel_asset() == NULL);
 }
 
 static void test_explicit(void)
@@ -142,39 +136,40 @@ static void test_explicit(void)
 
 static void test_finish_tx(void)
 {
-	const u8 *asset = channel_asset_from_hex(tmpctx, ID, strlen(ID));
+	const u8 *tag = channel_asset_from_hex(tmpctx, ID, strlen(ID));
+	const struct channel_asset *asset
+		= channel_asset_new(tmpctx, tag, AMOUNT_SAT(2000));
 	/* Any script will do: a P2WPKH shape. */
 	u8 *script = tal_arrz(tmpctx, u8, 22);
 	struct bitcoin_tx *tx;
 	struct amount_asset amt;
 
 	script[1] = 0x14;
-	channel_asset_set(asset, AMOUNT_SAT(2000));
 
 	/* A 100000-unit channel: 60000 to the opener (output 0), 39000 to
 	 * the other side (1), an anchor in the chain's coin (2), and 1000
 	 * units of trimmed HTLCs unpaid. */
 	tx = bitcoin_tx(tmpctx, chainparams, 2, 4, 0);
-	bitcoin_tx_add_asset_output(tx, script, NULL, AMOUNT_SAT(60000), asset);
-	bitcoin_tx_add_asset_output(tx, script, NULL, AMOUNT_SAT(39000), asset);
+	bitcoin_tx_add_asset_output(tx, script, NULL, AMOUNT_SAT(60000), tag);
+	bitcoin_tx_add_asset_output(tx, script, NULL, AMOUNT_SAT(39000), tag);
 	bitcoin_tx_add_output(tx, script, NULL, AMOUNT_SAT(330));
 
 	/* The leftovers go to the opener's output. */
-	channel_asset_finish_tx(tx, AMOUNT_SAT(100000), 0, 1);
+	channel_asset_finish_tx(tx, asset, AMOUNT_SAT(100000), 0, 1);
 	amt = bitcoin_tx_output_get_amount(tx, 0);
-	assert(channel_asset_eq(amt.asset, asset) && amt.value == 61000);
+	assert(memeq(amt.asset, ELEMENTS_ASSET_LEN, tag, ELEMENTS_ASSET_LEN) && amt.value == 61000);
 	amt = bitcoin_tx_output_get_amount(tx, 1);
-	assert(channel_asset_eq(amt.asset, asset) && amt.value == 39000);
+	assert(memeq(amt.asset, ELEMENTS_ASSET_LEN, tag, ELEMENTS_ASSET_LEN) && amt.value == 39000);
 	amt = bitcoin_tx_output_get_amount(tx, 2);
 	assert(amount_asset_is_main(&amt) && amt.value == 330);
 
 	/* Without an opener output, to the other side's. */
-	channel_asset_finish_tx(tx, AMOUNT_SAT(100500), -1, 1);
+	channel_asset_finish_tx(tx, asset, AMOUNT_SAT(100500), -1, 1);
 	amt = bitcoin_tx_output_get_amount(tx, 1);
 	assert(amt.value == 39500);
 
 	/* Nothing left over: nothing changes. */
-	channel_asset_finish_tx(tx, AMOUNT_SAT(100500), 0, 1);
+	channel_asset_finish_tx(tx, asset, AMOUNT_SAT(100500), 0, 1);
 	amt = bitcoin_tx_output_get_amount(tx, 0);
 	assert(amt.value == 61000);
 	amt = bitcoin_tx_output_get_amount(tx, 1);
@@ -189,7 +184,6 @@ static void test_finish_tx(void)
 		assert(reserve.n == 4);
 		assert(bitcoin_txid_eq(&reserve.txid, &funding.txid));
 	}
-	channel_asset_set(NULL, AMOUNT_SAT(0));
 }
 
 int main(int argc, char *argv[])
@@ -200,7 +194,7 @@ int main(int argc, char *argv[])
 	test_hex();
 	test_eq();
 	test_wire();
-	test_channel_asset();
+	test_fee_reserve_outpoint();
 	test_explicit();
 	test_finish_tx();
 

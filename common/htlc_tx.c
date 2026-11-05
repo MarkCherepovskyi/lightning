@@ -3,7 +3,6 @@
 #include <bitcoin/script.h>
 #include <common/htlc_tx.h>
 #include <common/keyset.h>
-#include <common/channel_asset.h>
 
 /* Low-level tx creator: used when onchaind has done most of the work! */
 struct bitcoin_tx *htlc_tx(const tal_t *ctx,
@@ -16,7 +15,7 @@ struct bitcoin_tx *htlc_tx(const tal_t *ctx,
 			   u32 locktime,
 			   bool option_anchor_outputs,
 			   bool option_anchors_zero_fee_htlc_tx,
-			   const u8 *asset)
+			   const u8 *asset_tag)
 {
 	/* BOLT #3:
 	 * * locktime: `0` for HTLC-success, `cltv_expiry` for HTLC-timeout
@@ -47,7 +46,7 @@ struct bitcoin_tx *htlc_tx(const tal_t *ctx,
 	 */
 	bitcoin_tx_add_asset_input(tx, commit,
 				   (option_anchor_outputs || option_anchors_zero_fee_htlc_tx) ? 1 : 0,
-				   NULL, amount, NULL, commit_wscript, asset);
+				   NULL, amount, NULL, commit_wscript, asset_tag);
 
 	/* BOLT #3:
 	 * * txout count: 1
@@ -63,7 +62,7 @@ struct bitcoin_tx *htlc_tx(const tal_t *ctx,
 		return tal_free(tx);
 
 	bitcoin_tx_add_asset_output(tx, scriptpubkey_p2wsh(tmpctx, htlc_tx_wscript),
-				    htlc_tx_wscript, amount, asset);
+				    htlc_tx_wscript, amount, asset_tag);
 
 	bitcoin_tx_finalize(tx);
 	assert(bitcoin_tx_check(tx));
@@ -80,7 +79,8 @@ struct bitcoin_tx *htlc_success_tx(const tal_t *ctx,
 				   u32 feerate_per_kw,
 				   const struct keyset *keyset,
 				   bool option_anchor_outputs,
-				   bool option_anchors_zero_fee_htlc_tx)
+				   bool option_anchors_zero_fee_htlc_tx,
+				   const u8 *asset_tag)
 {
 	const u8 *htlc_wscript;
 
@@ -101,7 +101,7 @@ struct bitcoin_tx *htlc_success_tx(const tal_t *ctx,
 		       0,
 		       option_anchor_outputs,
 		       option_anchors_zero_fee_htlc_tx,
-		       channel_asset());
+		       asset_tag);
 }
 
 /* Fill in the witness for HTLC-success tx produced above. */
@@ -144,7 +144,8 @@ struct bitcoin_tx *htlc_timeout_tx(const tal_t *ctx,
 				   u32 feerate_per_kw,
 				   const struct keyset *keyset,
 				   bool option_anchor_outputs,
-				   bool option_anchors_zero_fee_htlc_tx)
+				   bool option_anchors_zero_fee_htlc_tx,
+				   const u8 *asset_tag)
 {
 	const u8 *htlc_wscript;
 
@@ -165,7 +166,7 @@ struct bitcoin_tx *htlc_timeout_tx(const tal_t *ctx,
 		       cltv_expiry,
 		       option_anchor_outputs,
 		       option_anchors_zero_fee_htlc_tx,
-		       channel_asset());
+		       asset_tag);
 }
 
 /* Fill in the witness for HTLC-timeout tx produced above. */

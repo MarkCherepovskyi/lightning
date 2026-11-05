@@ -89,6 +89,7 @@ struct bitcoin_tx *initial_commit_tx(const tal_t *ctx,
 				     u32 csv_lock,
 				     bool option_anchor_outputs,
 				     bool option_anchors_zero_fee_htlc_tx,
+				     const struct channel_asset *asset,
 				     char** err_reason)
 {
 	struct amount_sat base_fee;
@@ -106,7 +107,7 @@ struct bitcoin_tx *initial_commit_tx(const tal_t *ctx,
 							&funding_key[LOCAL],
 							&funding_key[REMOTE]);
 	/* Asset channel?  Then the fee comes from the fee reserve. */
-	const u8 *asset = channel_asset();
+	const u8 *tag = channel_asset_tag(asset);
 	int outnum[NUM_SIDES] = { -1, -1 };
 
 	if (!amount_msat_add(&total_pay, self_pay, other_pay))
@@ -125,7 +126,7 @@ struct bitcoin_tx *initial_commit_tx(const tal_t *ctx,
 	 * 2. Calculate the base [commitment transaction
 	 * fee](#fee-calculation).
 	 */
-	base_fee = commit_tx_base_fee(feerate_per_kw, untrimmed,
+	base_fee = commit_tx_base_fee(NULL, feerate_per_kw, untrimmed,
 				      option_anchor_outputs,
 				      option_anchors_zero_fee_htlc_tx);
 
@@ -152,7 +153,7 @@ struct bitcoin_tx *initial_commit_tx(const tal_t *ctx,
 	if (asset) {
 		/* The fee reserve pays the anchors, and whatever is left is
 		 * the fee: nothing comes out of the opener's asset balance. */
-		if (!amount_sat_greater(channel_fee_reserve(), base_fee)) {
+		if (!amount_sat_greater(asset->fee_reserve, base_fee)) {
 			*err_reason = "Fee reserve cannot afford anchor outputs";
 			return NULL;
 		}
@@ -226,7 +227,7 @@ struct bitcoin_tx *initial_commit_tx(const tal_t *ctx,
 					      keyset);
 		amount = amount_msat_to_sat_round_down(self_pay);
 		int pos = bitcoin_tx_add_asset_output(
-		    tx, scriptpubkey_p2wsh(tx, wscript), wscript, amount, asset);
+		    tx, scriptpubkey_p2wsh(tx, wscript), wscript, amount, tag);
 		assert(pos == n);
 		outnum[side] = pos;
 		output_order[n] = dummy_local;
@@ -268,7 +269,7 @@ struct bitcoin_tx *initial_commit_tx(const tal_t *ctx,
 							   &keyset->other_payment_key);
 		}
 		pos = bitcoin_tx_add_asset_output(tx, scriptpubkey, redeem,
-						  amount, asset);
+						  amount, tag);
 		assert(pos == n);
 		outnum[!side] = pos;
 		output_order[n] = dummy_remote;
@@ -280,7 +281,7 @@ struct bitcoin_tx *initial_commit_tx(const tal_t *ctx,
 	/* Asset channel: the asset leftovers (rounding) go to the opener,
 	 * not to fees. */
 	if (asset)
-		channel_asset_finish_tx(tx, funding_sats,
+		channel_asset_finish_tx(tx, asset, funding_sats,
 					outnum[opener], outnum[!opener]);
 
 	/* BOLT #3:
@@ -341,9 +342,10 @@ struct bitcoin_tx *initial_commit_tx(const tal_t *ctx,
 	sequence = (0x80000000 | ((obscured_commitment_number>>24) & 0xFFFFFF));
 	bitcoin_tx_add_asset_input(tx, funding, sequence,
 				   NULL, funding_sats, NULL, funding_wscript,
-				   asset);
+				   tag);
 	if (asset)
-		add_fee_reserve_input(tx, funding, sequence, funding_wscript);
+		add_fee_reserve_input(tx, funding, sequence, funding_wscript,
+				      asset);
 
 	if (direct_outputs != NULL) {
 		direct_outputs[LOCAL] = direct_outputs[REMOTE] = NULL;

@@ -27,6 +27,10 @@
 #define REQ_FD STDIN_FILENO
 #define HSM_FD 4
 
+/* Asset channel (common/channel_asset.h)?  Then the fee is the whole fee
+ * reserve, and the close tx also spends that. */
+static const struct channel_asset *chan_asset;
+
 static void notify(enum log_level level, const char *fmt, ...)
 {
 	va_list ap;
@@ -60,32 +64,6 @@ static struct bitcoin_tx *close_tx(const tal_t *ctx,
 	struct bitcoin_tx *tx;
 	struct amount_sat out_minus_fee[NUM_SIDES];
 
-	/* Asset channels pay the whole fee reserve as the fee (that is the
-	 * only fee anyone offers), so neither asset output is reduced. */
-	if (channel_asset()) {
-		tx = create_asset_close_tx(ctx, chainparams,
-					   local_wallet_index,
-					   local_wallet_ext_key,
-					   scriptpubkey[LOCAL],
-					   scriptpubkey[REMOTE],
-					   funding_wscript, funding,
-					   funding_sats,
-					   out[LOCAL], out[REMOTE],
-					   dust_limit, opener == LOCAL);
-		if (!tx)
-			peer_failed_err(pps, channel_id,
-					"Both outputs below dust limit:"
-					" funding = %s"
-					" dust_limit = %s"
-					" LOCAL = %s"
-					" REMOTE = %s",
-					fmt_amount_sat(tmpctx, funding_sats),
-					fmt_amount_sat(tmpctx, dust_limit),
-					fmt_amount_sat(tmpctx, out[LOCAL]),
-					fmt_amount_sat(tmpctx, out[REMOTE]));
-		return tx;
-	}
-
 	/* BOLT #3:
 	 * ## Legacy Closing Transaction
 	 *...
@@ -97,7 +75,9 @@ static struct bitcoin_tx *close_tx(const tal_t *ctx,
 	 */
 	out_minus_fee[LOCAL] = out[LOCAL];
 	out_minus_fee[REMOTE] = out[REMOTE];
-	if (!amount_sat_sub(&out_minus_fee[opener], out[opener], fee))
+	/* (an asset channel's fee is the reserve, not an output) */
+	if (!chan_asset
+	    && !amount_sat_sub(&out_minus_fee[opener], out[opener], fee))
 		peer_failed_warn(pps, channel_id,
 				 "Funder cannot afford fee %s (%s and %s)",
 				 fmt_amount_sat(tmpctx, fee),
@@ -119,7 +99,8 @@ static struct bitcoin_tx *close_tx(const tal_t *ctx,
 			     funding_sats,
 			     out_minus_fee[LOCAL],
 			     out_minus_fee[REMOTE],
-			     dust_limit);
+			     dust_limit,
+			     chan_asset, opener == LOCAL);
 	if (!tx)
 		peer_failed_err(pps, channel_id,
 				"Both outputs below dust limit:"
@@ -256,7 +237,7 @@ static void send_offer(struct per_peer_state *pps,
 		close_tlvs = NULL;
 
 	/* Asset channels: also sign the fee reserve input. */
-	if (channel_asset()) {
+	if (chan_asset) {
 		struct bitcoin_signature reserve_sig
 			= sign_fee_reserve(tx, &funding_pubkey[REMOTE]);
 		if (!close_tlvs)
@@ -424,26 +405,25 @@ receive_offer(struct per_peer_state *pps,
 	 * signature for the fee reserve input, add ours, and complete that
 	 * input's witness so lightningd only has to sign the funding input
 	 * as usual. */
-	if (channel_asset()) {
+	if (chan_asset) {
 		struct bitcoin_signature their_reserve_sig, our_reserve_sig;
 
-		if (!amount_sat_eq(received_fee, channel_fee_reserve()))
+		if (!amount_sat_eq(received_fee, chan_asset->fee_reserve))
 			peer_failed_warn(pps, channel_id,
 					 "Asset channel close fee must be the"
 					 " fee reserve %s, not %s",
 					 fmt_amount_sat(tmpctx,
-							channel_fee_reserve()),
+							chan_asset->fee_reserve),
 					 fmt_amount_sat(tmpctx, received_fee));
-		if (!close_tlvs || !close_tlvs->fee_reserve_sig)
+		if (!check_fee_reserve_sig(tx, funding_wscript,
+					   &funding_pubkey[REMOTE],
+					   close_tlvs
+					   ? close_tlvs->fee_reserve_sig : NULL))
 			peer_failed_warn(pps, channel_id,
-					 "closing_signed without fee_reserve_sig");
+					 "Bad or missing fee_reserve_sig for %s",
+					 fmt_bitcoin_tx(tmpctx, tx));
 		their_reserve_sig.s = *close_tlvs->fee_reserve_sig;
 		their_reserve_sig.sighash_type = SIGHASH_ALL;
-		if (!check_tx_sig(tx, 1, NULL, funding_wscript,
-				  &funding_pubkey[REMOTE], &their_reserve_sig))
-			peer_failed_warn(pps, channel_id,
-					 "Bad fee_reserve_sig for %s",
-					 fmt_bitcoin_tx(tmpctx, tx));
 		our_reserve_sig = sign_fee_reserve(tx, &funding_pubkey[REMOTE]);
 		bitcoin_tx_input_set_witness(tx, 1,
 			take(bitcoin_witness_2of2(NULL, &their_reserve_sig,
@@ -682,22 +662,6 @@ static size_t closing_tx_weight_estimate(u8 *scriptpubkey[NUM_SIDES],
 	struct bitcoin_outpoint dummy_funding;
 
 	memset(&dummy_funding, 0, sizeof(dummy_funding));
-	/* Asset channels also spend the fee reserve. */
-	if (channel_asset()) {
-		tx = create_asset_close_tx(tmpctx, chainparams,
-					   local_wallet_index,
-					   local_wallet_ext_key,
-					   scriptpubkey[LOCAL],
-					   scriptpubkey[REMOTE],
-					   funding_wscript,
-					   &dummy_funding,
-					   funding_sats,
-					   out[LOCAL], out[REMOTE],
-					   dust_limit, true);
-		return bitcoin_tx_weight(tx)
-			+ 2 * bitcoin_tx_2of2_input_witness_weight();
-	}
-
 	tx = create_close_tx(tmpctx, chainparams,
 			     local_wallet_index, local_wallet_ext_key,
 			     scriptpubkey[LOCAL], scriptpubkey[REMOTE],
@@ -706,10 +670,12 @@ static size_t closing_tx_weight_estimate(u8 *scriptpubkey[NUM_SIDES],
 			     funding_sats,
 			     out[LOCAL],
 			     out[REMOTE],
-			     dust_limit);
+			     dust_limit,
+			     chan_asset, true);
 
-	/* We will have to append the witness */
-	return bitcoin_tx_weight(tx) + bitcoin_tx_2of2_input_witness_weight();
+	/* We will have to append the witness (one per input) */
+	return bitcoin_tx_weight(tx)
+		+ tx->wtx->num_inputs * bitcoin_tx_2of2_input_witness_weight();
 }
 
 /* Get the minimum and desired fees */
@@ -757,8 +723,8 @@ static void calc_fee_bounds(size_t expected_weight,
 
 	/* Asset channels: the fee is the whole fee reserve, so there is
 	 * nothing to negotiate (common/channel_asset.h). */
-	if (channel_asset())
-		*minfee = *desiredfee = *maxfee = channel_fee_reserve();
+	if (chan_asset)
+		*minfee = *desiredfee = *maxfee = chan_asset->fee_reserve;
 
 	/* Can't exceed maxfee. */
 	if (amount_sat_greater(*minfee, *maxfee))
@@ -971,8 +937,7 @@ int main(int argc, char *argv[])
 	struct tlv_closing_signed_tlvs_fee_range *our_feerange, **their_feerange;
 	struct bitcoin_outpoint *wrong_funding;
 	bool developer;
-	u8 *asset;
-	struct amount_sat fee_reserve;
+	struct channel_asset *asset;
 
 	developer = subdaemon_setup(argc, argv);
 
@@ -999,12 +964,9 @@ int main(int argc, char *argv[])
 				    &fee_negotiation_step_unit,
 				    &use_quickclose,
 				    &wrong_funding,
-				    &asset,
-				    &fee_reserve))
+				    &asset))
 		master_badmsg(WIRE_CLOSINGD_INIT, msg);
-	/* Asset channel (if any) for the close tx. */
-	channel_asset_set(channel_asset_or_null(asset), fee_reserve);
-	tal_free(asset);
+	chan_asset = asset;
 
 	/* stdin == requests, 3 == peer, 4 = hsmd */
 	pps = notleak(new_per_peer_state(ctx));

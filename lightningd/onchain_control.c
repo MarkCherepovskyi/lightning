@@ -1661,8 +1661,8 @@ static struct amount_sat asset_sweep_fee(const struct asset_sweep *sweep,
 {
 	struct amount_sat fee = amount_tx_fee(feerate, weight);
 
-	if (amount_sat_greater(fee, sweep->channel->fee_reserve))
-		return sweep->channel->fee_reserve;
+	if (amount_sat_greater(fee, sweep->channel->asset->fee_reserve))
+		return sweep->channel->asset->fee_reserve;
 	return fee;
 }
 
@@ -1693,11 +1693,11 @@ static struct bitcoin_tx *asset_sweep_tx(const tal_t *ctx,
 	/* Input 0 goes with output 0 (SIGHASH_SINGLE, for HTLC txs) */
 	bitcoin_tx_add_asset_input(tx, &sweep->out, sweep->sequence, NULL,
 				   sweep->out_sats, sweep->scriptpubkey,
-				   sweep->wscript, channel->asset);
+				   sweep->wscript, channel->asset->tag);
 	bitcoin_tx_add_asset_output(tx,
 				    sweep->htlc_tx_out ? sweep->htlc_tx_out
 				    : channel->shutdown_scriptpubkey[LOCAL],
-				    NULL, sweep->out_sats, channel->asset);
+				    NULL, sweep->out_sats, channel->asset->tag);
 
 	weight = bitcoin_tx_weight(tx)
 		+ asset_sweep_witness_weight(sweep)
@@ -2178,7 +2178,7 @@ static void handle_onchaind_spend_htlc_success(struct channel *channel,
 	 */
 	tx = htlc_tx(NULL, chainparams, &out, info->wscript, out_sats, htlc_wscript, fee,
 		     0, option_anchor_outputs, option_anchors_zero_fee_htlc_tx,
-		     channel->asset);
+		     channel_asset_tag(channel->asset));
 	tal_free(htlc_wscript);
 	if (!tx) {
 		/* Can only happen if fee > out_sats */
@@ -2282,7 +2282,7 @@ static void handle_onchaind_spend_htlc_timeout(struct channel *channel,
 	 */
 	tx = htlc_tx(NULL, chainparams, &out, info->wscript, out_sats, htlc_wscript, fee,
 		     cltv_expiry, option_anchor_outputs, option_anchors_zero_fee_htlc_tx,
-		     channel->asset);
+		     channel_asset_tag(channel->asset));
 	tal_free(htlc_wscript);
 	if (!tx) {
 		/* Can only happen if fee > out_sats */

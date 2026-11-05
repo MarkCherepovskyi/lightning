@@ -867,7 +867,8 @@ static struct amount_sat commit_txfee(const struct channel *channel,
 	 *   handle twice the current `feerate_per_kw` to ensure
 	 *   predictability between implementations.
 	 */
-	fee = commit_tx_base_fee(marginal_feerate(feerate), num_untrimmed_htlcs + 1,
+	fee = commit_tx_base_fee(channel->asset, marginal_feerate(feerate),
+				 num_untrimmed_htlcs + 1,
 				 option_anchor_outputs, option_anchors_zero_fee_htlc_tx);
 
 	if (option_anchor_outputs || option_anchors_zero_fee_htlc_tx) {
@@ -1102,9 +1103,9 @@ static void NON_NULL_ARGS(1, 2, 4, 5) json_add_channel(struct command *cmd,
 	json_add_num(response, "funding_outnum", channel->funding.n);
 	if (channel->asset) {
 		json_add_string(response, "asset",
-				fmt_channel_asset(tmpctx, channel->asset));
+				fmt_channel_asset(tmpctx, channel->asset->tag));
 		json_add_amount_sat_msat(response, "fee_reserve_msat",
-					 channel->fee_reserve);
+					 channel->asset->fee_reserve);
 	}
 
 	has_valid_inflights = false;
@@ -2878,7 +2879,7 @@ void channel_watch_funding(struct lightningd *ld, struct channel *channel)
 					 take(scriptpubkey_p2wsh(NULL, funding_wscript)),
 					 &channel->funding,
 					 channel->funding_sats,
-					 channel->asset,
+					 channel_asset_tag(channel->asset),
 					 channel_funding_found,
 					 channel);
 	}

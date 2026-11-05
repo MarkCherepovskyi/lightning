@@ -12,6 +12,7 @@
 #include <bitcoin/script.h>
 #include <ccan/array_size/array_size.h>
 #include <ccan/breakpoint/breakpoint.h>
+#include <ccan/mem/mem.h>
 #include <ccan/tal/str/str.h>
 #include <common/fee_states.h>
 #include <common/initial_channel.h>
@@ -94,6 +95,9 @@ struct state {
 	 * the structure has room for HTLCs, those routines are channeld-specific
 	 * as initial channels never have HTLCs. */
 	struct channel *channel;
+
+	/* Asset channel (common/channel_asset.h)?  NULL for an ordinary one. */
+	struct channel_asset *asset;
 
 	/* Channel type we agreed on (even before channel populated) */
 	struct channel_type *channel_type;
@@ -319,7 +323,7 @@ static u8 *funder_channel_start(struct state *state, u8 channel_flags,
 
 	/* Asset channels are built on anchors (common/channel_asset.h), and
 	 * the peer must know what they are. */
-	if (channel_asset()) {
+	if (state->asset) {
 		if (!feature_negotiated(state->our_features,
 					state->their_features,
 					OPT_CHANNEL_ASSET)) {
@@ -343,6 +347,7 @@ static u8 *funder_channel_start(struct state *state, u8 channel_flags,
 				 &state->localconf,
 				 &state->localconf,
 				 channel_type_has(state->channel_type, OPT_ANCHORS_ZERO_FEE_HTLC_TX),
+				 state->asset,
 				 &err_reason)) {
 		negotiation_aborted(state,
 				    tal_fmt(tmpctx, "Not opening because if they used the same setting as us %s",
@@ -365,12 +370,12 @@ static u8 *funder_channel_start(struct state *state, u8 channel_flags,
 
 	/* Asset channel: tell them the asset and the size of the fee reserve
 	 * we'll put in. */
-	if (channel_asset()) {
+	if (state->asset) {
 		open_tlvs->channel_asset
-			= tal_dup_arr(open_tlvs, u8, channel_asset(),
+			= tal_dup_arr(open_tlvs, u8, state->asset->tag,
 				      ELEMENTS_ASSET_LEN, 0);
-		open_tlvs->fee_reserve = tal(open_tlvs, struct amount_sat);
-		*open_tlvs->fee_reserve = channel_fee_reserve();
+		open_tlvs->fee_reserve = tal_dup(open_tlvs, struct amount_sat,
+						 &state->asset->fee_reserve);
 	}
 
 	msg = towire_open_channel(NULL,
@@ -452,15 +457,19 @@ static u8 *funder_channel_start(struct state *state, u8 channel_flags,
 
 	/* An asset channel only works if they build the same transactions,
 	 * so they must echo the asset back. */
-	if (!channel_asset_eq(channel_asset(),
-			      channel_asset_or_null(accept_tlvs->channel_asset))) {
+	if ((state->asset == NULL) != (accept_tlvs->channel_asset == NULL)
+	    || (state->asset
+		&& !memeq(state->asset->tag, ELEMENTS_ASSET_LEN,
+			  accept_tlvs->channel_asset,
+			  tal_bytelen(accept_tlvs->channel_asset)))) {
 		negotiation_failed(state,
 				   "Peer did not accept asset channel"
 				   " (asset %s)",
-				   channel_asset()
+				   state->asset
 				   ? fmt_channel_asset(tmpctx,
-						      channel_asset())
+						      state->asset->tag)
 				   : "none");
+		return NULL;
 	}
 
 	/* BOLT #2:
@@ -546,6 +555,7 @@ static u8 *funder_channel_start(struct state *state, u8 channel_flags,
 				 &state->remoteconf,
 				 &state->localconf,
 				 channel_type_has(state->channel_type, OPT_ANCHORS_ZERO_FEE_HTLC_TX),
+				 state->asset,
 				 &err_reason)) {
 		negotiation_failed(state, "%s", err_reason);
 		return NULL;
@@ -592,6 +602,7 @@ static u8 *funder_channel_start(struct state *state, u8 channel_flags,
  * hsmd also signs the fee reserve input; that signature goes to the peer in
  * a TLV. */
 static void read_remote_commitment_sigs(const tal_t *ctx,
+					const struct state *state,
 					struct bitcoin_signature *sig,
 					secp256k1_ecdsa_signature **fee_reserve_sig)
 {
@@ -599,7 +610,7 @@ static void read_remote_commitment_sigs(const tal_t *ctx,
 	struct bitcoin_signature reserve_sig;
 
 	*fee_reserve_sig = NULL;
-	if (!channel_asset()) {
+	if (!state->asset) {
 		if (!fromwire_hsmd_sign_tx_reply(msg, sig))
 			status_failed(STATUS_FAIL_HSM_IO, "Bad sign_tx_reply %s",
 				      tal_hex(tmpctx, msg));
@@ -688,6 +699,7 @@ static bool funder_finalize_channel_setup(struct state *state,
 		peer_failed_err(state->pps,
 				&state->channel_id,
 				"could not create channel with given config");
+	state->channel->asset = state->asset;
 
 	/* BOLT #2:
 	 *
@@ -733,7 +745,7 @@ static bool funder_finalize_channel_setup(struct state *state,
 						    feerate);
 
 	wire_sync_write(HSM_FD, take(msg));
-	read_remote_commitment_sigs(created_tlvs, sig,
+	read_remote_commitment_sigs(created_tlvs, state, sig,
 				    &created_tlvs->fee_reserve_sig);
 
 	/* You can tell this has been a problem before, since there's a debug
@@ -849,7 +861,7 @@ static bool funder_finalize_channel_setup(struct state *state,
 			      "Unable to set signature internally");
 
 	/* asset channel: and their sig for the fee reserve. */
-	if (channel_asset()
+	if (state->asset
 	    && !check_fee_reserve_sig(*tx, wscript,
 					     &state->their_funding_pubkey,
 					     signed_tlvs->fee_reserve_sig))
@@ -976,16 +988,17 @@ static u8 *fundee_channel(struct state *state, const u8 *open_channel_msg)
 			return NULL;
 		}
 		if (!chainparams->is_elements
-		    || !channel_asset_or_null(open_tlvs->channel_asset)
+		    || tal_bytelen(open_tlvs->channel_asset) != ELEMENTS_ASSET_LEN
 		    || !open_tlvs->fee_reserve) {
 			negotiation_failed(state,
 					   "Bad asset channel request");
 			return NULL;
 		}
-		channel_asset_set(open_tlvs->channel_asset,
-				  *open_tlvs->fee_reserve);
+		state->asset = channel_asset_new(state,
+						 open_tlvs->channel_asset,
+						 *open_tlvs->fee_reserve);
 	} else
-		channel_asset_set(NULL, AMOUNT_SAT(0));
+		state->asset = NULL;
 
 	/* BOLT #2:
 	 *  - if the message doesn't include a `channel_type`:
@@ -1020,7 +1033,7 @@ static u8 *fundee_channel(struct state *state, const u8 *open_channel_msg)
 	}
 
 	/* Asset channels are built on anchors (common/channel_asset.h). */
-	if (channel_asset()
+	if (state->asset
 	    && !channel_type_has(state->channel_type,
 				 OPT_ANCHORS_ZERO_FEE_HTLC_TX)) {
 		negotiation_failed(state, "Asset channels need option_anchors");
@@ -1126,6 +1139,7 @@ static u8 *fundee_channel(struct state *state, const u8 *open_channel_msg)
 				 &state->localconf,
 				 channel_type_has(state->channel_type,
 						  OPT_ANCHORS_ZERO_FEE_HTLC_TX),
+				 state->asset,
 				 &err_reason)) {
 		negotiation_failed(state, "%s", err_reason);
 		return NULL;
@@ -1146,9 +1160,7 @@ static u8 *fundee_channel(struct state *state, const u8 *open_channel_msg)
 				       channel_flags,
 				       state->upfront_shutdown_script[REMOTE],
 				       state->channel_type,
-				       channel_asset_dup(tmpctx, channel_asset()),
-				       channel_asset()
-				       ? channel_fee_reserve() : AMOUNT_SAT(0));
+				       state->asset);
 	wire_sync_write(REQ_FD, take(msg));
 	msg = wire_sync_read(tmpctx, REQ_FD);
 
@@ -1202,9 +1214,9 @@ static u8 *fundee_channel(struct state *state, const u8 *open_channel_msg)
 	 */
 	accept_tlvs->channel_type = state->channel_type->features;
 	/* confirm we'll run it as an asset channel. */
-	if (channel_asset())
+	if (state->asset)
 		accept_tlvs->channel_asset
-			= tal_dup_arr(accept_tlvs, u8, channel_asset(),
+			= tal_dup_arr(accept_tlvs, u8, state->asset->tag,
 				      ELEMENTS_ASSET_LEN, 0);
 
 	msg = towire_accept_channel(NULL, &state->channel_id,
@@ -1298,6 +1310,8 @@ static u8 *fundee_channel(struct state *state, const u8 *open_channel_msg)
 					     feature_offered(state->their_features,
 							     OPT_LARGE_CHANNELS),
 					     REMOTE);
+	if (state->channel)
+		state->channel->asset = state->asset;
 	/* We don't expect this to fail, but it does do some additional
 	 * internal sanity checks. */
 	if (!state->channel)
@@ -1348,7 +1362,7 @@ static u8 *fundee_channel(struct state *state, const u8 *open_channel_msg)
 
 	/* asset channel: check their sig for the fee reserve too,
 	 * and keep it with our first commitment tx. */
-	if (channel_asset()
+	if (state->asset
 	    && !check_fee_reserve_sig(local_commit, wscript,
 					     &their_funding_pubkey,
 					     created_tlvs->fee_reserve_sig))
@@ -1404,7 +1418,7 @@ static u8 *fundee_channel(struct state *state, const u8 *open_channel_msg)
 
 	wire_sync_write(HSM_FD, take(msg));
 	signed_tlvs = tlv_funding_signed_tlvs_new(tmpctx);
-	read_remote_commitment_sigs(signed_tlvs, &sig,
+	read_remote_commitment_sigs(signed_tlvs, state, &sig,
 				    &signed_tlvs->fee_reserve_sig);
 
 	/* We don't send this ourselves: channeld does, because master needs
@@ -1439,11 +1453,7 @@ static u8 *fundee_channel(struct state *state, const u8 *open_channel_msg)
 				     state->localconf.channel_reserve,
 				     state->upfront_shutdown_script[LOCAL],
 				     state->upfront_shutdown_script[REMOTE],
-				     state->channel_type,
-				     channel_asset_dup(tmpctx,
-						      channel_asset()),
-				     channel_asset()
-				     ? channel_fee_reserve() : AMOUNT_SAT(0));
+				     state->channel_type);
 }
 
 /*~ Standard "peer sent a message, handle it" demuxer.  Though it really only
@@ -1510,8 +1520,6 @@ static u8 *handle_master_in(struct state *state)
 	u16 funding_txout;
 	u32 nonanchor_feerate, anchor_feerate;
 	struct channel_type *ctype;
-	u8 *asset;
-	struct amount_sat fee_reserve;
 
 	switch (t) {
 	case WIRE_OPENINGD_FUNDER_START:
@@ -1526,12 +1534,8 @@ static u8 *handle_master_in(struct state *state)
 						    &channel_flags,
 						    &state->reserve,
 						    &ctype,
-						    &asset,
-						    &fee_reserve))
+						    &state->asset))
 			master_badmsg(WIRE_OPENINGD_FUNDER_START, msg);
-		channel_asset_set(channel_asset_or_null(asset),
-					 fee_reserve);
-		tal_free(asset);
 		msg = funder_channel_start(state, channel_flags, nonanchor_feerate, anchor_feerate, ctype);
 		tal_free(ctype);
 
@@ -1620,6 +1624,7 @@ int main(int argc, char *argv[])
 	 * handle_peer_gossip_or_error compares this. */
 	memset(&state->channel_id, 0, sizeof(state->channel_id));
 	state->channel = NULL;
+	state->asset = NULL;
 
 	/* Default this to zero, we only ever look at the local */
 	state->remoteconf.max_dust_htlc_exposure_msat = AMOUNT_MSAT(0);

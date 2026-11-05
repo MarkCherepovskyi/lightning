@@ -1092,7 +1092,7 @@ static struct bitcoin_signature *calc_commitsigs(const tal_t *ctx,
 	/* For asset channels hsmd also signs the fee reserve input, and
 	 * that signature goes to the peer in a TLV. */
 	*fee_reserve_sig = NULL;
-	if (channel_asset()) {
+	if (peer->channel->asset) {
 		if (!fromwire_hsmd_sign_asset_commitment_tx_reply(msg,
 								  commit_sig,
 								  &reserve_sig))
@@ -2268,7 +2268,7 @@ static struct commitsig_info *handle_peer_commit_sig(struct peer *peer,
 			      "Unable to set signature internally");
 
 	/* Asset channel: and their sig for the fee reserve input. */
-	if (channel_asset()
+	if (peer->channel->asset
 	    && !check_fee_reserve_sig(txs[0], funding_wscript,
 				      &remote_funding,
 				      cs_tlv->fee_reserve_sig))
@@ -4372,7 +4372,7 @@ static void splice_accepter(struct peer *peer, const u8 *inmsg)
 
 	/* Asset channels fund two outputs (common/channel_asset.h), which
 	 * splicing doesn't rebuild. */
-	if (channel_asset())
+	if (peer->channel->asset)
 		peer_failed_warn(peer->pps, &peer->channel_id,
 				 "Asset channels cannot be spliced");
 
@@ -7073,8 +7073,7 @@ static void init_channel(struct peer *peer)
 	struct penalty_base *pbases;
 	struct channel_type *channel_type;
 	bool found_locked_inflight;
-	u8 *asset;
-	struct amount_sat fee_reserve;
+	struct channel_asset *asset;
 
 	assert(!(fcntl(MASTER_FD, F_GETFL) & O_NONBLOCK));
 
@@ -7136,13 +7135,9 @@ static void init_channel(struct peer *peer)
 				    &pbases,
 				    &peer->splice_state->inflights,
 				    &peer->local_alias,
-				    &asset,
-				    &fee_reserve)) {
+				    &asset)) {
 		master_badmsg(WIRE_CHANNELD_INIT, msg);
 	}
-	/* Asset channel (if any) for the tx builders. */
-	channel_asset_set(channel_asset_or_null(asset), fee_reserve);
-	tal_free(asset);
 
 	peer->final_index = tal_dup(peer, u32, &final_index);
 	peer->final_ext_key = tal_dup(peer, struct ext_key, &final_ext_key);
@@ -7222,6 +7217,7 @@ static void init_channel(struct peer *peer)
 					 feature_offered(peer->their_features,
 							 OPT_LARGE_CHANNELS),
 					 opener);
+	peer->channel->asset = tal_steal(peer->channel, asset);
 
 	if (!channel_force_htlcs(peer->channel,
 			 cast_const2(const struct existing_htlc **, htlcs)))

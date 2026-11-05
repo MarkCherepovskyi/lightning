@@ -1,4 +1,5 @@
 #include <bitcoin/signature.h>
+#include <common/channel_asset.h>
 #include <bitcoin/tx.h>
 #include <common/bip32.h>
 #include <common/channel_id.h>
@@ -31,9 +32,7 @@ msgdata,closingd_init,fee_negotiation_step,u64,
 msgdata,closingd_init,fee_negotiation_step_unit,u8,
 msgdata,closingd_init,use_quickclose,bool,
 msgdata,closingd_init,shutdown_wrong_funding,?bitcoin_outpoint,
-msgdata,closingd_init,asset_len,u16,
-msgdata,closingd_init,asset,u8,asset_len
-msgdata,closingd_init,fee_reserve,amount_sat,
+msgdata,closingd_init,asset,?channel_asset,
 
 # Message for any commands waiting.
 msgtype,closingd_notification,2003

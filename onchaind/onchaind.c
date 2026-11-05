@@ -211,6 +211,9 @@ static void trim_maximum_feerate(struct amount_sat funding,
 	status_debug("... to %u", max_possible_feerate);
 }
 
+/* Asset channel (common/channel_asset.h)?  NULL for an ordinary one. */
+static const struct channel_asset *chan_asset;
+
 /* Asset channel: the channel's account is in units of its asset, so the
  * L-BTC outputs of its transactions (anchors, fee outputs) stay out of it. */
 static struct bitcoin_outpoint *lbtc_outpoints;
@@ -227,7 +230,7 @@ static bool is_asset_output(const struct wally_tx_output *out)
 
 static void note_lbtc_outputs(const struct tx_parts *tx)
 {
-	if (!channel_asset())
+	if (!chan_asset)
 		return;
 	for (size_t i = 0; i < tal_count(tx->outputs); i++) {
 		struct bitcoin_outpoint op;
@@ -259,14 +262,14 @@ static struct amount_sat output_amount(const struct wally_tx_output *out)
 {
 	struct amount_asset asset = wally_tx_output_get_amount(out);
 
-	if (!channel_asset())
+	if (!chan_asset)
 		assert(amount_asset_is_main(&asset));
 	return amount_sat(asset.value);
 }
 
 static void send_coin_mvt(struct chain_coin_mvt *mvt TAKES)
 {
-	if (channel_asset() && is_lbtc_outpoint(&mvt->outpoint)) {
+	if (chan_asset && is_lbtc_outpoint(&mvt->outpoint)) {
 		tal_free_if_taken(mvt);
 		return;
 	}
@@ -422,7 +425,7 @@ static void record_coin_movements(struct tracked_output *out,
 	 * hold the asset), so the channel account never gets the deposit
 	 * lightningd's wallet makes for an L-BTC to_remote; without it the
 	 * withdrawal below underflows the account. */
-	if (channel_asset()
+	if (chan_asset
 	    && out->tx_type == THEIR_UNILATERAL
 	    && out->output_type == OUTPUT_TO_US)
 		record_channel_deposit(out, out->tx_blockheight,
@@ -516,7 +519,7 @@ static bool set_htlc_timeout_fee(struct bitcoin_tx *tx,
 	size_t weight;
 
 	/* Asset channel: the HTLC tx pays out the asset. */
-	if (!channel_asset())
+	if (!chan_asset)
 		assert(amount_asset_is_main(&asset));
 	amount = amount_sat(asset.value);
 
@@ -593,7 +596,8 @@ static struct amount_sat get_htlc_success_fee(struct tracked_output *out)
 			     0,
 			     keyset,
 			     option_anchor_outputs,
-			     option_anchors_zero_fee_htlc_tx);
+			     option_anchors_zero_fee_htlc_tx,
+			     channel_asset_tag(chan_asset));
 
 	/* BOLT #3:
 	 *
@@ -1940,7 +1944,8 @@ static size_t resolve_our_htlc_ourcommit(struct tracked_output *out,
 				     htlcs[matches[i]].cltv_expiry,
 				     to_self_delay[LOCAL], 0, keyset,
 				     option_anchor_outputs,
-				     option_anchors_zero_fee_htlc_tx);
+				     option_anchors_zero_fee_htlc_tx,
+				     channel_asset_tag(chan_asset));
 
 		if (set_htlc_timeout_fee(tx, out->remote_htlc_sig,
 					 htlc_scripts[matches[i]]))
@@ -2699,7 +2704,7 @@ static void their_unilateral_local(struct tracked_output ***outs,
 {
 	struct tracked_output *out;
 
-	if (channel_asset()) {
+	if (chan_asset) {
 		/* A NULL per_commit_point: the key doesn't need tweaking. */
 		their_unilateral_asset_local(outs, outpoint, tx_blockheight,
 					     amt, local_scriptpubkey, tx_type,
@@ -3443,7 +3448,7 @@ static void handle_unknown_commitment(const struct tx_parts *tx,
 			outpoint.txid = tx->txid;
 			outpoint.n = i;
 
-			if (channel_asset()) {
+			if (chan_asset) {
 				their_unilateral_asset_local(&outs, &outpoint,
 							     tx_blockheight,
 							     amt, local_script,
@@ -3544,7 +3549,7 @@ int main(int argc, char *argv[])
 	struct amount_sat funding_sats;
 	u8 *scriptpubkey[NUM_SIDES];
 	u32 locktime, tx_blockheight;
-	u8 *asset;
+	struct channel_asset *asset;
 
 	subdaemon_setup(argc, argv);
 
@@ -3588,10 +3593,7 @@ int main(int argc, char *argv[])
 		master_badmsg(WIRE_ONCHAIND_INIT, msg);
 	}
 
-	/* Asset channel (if any): the HTLC tx builders tag their outputs.
-	 * We don't need the fee reserve amount. */
-	channel_asset_set(channel_asset_or_null(asset), AMOUNT_SAT(0));
-	tal_free(asset);
+	chan_asset = notleak(tal_steal(ctx, asset));
 
 	/* We need to keep tx around, but there's only one: not really a leak */
 	tal_steal(ctx, notleak(tx));

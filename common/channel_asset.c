@@ -6,66 +6,51 @@
 #include <ccan/str/hex/hex.h>
 #include <common/channel_asset.h>
 #include <common/utils.h>
+#include <wire/wire.h>
 #include <stdlib.h>
 #include <string.h>
 
-static bool asset_mode;
-static u8 asset_tag[ELEMENTS_ASSET_LEN];
-static struct amount_sat fee_reserve;
-
-void channel_asset_set(const u8 *asset, struct amount_sat reserve)
+struct channel_asset *channel_asset_new(const tal_t *ctx,
+					const u8 *tag,
+					struct amount_sat fee_reserve)
 {
-	asset_mode = (asset != NULL);
-	if (asset_mode)
-		memcpy(asset_tag, asset, sizeof(asset_tag));
-	fee_reserve = reserve;
+	struct channel_asset *asset = tal(ctx, struct channel_asset);
+
+	memcpy(asset->tag, tag, sizeof(asset->tag));
+	asset->fee_reserve = fee_reserve;
+	return asset;
 }
 
-const u8 *channel_asset(void)
-{
-	return asset_mode ? asset_tag : NULL;
-}
-
-struct amount_sat channel_fee_reserve(void)
-{
-	assert(asset_mode);
-	return fee_reserve;
-}
-
-bool channel_asset_eq(const u8 *a, const u8 *b)
+bool channel_asset_eq(const struct channel_asset *a,
+		      const struct channel_asset *b)
 {
 	if (!a || !b)
 		return a == b;
-	return memcmp(a, b, ELEMENTS_ASSET_LEN) == 0;
+	return memcmp(a->tag, b->tag, sizeof(a->tag)) == 0;
 }
 
-const u8 *channel_asset_or_null(const u8 *arr)
+void towire_channel_asset(u8 **pptr, const struct channel_asset *asset)
 {
-	if (!arr || tal_bytelen(arr) != ELEMENTS_ASSET_LEN)
-		return NULL;
-	return arr;
+	towire_u8_array(pptr, asset->tag, sizeof(asset->tag));
+	towire_amount_sat(pptr, asset->fee_reserve);
 }
 
-u8 *channel_asset_dup(const tal_t *ctx, const u8 *asset)
+void fromwire_channel_asset(const u8 **cursor, size_t *max,
+			    struct channel_asset *asset)
 {
-	if (!asset)
-		return NULL;
-	return tal_dup_arr(ctx, u8, asset, ELEMENTS_ASSET_LEN, 0);
+	fromwire_u8_array(cursor, max, asset->tag, sizeof(asset->tag));
+	asset->fee_reserve = fromwire_amount_sat(cursor, max);
 }
 
 u8 *channel_asset_from_hex(const tal_t *ctx, const char *hex, size_t hexlen)
 {
-	u8 id[ELEMENTS_ASSET_LEN - 1];
-	u8 *asset;
-
-	if (!hex_decode(hex, hexlen, id, sizeof(id)))
-		return NULL;
+	u8 *asset = tal_arr(ctx, u8, ELEMENTS_ASSET_LEN);
 
 	/* elements-cli prints asset ids byte-reversed, like txids. */
-	asset = tal_arr(ctx, u8, ELEMENTS_ASSET_LEN);
+	if (!hex_decode(hex, hexlen, asset + 1, ELEMENTS_ASSET_LEN - 1))
+		return tal_free(asset);
 	asset[0] = 0x01;
-	for (size_t i = 0; i < sizeof(id); i++)
-		asset[1 + i] = id[sizeof(id) - 1 - i];
+	reverse_bytes(asset + 1, ELEMENTS_ASSET_LEN - 1);
 	return asset;
 }
 
@@ -73,15 +58,17 @@ char *fmt_channel_asset(const tal_t *ctx, const u8 *asset)
 {
 	u8 id[ELEMENTS_ASSET_LEN - 1];
 
-	for (size_t i = 0; i < sizeof(id); i++)
-		id[i] = asset[ELEMENTS_ASSET_LEN - 1 - i];
+	memcpy(id, asset + 1, sizeof(id));
+	reverse_bytes(id, sizeof(id));
 	return tal_hexstr(ctx, id, sizeof(id));
 }
 
-bool channel_asset_in(const u8 *asset, u8 *const *assets)
+bool channel_asset_in(const u8 *tag, u8 *const *tags)
 {
-	for (size_t i = 0; i < tal_count(assets); i++)
-		if (channel_asset_eq(asset, assets[i]))
+	if (!tag)
+		return false;
+	for (size_t i = 0; i < tal_count(tags); i++)
+		if (memcmp(tag, tags[i], ELEMENTS_ASSET_LEN) == 0)
 			return true;
 	return false;
 }
@@ -104,12 +91,13 @@ struct bitcoin_outpoint fee_reserve_outpoint(const struct bitcoin_outpoint *fund
 void add_fee_reserve_input(struct bitcoin_tx *tx,
 			   const struct bitcoin_outpoint *funding,
 			   u32 sequence,
-			   const u8 *funding_wscript)
+			   const u8 *funding_wscript,
+			   const struct channel_asset *asset)
 {
 	struct bitcoin_outpoint reserve = fee_reserve_outpoint(funding);
 
 	bitcoin_tx_add_input(tx, &reserve, sequence, NULL,
-			     channel_fee_reserve(), NULL, funding_wscript);
+			     asset->fee_reserve, NULL, funding_wscript);
 }
 
 bool check_fee_reserve_sig(struct bitcoin_tx *tx,
@@ -131,19 +119,18 @@ bool check_fee_reserve_sig(struct bitcoin_tx *tx,
 }
 
 void channel_asset_finish_tx(struct bitcoin_tx *tx,
+			     const struct channel_asset *asset,
 			     struct amount_sat funding_sats,
 			     int opener_outnum,
 			     int other_outnum)
 {
-	const u8 *asset = channel_asset();
 	struct amount_sat paid = AMOUNT_SAT(0), leftover, topped_up;
 	struct amount_asset amt;
 	int outnum;
 
-	assert(asset);
 	for (size_t i = 0; i < tx->wtx->num_outputs; i++) {
 		amt = bitcoin_tx_output_get_amount(tx, i);
-		if (memcmp(amt.asset, asset, sizeof(amt.asset)) != 0)
+		if (memcmp(amt.asset, asset->tag, sizeof(amt.asset)) != 0)
 			continue;
 		if (!amount_sat_add(&paid, paid, amount_sat(amt.value)))
 			abort();

@@ -1316,6 +1316,10 @@ static void htlc_accepted_hook_serialize(struct htlc_accepted_hook_payload *p,
 	if (p->extra_tlvs_raw) {
 		json_add_hex_talarr(s, "extra_tlvs", p->extra_tlvs_raw);
 	}
+	if (hin->key.channel->asset)
+		json_add_string(s, "asset",
+				fmt_channel_asset(tmpctx,
+						  hin->key.channel->asset->tag));
 	json_object_end(s);
 }
 

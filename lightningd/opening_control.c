@@ -97,8 +97,7 @@ wallet_commit_channel(struct lightningd *ld,
 		      const struct channel_type *type,
 		      const struct wally_psbt *funding_psbt,
 		      bool withheld,
-		      const u8 *asset,
-		      struct amount_sat fee_reserve)
+		      const struct channel_asset *asset)
 {
 	struct channel *channel;
 	struct amount_msat our_msat;
@@ -241,10 +240,8 @@ wallet_commit_channel(struct lightningd *ld,
 			      withheld);
 
 	/* asset channel? */
-	channel->asset = asset
-		? tal_dup_arr(channel, u8, asset, ELEMENTS_ASSET_LEN, 0)
+	channel->asset = asset ? tal_dup(channel, struct channel_asset, asset)
 		: NULL;
-	channel->fee_reserve = fee_reserve;
 
 	/* Now we finally put it in the database. */
 	wallet_channel_insert(ld->wallet, channel);
@@ -464,8 +461,7 @@ static void opening_funder_finished(struct subd *openingd, const u8 *resp,
 					type,
 					fc->funding_psbt,
 					fc->withheld,
-					fc->asset,
-					fc->fee_reserve);
+					fc->asset);
 	if (!channel) {
 		was_pending(command_fail(fc->cmd, LIGHTNINGD,
 					 "Key generation failure"));
@@ -514,8 +510,6 @@ static void opening_fundee_finished(struct subd *openingd,
 	struct peer_fd *peer_fd;
 	struct penalty_base *pbase;
 	struct channel_type *type;
-	u8 *asset;
-	struct amount_sat fee_reserve;
 
 	log_debug(uc->log, "Got opening_fundee_finish_response");
 
@@ -543,9 +537,7 @@ static void opening_fundee_finished(struct subd *openingd,
 				     &uc->our_config.channel_reserve,
 				     &local_upfront_shutdown_script,
 				     &remote_upfront_shutdown_script,
-				     &type,
-				     &asset,
-				     &fee_reserve)) {
+				     &type)) {
 		log_broken(uc->log, "bad OPENING_FUNDEE_REPLY %s",
 			   tal_hex(reply, reply));
 		uncommitted_channel_disconnect(uc, LOG_BROKEN,
@@ -588,8 +580,7 @@ static void opening_fundee_finished(struct subd *openingd,
 					type,
 					NULL,
 					false,
-					channel_asset_or_null(asset),
-					fee_reserve);
+					uc->asset);
 	if (!channel) {
 		uncommitted_channel_disconnect(uc, LOG_BROKEN,
 					       "Commit channel failed");
@@ -694,9 +685,6 @@ struct openchannel_hook_payload {
 	u8 *shutdown_scriptpubkey;
 	const u8 *our_upfront_shutdown_script;
 	struct channel_type *channel_type;
-	/* Asset channel offer (NULL otherwise), see common/channel_asset.h */
-	u8 *asset;
-	struct amount_sat fee_reserve;
 	char *errmsg;
 };
 
@@ -726,11 +714,11 @@ static void openchannel_hook_serialize(struct openchannel_hook_payload *payload,
 		json_add_hex_talarr(stream, "shutdown_scriptpubkey",
 				    payload->shutdown_scriptpubkey);
 	json_add_channel_type(stream, "channel_type", payload->channel_type);
-	if (payload->asset) {
+	if (payload->uc->asset) {
 		json_add_string(stream, "asset",
-				fmt_channel_asset(tmpctx, payload->asset));
+				fmt_channel_asset(tmpctx, payload->uc->asset->tag));
 		json_add_amount_sat_msat(stream, "fee_reserve_msat",
-					 payload->fee_reserve);
+					 payload->uc->asset->fee_reserve);
 	}
 	json_object_end(stream); /* .openchannel */
 }
@@ -913,15 +901,12 @@ static void opening_got_offer(struct subd *openingd,
 					&payload->channel_flags,
 					&payload->shutdown_scriptpubkey,
 					&payload->channel_type,
-					&payload->asset,
-					&payload->fee_reserve)) {
+					&uc->asset)) {
 		log_broken(openingd->log, "Malformed opening_got_offer %s",
 			   tal_hex(tmpctx, msg));
 		tal_free(openingd);
 		return;
 	}
-	if (!channel_asset_or_null(payload->asset))
-		payload->asset = tal_free(payload->asset);
 
 	/* Don't allow opening if we don't know any fees; even if
 	 * ignore-feerates is set. */
@@ -935,15 +920,15 @@ static void opening_got_offer(struct subd *openingd,
 
 	/* We only take asset channels in assets we were configured for;
 	 * the openchannel hook may still reject those. */
-	if (payload->asset
-	    && !channel_asset_in(payload->asset, openingd->ld->channel_assets)) {
+	if (uc->asset
+	    && !channel_asset_in(uc->asset->tag, openingd->ld->channel_assets)) {
 		subd_send_msg(openingd,
 			      take(towire_openingd_got_offer_reply(NULL,
 				      tal_fmt(tmpctx,
 					      "Cannot accept channel: %s is"
 					      " not a channel-asset",
 					      fmt_channel_asset(tmpctx,
-								payload->asset)),
+								uc->asset->tag)),
 				      NULL, NULL, NULL, 0)));
 		tal_free(payload);
 		return;
@@ -1174,7 +1159,8 @@ static struct command_result *json_fundchannel_complete(struct command *cmd,
 		amt = wally_psbt_output_get_amount(&funding_psbt->outputs
 						   [*funding_txout_num]);
 		if (amt.value == 0
-		    || !channel_asset_eq(amt.asset, fc->asset)
+		    || !memeq(amt.asset, sizeof(amt.asset),
+			      fc->asset->tag, sizeof(fc->asset->tag))
 		    || !amount_sat_eq(amount_sat(amt.value), fc->funding_sats))
 			return command_fail(cmd, FUNDING_PSBT_INVALID,
 					    "asset channel: output %u must pay"
@@ -1184,19 +1170,20 @@ static struct command_result *json_fundchannel_complete(struct command *cmd,
 					    fmt_amount_sat(tmpctx,
 							   fc->funding_sats),
 					    fmt_channel_asset(tmpctx,
-							      fc->asset));
+							      fc->asset->tag));
 		amt = wally_psbt_output_get_amount(&funding_psbt->outputs
 						   [reserve]);
 		if (amt.value == 0
 		    || !amount_asset_is_main(&amt)
-		    || !amount_sat_eq(amount_sat(amt.value), fc->fee_reserve))
+		    || !amount_sat_eq(amount_sat(amt.value),
+				      fc->asset->fee_reserve))
 			return command_fail(cmd, FUNDING_PSBT_INVALID,
 					    "asset channel: output %zu must pay"
 					    " exactly the %s fee reserve,"
 					    " explicitly",
 					    reserve,
 					    fmt_amount_sat(tmpctx,
-							   fc->fee_reserve));
+							   fc->asset->fee_reserve));
 	}
 
 	/* Can't really check amounts for elements. */
@@ -1454,8 +1441,7 @@ static struct command_result *json_fundchannel_start(struct command *cmd,
 	} else if (fee_reserve)
 		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
 				    "fee_reserve only applies with asset");
-	fc->asset = tal_steal(fc, asset);
-	fc->fee_reserve = asset ? *fee_reserve : AMOUNT_SAT(0);
+	fc->asset = asset ? channel_asset_new(fc, asset, *fee_reserve) : NULL;
 
 	if (ctype) {
 		fc->channel_type = tal_steal(fc, ctype);
@@ -1622,8 +1608,7 @@ static struct command_result *json_fundchannel_start(struct command *cmd,
 			fc->channel_flags,
 			reserve,
 			fc->channel_type,
-			fc->asset,
-			fc->fee_reserve);
+			fc->asset);
 
 	if (!topology_synced(cmd->ld->topology)) {
 		struct fundchannel_start_info *info

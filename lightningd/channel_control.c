@@ -2040,8 +2040,7 @@ bool peer_start_channeld(struct channel *channel,
 				       cast_const2(const struct inflight **,
 						   inflights),
 				       *channel->alias[LOCAL],
-				       channel->asset,
-				       channel->fee_reserve);
+				       channel->asset);
 
 	/* We don't expect a response: we are triggered by funding_depth_cb. */
 	subd_send_msg(channel->owner, take(initmsg));

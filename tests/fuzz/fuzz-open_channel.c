@@ -109,8 +109,7 @@ static bool test_sync_write(int fd, const void *msg TAKES)
 			u8 channel_flags;
 			u8 *shutdown_scriptpubkey;
 			struct channel_type *ctype;
-			u8 *asset;
-			struct amount_sat fee_reserve;
+			struct channel_asset *asset;
 
 			assert(fromwire_openingd_got_offer(tmpctx, msg,
 						&funding_satoshis,
@@ -125,7 +124,7 @@ static bool test_sync_write(int fd, const void *msg TAKES)
 						&channel_flags,
 						&shutdown_scriptpubkey,
 						&ctype,
-						&asset, &fee_reserve));
+						&asset));
 		}
 	}
 	else if (fd == HSM_FD) /* HSMD message */

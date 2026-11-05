@@ -109,7 +109,7 @@ int main(int argc, char *argv[])
 		errx(1, "Parsing remote-close-pubkey");
 	argnum++;
 
-	fee = commit_tx_base_fee(feerate_per_kw, 0,
+	fee = commit_tx_base_fee(NULL, feerate_per_kw, 0,
 				 option_anchor_outputs,
 				 false);
 	/* BOLT #3:
