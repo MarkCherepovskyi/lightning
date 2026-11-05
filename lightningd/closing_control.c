@@ -488,10 +488,7 @@ void peer_start_closingd(struct channel *channel, struct peer_fd *peer_fd)
 
 	hsmfd = hsm_get_client_fd(ld, &channel->peer->id, channel->dbid,
 				  HSM_PERM_SIGN_CLOSING_TX
-				  | HSM_PERM_COMMITMENT_POINT
-				  /* Asset channels: closingd signs the fee reserve
-				   * input with hsmd_sign_splice_tx */
-				  | (channel->asset ? HSM_PERM_SIGN_SPLICE_TX : 0));
+				  | HSM_PERM_COMMITMENT_POINT);
 	if (hsmfd < 0) {
 		log_broken(channel->log, "Could not get hsm fd for closing: %s",
 			   strerror(errno));

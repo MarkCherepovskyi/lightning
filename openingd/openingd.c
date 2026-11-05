@@ -602,28 +602,19 @@ static u8 *funder_channel_start(struct state *state, u8 channel_flags,
  * hsmd also signs the fee reserve input; that signature goes to the peer in
  * a TLV. */
 static void read_remote_commitment_sigs(const tal_t *ctx,
-					const struct state *state,
 					struct bitcoin_signature *sig,
 					secp256k1_ecdsa_signature **fee_reserve_sig)
 {
 	const u8 *msg = wire_sync_read(tmpctx, HSM_FD);
-	struct bitcoin_signature reserve_sig;
+	struct bitcoin_signature *reserve_sig;
 
-	*fee_reserve_sig = NULL;
-	if (!state->asset) {
-		if (!fromwire_hsmd_sign_tx_reply(msg, sig))
-			status_failed(STATUS_FAIL_HSM_IO, "Bad sign_tx_reply %s",
-				      tal_hex(tmpctx, msg));
-		return;
-	}
-
-	if (!fromwire_hsmd_sign_asset_commitment_tx_reply(msg, sig,
-							  &reserve_sig))
+	if (!fromwire_hsmd_sign_commitment_tx_reply(tmpctx, msg, sig, &reserve_sig))
 		status_failed(STATUS_FAIL_HSM_IO,
-			      "Bad sign_asset_commitment_tx_reply %s",
+			      "Bad sign_commitment_tx_reply %s",
 			      tal_hex(tmpctx, msg));
-	*fee_reserve_sig = tal_dup(ctx, secp256k1_ecdsa_signature,
-				   &reserve_sig.s);
+	*fee_reserve_sig = reserve_sig
+		? tal_dup(ctx, secp256k1_ecdsa_signature, &reserve_sig->s)
+		: NULL;
 }
 
 static bool funder_finalize_channel_setup(struct state *state,
@@ -742,10 +733,10 @@ static bool funder_finalize_channel_setup(struct state *state,
 								OPT_STATIC_REMOTEKEY),
 						    commit_num,
 						    NULL, /* No htlcs */
-						    feerate);
+						    feerate, state->asset);
 
 	wire_sync_write(HSM_FD, take(msg));
-	read_remote_commitment_sigs(created_tlvs, state, sig,
+	read_remote_commitment_sigs(created_tlvs, sig,
 				    &created_tlvs->fee_reserve_sig);
 
 	/* You can tell this has been a problem before, since there's a debug
@@ -1414,11 +1405,11 @@ static u8 *fundee_channel(struct state *state, const u8 *open_channel_msg)
 								OPT_STATIC_REMOTEKEY),
 						   commit_num,
 						    NULL, /* No htlcs */
-						   feerate);
+						   feerate, state->asset);
 
 	wire_sync_write(HSM_FD, take(msg));
 	signed_tlvs = tlv_funding_signed_tlvs_new(tmpctx);
-	read_remote_commitment_sigs(signed_tlvs, state, &sig,
+	read_remote_commitment_sigs(signed_tlvs, &sig,
 				    &signed_tlvs->fee_reserve_sig);
 
 	/* We don't send this ourselves: channeld does, because master needs

@@ -1072,7 +1072,7 @@ static struct bitcoin_signature *calc_commitsigs(const tal_t *ctx,
 	size_t i;
 	struct pubkey local_htlckey;
 	const u8 *msg;
-	struct bitcoin_signature *htlc_sigs, reserve_sig;
+	struct bitcoin_signature *htlc_sigs, *reserve_sig;
 
 	status_debug("calc_commitsigs(%p, %p, %p, %p, %p, %d, %p, %p)",
 		     ctx, peer, txs, funding_wscript, htlc_map,
@@ -1086,25 +1086,20 @@ static struct bitcoin_signature *calc_commitsigs(const tal_t *ctx,
 								OPT_STATIC_REMOTEKEY),
 						    commit_index,
 						    htlcs,
-						    channel_feerate(peer->channel, REMOTE));
+						    channel_feerate(peer->channel, REMOTE),
+						    peer->channel->asset);
 
 	msg = hsm_req(tmpctx, take(msg));
-	/* For asset channels hsmd also signs the fee reserve input, and
-	 * that signature goes to the peer in a TLV. */
-	*fee_reserve_sig = NULL;
-	if (peer->channel->asset) {
-		if (!fromwire_hsmd_sign_asset_commitment_tx_reply(msg,
-								  commit_sig,
-								  &reserve_sig))
-			status_failed(STATUS_FAIL_HSM_IO,
-				      "Reading sign_remote_commitment_tx reply: %s",
-				      tal_hex(tmpctx, msg));
-		*fee_reserve_sig = tal_dup(ctx, secp256k1_ecdsa_signature,
-					   &reserve_sig.s);
-	} else if (!fromwire_hsmd_sign_tx_reply(msg, commit_sig))
+	if (!fromwire_hsmd_sign_commitment_tx_reply(tmpctx, msg, commit_sig,
+						    &reserve_sig))
 		status_failed(STATUS_FAIL_HSM_IO,
 			      "Reading sign_remote_commitment_tx reply: %s",
 			      tal_hex(tmpctx, msg));
+	/* For asset channels hsmd also signs the fee reserve input, and
+	 * that signature goes to the peer in a TLV. */
+	*fee_reserve_sig = reserve_sig
+		? tal_dup(ctx, secp256k1_ecdsa_signature, &reserve_sig->s)
+		: NULL;
 
 	status_debug("Creating commit_sig signature %"PRIu64" %s for tx %s wscript %s key %s",
 		     commit_index,

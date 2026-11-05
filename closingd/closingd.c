@@ -135,26 +135,6 @@ static u8 *closing_read_peer_msg(const tal_t *ctx,
 	}
 }
 
-/* Asset channels: our signature for input 1, the fee reserve (same 2-of-2
- * as the funding output, so the splice signer fits). */
-static struct bitcoin_signature sign_fee_reserve(const struct bitcoin_tx *tx,
-						 const struct pubkey *remote_funding_key)
-{
-	struct bitcoin_signature sig;
-	u8 *msg;
-
-	wire_sync_write(HSM_FD,
-			take(towire_hsmd_sign_splice_tx(NULL, tx,
-							remote_funding_key,
-							1)));
-	msg = wire_sync_read(tmpctx, HSM_FD);
-	if (!fromwire_hsmd_sign_tx_reply(msg, &sig))
-		status_failed(STATUS_FAIL_HSM_IO,
-			      "Bad hsm_sign_splice_tx reply %s",
-			      tal_hex(tmpctx, msg));
-	return sig;
-}
-
 static void send_offer(struct per_peer_state *pps,
 		       const struct chainparams *chainparams,
 		       const struct channel_id *channel_id,
@@ -174,7 +154,7 @@ static void send_offer(struct per_peer_state *pps,
 		       struct amount_sat max_fee_to_accept)
 {
 	struct bitcoin_tx *tx;
-	struct bitcoin_signature our_sig;
+	struct bitcoin_signature our_sig, *our_reserve_sig;
 	struct tlv_closing_signed_tlvs *close_tlvs;
 	u8 *msg;
 
@@ -213,9 +193,11 @@ static void send_offer(struct per_peer_state *pps,
 	wire_sync_write(HSM_FD,
 			take(towire_hsmd_sign_mutual_close_tx(NULL,
 							     tx,
-							     &funding_pubkey[REMOTE])));
+							     &funding_pubkey[REMOTE],
+							     chan_asset)));
 	msg = wire_sync_read(tmpctx, HSM_FD);
-	if (!fromwire_hsmd_sign_tx_reply(msg, &our_sig))
+	if (!fromwire_hsmd_sign_commitment_tx_reply(tmpctx, msg, &our_sig,
+						    &our_reserve_sig))
 		status_failed(STATUS_FAIL_HSM_IO,
 			      "Bad hsm_sign_mutual_close_tx reply %s",
 			      tal_hex(tmpctx, msg));
@@ -236,15 +218,13 @@ static void send_offer(struct per_peer_state *pps,
 	} else
 		close_tlvs = NULL;
 
-	/* Asset channels: also sign the fee reserve input. */
-	if (chan_asset) {
-		struct bitcoin_signature reserve_sig
-			= sign_fee_reserve(tx, &funding_pubkey[REMOTE]);
+	/* Asset channels: hsmd also signed the fee reserve input. */
+	if (our_reserve_sig) {
 		if (!close_tlvs)
 			close_tlvs = tlv_closing_signed_tlvs_new(tmpctx);
 		close_tlvs->fee_reserve_sig
 			= tal_dup(close_tlvs, secp256k1_ecdsa_signature,
-				  &reserve_sig.s);
+				  &our_reserve_sig->s);
 	}
 
 	assert(our_sig.sighash_type == SIGHASH_ALL);
@@ -402,12 +382,9 @@ receive_offer(struct per_peer_state *pps,
 	}
 
 	/* Asset channels: the fee is the whole reserve.  Check their
-	 * signature for the fee reserve input, add ours, and complete that
-	 * input's witness so lightningd only has to sign the funding input
-	 * as usual. */
+	 * signature for the fee reserve input; it stays in the PSBT, where
+	 * lightningd finds it when it signs the tx to broadcast it. */
 	if (chan_asset) {
-		struct bitcoin_signature their_reserve_sig, our_reserve_sig;
-
 		if (!amount_sat_eq(received_fee, chan_asset->fee_reserve))
 			peer_failed_warn(pps, channel_id,
 					 "Asset channel close fee must be the"
@@ -422,14 +399,6 @@ receive_offer(struct per_peer_state *pps,
 			peer_failed_warn(pps, channel_id,
 					 "Bad or missing fee_reserve_sig for %s",
 					 fmt_bitcoin_tx(tmpctx, tx));
-		their_reserve_sig.s = *close_tlvs->fee_reserve_sig;
-		their_reserve_sig.sighash_type = SIGHASH_ALL;
-		our_reserve_sig = sign_fee_reserve(tx, &funding_pubkey[REMOTE]);
-		bitcoin_tx_input_set_witness(tx, 1,
-			take(bitcoin_witness_2of2(NULL, &their_reserve_sig,
-						  &our_reserve_sig,
-						  &funding_pubkey[REMOTE],
-						  &funding_pubkey[LOCAL])));
 	}
 
 	status_debug("Received fee offer %s",
