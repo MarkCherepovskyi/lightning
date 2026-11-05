@@ -126,7 +126,7 @@ struct bitcoin_tx *initial_commit_tx(const tal_t *ctx,
 	 * 2. Calculate the base [commitment transaction
 	 * fee](#fee-calculation).
 	 */
-	base_fee = commit_tx_base_fee(NULL, feerate_per_kw, untrimmed,
+	base_fee = commit_tx_base_fee(asset, feerate_per_kw, untrimmed,
 				      option_anchor_outputs,
 				      option_anchors_zero_fee_htlc_tx);
 
