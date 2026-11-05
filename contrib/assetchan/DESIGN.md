@@ -143,9 +143,26 @@ Explicit (unblinded) outputs only.
 
 Target was ≈ 1,500 lines (vs 4,370 on `liquid-merged`). **Measured** (`git diff --stat
 master`, 2026-11-05, without `contrib/assetchan`, the pytest and the generated
-`msggen/schema.json`): 81 files, +2,099/−343, of which unit/fuzz tests +307; by area:
-lightningd +676 (C5's sweeps ≈ 340 of it), common +589, openingd +172, bitcoin +146,
-channeld +100, hsmd +99, onchaind +98, closingd +64, doc +42, wire +34, wallet +27.
+`msggen/schema.json`): 78 files, +2,021/−343, of which unit/fuzz tests +298; by area:
+lightningd +628 (C5's sweeps ≈ 340 of it), common +563, openingd +172, bitcoin +146,
+channeld +100, onchaind +99, hsmd +99, closingd +65, doc +36, wire +34, wallet +27.
+
+**What stays in core, and what the plugin owns.** Core keeps only what builds, signs,
+watches or forwards transactions: the daemons need the asset to produce valid
+Elements transactions (C2, C3, C5), hsmd must check what it signs (C3), and the
+cross-asset forwarding refusal must hold without any plugin. Everything else is the
+plugin's: it turns asset channels on (it offers the feature bit; core negotiates them
+only then), picks the assets (`assetchan-asset`), polices fee reserves, funds channels
+from elementsd, ties invoices to assets, checks the asset of incoming payments and
+routes payments over channels of the right asset. Without the plugin a node is an
+ordinary CLN node: upstream's `test_closing.py`, `test_connection.py` and
+`test_pay.py` pass on Bitcoin regtest with this branch (`run-tests.sh` with
+`ASSETCHAN_TEST_NETWORK=regtest`), except three connection tests
+(`test_connect_transient[_pending]`, `test_networkevents`) that fail the same way on
+master in that Docker setup. The biggest remaining piece, the fee reserve (C3),
+goes away only when Elements relays packages, so that commitments can pay no fee and
+be bumped through their anchors; a broadcaster-added fee input doesn't work, because
+it changes the commitment's txid, which the pre-signed HTLC transactions commit to.
 The table's per-change numbers are the estimates. **Not in core** (vs the branch): asset wallet (`withdrawasset`, `listassetfunds`,
 `our_asset_outputs`), `invoice asset=`, per-asset gossip (gossipd/connectd/gossmap,
 ~600 lines; see Gossip in §7), askrene/xpay/topology `asset=`, the custom
