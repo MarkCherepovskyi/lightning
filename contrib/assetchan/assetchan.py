@@ -16,11 +16,15 @@ plugin does the rest, with an elementsd wallet holding the assets:
 - `assetchan-pay` pays over channels in the invoice's asset only: gossip
   doesn't say which asset a channel is in, so the plugin reads it off the
   funding output (`assetchan-listchannels` shows that) and keeps an askrene
-  layer per asset.
+  layer per asset;
+- after a unilateral close, core hands us each spend of an asset output of
+  ours (`asset_sweep`), signed but paying no fee: the plugin adds L-BTC from
+  elementsd to pay it, broadcasts it and bumps its fee until it confirms
+  (`assetchan-sweeps` lists them).
 
 Amounts are in the asset's base units; on the wire a unit is 1000 msat.
 """
-from elements import ElementsError, ElementsRpc, base_units, coins, config_value, rpc_url
+from elements import ElementsError, ElementsRpc, Tx, TxIn, TxOut, base_units, coins, config_value, rpc_url
 from pyln.client import Plugin, RpcError, RpcException
 
 import hashlib
@@ -36,6 +40,7 @@ plugin.lbtc = None           # L-BTC's asset id
 plugin.invoice_assets = {}   # payment_hash -> asset of that invoice of ours
 plugin.gossip_assets = {}    # gossiped scid -> asset of its funding output (None: can't tell)
 plugin.layers = {}           # askrene layer we created -> scids disabled in it
+plugin.sweeps = {}           # 'txid:vout' an asset sweep spends -> its state
 
 LBTC = 'lbtc'                           # the "asset" of an ordinary channel
 INVOICE_KEY = ['assetchan', 'invoice']  # datastore: + [payment_hash] -> asset
@@ -515,6 +520,171 @@ def on_htlc_accepted(plugin, htlc, onion, **kwargs):
     return {'result': 'fail', 'failure_message': '10070000'}
 
 
+# ------------------------------------------------------------- asset sweeps
+# Core signs each spend of an asset output of ours SIGHASH_SINGLE|ANYONECANPAY
+# (the asset input and its asset output, all of it to our close address)
+# and pays no fee: an asset can't.  We add an L-BTC input of elementsd's
+# wallet, change back to it and the fee output, have elementsd sign its
+# input, and put core's witness back on input 0.  Every block we rebroadcast
+# it, at a higher fee when the deadline gets close, until the asset output
+# is spent on chain (by us, or by the peer where it may).
+
+SWEEP_SEQUENCE = 0xfffffffd   # our L-BTC input signals RBF
+SWEEP_DUST = 546              # smallest L-BTC change worth an output
+
+
+def sweep_feerate(ed, blocks_left):
+    """sat/vB for a sweep that must be mined within blocks_left: what
+    elementsd estimates for that target (or the relay floor without an
+    estimate), doubled for each block inside the last three."""
+    info = ed.call('getmempoolinfo')
+    floor = float(max(info['mempoolminfee'], info['minrelaytxfee'])) * 1e5
+    est = ed.call('estimatesmartfee', max(1, min(1008, blocks_left)))
+    rate = max(floor, float(est['feerate']) * 1e5 if 'feerate' in est else 0)
+    if blocks_left < 3:
+        rate *= 2 ** (3 - max(blocks_left, 0))
+    return rate
+
+
+def lock_coin(ed, coin, lock):
+    """Lock (or unlock) a coin of elementsd's wallet; False if we can't
+    (someone else locked it first, or it's spent already)."""
+    try:
+        ed.call('lockunspent', not lock, [{'txid': coin['txid'], 'vout': coin['vout']}])
+        return True
+    except ElementsError:
+        return False
+
+
+def sweep_coin(plugin, ed, sweep, units):
+    """An unblinded, confirmed L-BTC UTXO of elementsd's wallet worth at
+    least units, kept locked for this sweep (and its fee bumps)."""
+    coin = sweep.get('coin')
+    if coin and coin['units'] >= units:
+        return coin
+    utxos = [u for u in ed.call('listunspent', 1, 9999999, [], False,
+                                {'asset': lbtc_asset(plugin)})
+             if is_explicit(u) and base_units(u['amount']) >= units]
+    if not utxos:
+        return None
+    u = min(utxos, key=lambda u: base_units(u['amount']))
+    new = {'txid': u['txid'], 'vout': u['vout'], 'units': base_units(u['amount'])}
+    if not lock_coin(ed, new, True):
+        return None  # another sweep took it meanwhile: next block
+    if coin:
+        lock_coin(ed, coin, False)
+    sweep['coin'] = new
+    return new
+
+
+def sweep_tx(plugin, ed, sweep, coin, fee):
+    """Core's sweep plus our L-BTC input, change and fee, signed."""
+    core = Tx.parse(sweep['tx'])
+    tx = Tx.parse(sweep['tx'])
+    tx.inputs.append(TxIn(coin['txid'], coin['vout'], SWEEP_SEQUENCE))
+    lbtc = lbtc_asset(plugin)
+    change = coin['units'] - fee
+    tx.outputs = tx.outputs[:1]
+    if change >= SWEEP_DUST:
+        tx.outputs.append(TxOut.explicit(lbtc, change, bytes.fromhex(sweep['change_script'])))
+    else:
+        fee = coin['units']
+    tx.outputs.append(TxOut.explicit(lbtc, fee, b''))
+    signed = Tx.parse(ed.call('signrawtransactionwithwallet', tx.hex())['hex'])
+    if not signed.inputs[1].witness:
+        raise ElementsError('elementsd did not sign our L-BTC input')
+    signed.inputs[0].witness = core.inputs[0].witness
+    return signed, fee
+
+
+def sweep_done(ed, sweep):
+    """Is the asset output it spends spent on chain (by anyone)?"""
+    return ed.call('gettxout', sweep['txid'], sweep['vout'], False) is None
+
+
+def try_sweep(plugin, key):
+    """(Re)broadcast a sweep, at the fee its deadline calls for."""
+    sweep = plugin.sweeps[key]
+    ed = elements(plugin)
+    if sweep_done(ed, sweep):
+        if sweep.get('coin'):
+            lock_coin(ed, sweep['coin'], False)  # if our sweep didn't spend it
+        plugin.log('asset sweep of {} done'.format(key))
+        del plugin.sweeps[key]
+        return
+    height = ed.call('getblockcount')
+    if height + 1 < sweep['minblock']:
+        return
+    rate = sweep_feerate(ed, sweep['deadline'] - height)
+    cap = plugin.get_option('assetchan-max-sweep-fee')
+    # Size it with a guessed fee, then pay for that size.
+    fee = sweep.get('fee', 0)
+    vsize = sweep.get('vsize', 300)
+    want = min(cap, max(int(rate * vsize) + 1, fee))
+    if sweep.get('hex') is None or want > fee:
+        if fee:
+            # A replacement must pay for its own relay on top.
+            want = min(cap, max(want, fee + vsize))
+        coin = sweep_coin(plugin, ed, sweep, want + SWEEP_DUST)
+        if coin is None:
+            plugin.log('asset sweep of {}: no L-BTC UTXO of {} sat in elementsd:'
+                       ' retrying next block'.format(key, want + SWEEP_DUST), level='warn')
+            return
+        tx, paid = sweep_tx(plugin, ed, sweep, coin, want)
+        vsize = tx.vsize()
+        want = min(cap, max(want, int(rate * vsize) + 1))
+        if want > paid:
+            tx, paid = sweep_tx(plugin, ed, sweep, coin, want)
+        sweep.update(hex=tx.hex(), fee=paid, vsize=tx.vsize())
+    try:
+        txid = ed.call('sendrawtransaction', sweep['hex'])
+        if txid != sweep.get('broadcast'):
+            plugin.log('asset sweep of {}: {} paying {} sat'.format(key, txid, sweep['fee']))
+        sweep['broadcast'] = txid
+    except ElementsError as e:
+        if 'already' not in str(e) and 'txn-mempool-conflict' not in str(e):
+            plugin.log('asset sweep of {}: {}'.format(key, e), level='warn')
+
+
+@plugin.subscribe('asset_sweep')
+def on_asset_sweep(plugin, **kwargs):
+    """Core has a spend of an asset output of ours for us to fund."""
+    s = kwargs.get('asset_sweep', kwargs)
+    spent = Tx.parse(s['tx']).inputs[0]
+    key = '{}:{}'.format(spent.txid, spent.vout)
+    old = plugin.sweeps.get(key, {})
+    if old.get('tx') == s['tx']:
+        return  # onchaind asked again (restart, reorg): nothing new
+    plugin.sweeps[key] = {'tx': s['tx'], 'txid': spent.txid, 'vout': spent.vout,
+                          'minblock': s['minblock'], 'deadline': s['deadline'],
+                          'channel_id': s['channel_id'], 'asset': s['asset'],
+                          'coin': old.get('coin'),
+                          'change_script': elements(plugin).call(
+                              'getaddressinfo', new_address(plugin))['scriptPubKey']}
+    try:
+        try_sweep(plugin, key)
+    except (ElementsError, ValueError) as e:
+        plugin.log('asset sweep of {}: {} (retrying next block)'.format(key, e), level='warn')
+
+
+@plugin.subscribe('block_added')
+def on_block_added(plugin, **kwargs):
+    for key in list(plugin.sweeps):
+        try:
+            try_sweep(plugin, key)
+        except (ElementsError, ValueError) as e:
+            plugin.log('asset sweep of {}: {}'.format(key, e), level='warn')
+
+
+@plugin.method('assetchan-sweeps')
+def assetchan_sweeps(plugin):
+    """The asset sweeps we are funding and broadcasting."""
+    return {'sweeps': [{'outpoint': k, 'channel_id': s['channel_id'], 'asset': s['asset'],
+                        'minblock': s['minblock'], 'deadline': s['deadline'],
+                        'txid': s.get('broadcast'), 'fee': s.get('fee')}
+                       for k, s in plugin.sweeps.items()]}
+
+
 # ------------------------------------------------------------ notifications
 @plugin.subscribe('invoice_payment')
 def on_invoice_payment(plugin, invoice_payment, **kwargs):
@@ -559,6 +729,9 @@ plugin.add_option('assetchan-max-fee-reserve', 10000,
 plugin.add_option('assetchan-default-fee-reserve', 2000,
                   'L-BTC fee reserve (sat) assetchan-open puts up by default',
                   opt_type='int')
+plugin.add_option('assetchan-max-sweep-fee', 20000,
+                  'Most L-BTC (sat) we pay for one sweep of an asset output after a'
+                  ' unilateral close', opt_type='int')
 plugin.add_option('assetchan-close-to', 'elements',
                   "Where our asset goes when a channel closes: a fresh address of"
                   " elementsd's wallet (elements), or whatever core picks (none)")
