@@ -20,7 +20,6 @@ Python 3 and pyln-client only.  It listens on localhost and spends test
 coins: don't expose it.  `?demo` shows the page with sample data.
 """
 import argparse
-import base64
 import contextlib
 import json
 import os
@@ -28,18 +27,14 @@ import re
 import sys
 import threading
 import time
-import urllib.error
-import urllib.parse
-import urllib.request
 from concurrent.futures import ThreadPoolExecutor
-from decimal import Decimal
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+from elements import ElementsError, ElementsRpc, config_value
 from pyln.client import LightningRpc, RpcError
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 UI_DIR = os.path.join(HERE, 'ui')
-COIN = 10**8
 HEX64 = re.compile(r'^[0-9a-f]{64}$')
 ADDRESS = re.compile(r'^[A-Za-z0-9]{20,150}$')
 
@@ -55,36 +50,6 @@ class Fail(Exception):
 
 
 # ---------------------------------------------------------------- rpc
-class ElementsRpc:
-    """elementsd's JSON-RPC, with the standard library only (positional params)."""
-
-    def __init__(self, url, wallet=''):
-        u = urllib.parse.urlsplit(url)
-        self.url = '{}://{}{}'.format(u.scheme, u.netloc.rpartition('@')[2], u.path).rstrip('/')
-        if wallet:
-            self.url += '/wallet/' + urllib.parse.quote(wallet, safe='')
-        auth = '{}:{}'.format(urllib.parse.unquote(u.username or ''),
-                              urllib.parse.unquote(u.password or ''))
-        self.headers = {'Content-Type': 'application/json',
-                        'Authorization': 'Basic ' + base64.b64encode(auth.encode()).decode()}
-
-    def call(self, method, *params):
-        req = {'jsonrpc': '1.0', 'id': 'ui', 'method': method, 'params': list(params)}
-        try:
-            with urllib.request.urlopen(urllib.request.Request(self.url, json.dumps(req).encode(),
-                                                               self.headers), timeout=120) as r:
-                body = r.read()
-        except urllib.error.HTTPError as e:
-            body = e.read()
-        except OSError as e:
-            raise Fail('elementsd {}: {}'.format(method, e))
-        resp = json.loads(body.decode(), parse_float=Decimal)
-        if resp.get('error'):
-            err = resp['error']
-            raise Fail('elementsd {}: {}'.format(method, err.get('message', err) if isinstance(err, dict) else err))
-        return resp.get('result')
-
-
 def rpc(node):
     """A fresh client for the node: one per call, so threads don't share a socket."""
     return LightningRpc(os.path.join(NODES[node], NETWORK, 'lightning-rpc'))
@@ -101,11 +66,7 @@ def call(node, method, **params):
 
 
 def config(node, name, default=None):
-    cfg = call(node, 'listconfigs')['configs'].get(name, {})
-    for k in ('value_int', 'value_str', 'value_bool', 'values_str'):
-        if k in cfg:
-            return cfg[k]
-    return default
+    return config_value(call(node, 'listconfigs')['configs'], name, default)
 
 
 def asset_label(asset):
@@ -118,7 +79,10 @@ def can_mine():
 
 def mine(n):
     if can_mine():
-        ELEMENTS.call('generatetoaddress', n, ELEMENTS.call('getnewaddress'))
+        try:
+            ELEMENTS.call('generatetoaddress', n, ELEMENTS.call('getnewaddress'))
+        except ElementsError as e:
+            raise Fail(str(e))
 
 
 def wait_for(what, fn, mine_between=False, timeout=None):
@@ -141,11 +105,14 @@ def wait_for(what, fn, mine_between=False, timeout=None):
 
 # ---------------------------------------------------------------- state
 class Poller:
-    """Reads the nodes in the background so a page load never waits on them."""
+    """Reads the nodes when the page asks for the state, at most every
+    MAX_AGE seconds: nothing runs without a viewer."""
+    MAX_AGE = 3
 
     def __init__(self):
         self.lock = threading.Lock()
         self.state = None
+        self.read_at = 0
         self.pool = ThreadPoolExecutor(max_workers=16)
 
     def node_snapshot(self, node):
@@ -154,7 +121,7 @@ class Poller:
             'funds': lambda: call(node, 'listfunds'),
             'peers': lambda: call(node, 'listpeers')['peers'],
             'chans': lambda: call(node, 'listpeerchannels')['channels'],
-            'assets': lambda: config(node, 'channel-asset', []),
+            'config': lambda: call(node, 'listconfigs')['configs'],
         }
         futures = {k: self.pool.submit(fn) for k, fn in calls.items()}
         try:
@@ -162,7 +129,7 @@ class Poller:
         except Fail:
             return None
         try:
-            snap['elements'] = call(node, 'assetchan-funds')['elements']
+            snap['elements'] = call(node, 'assetchan-funds', channels=False)['elements']
         except Fail:
             snap['elements'] = {}
         return snap
@@ -172,11 +139,9 @@ class Poller:
                  [(n, self.pool.submit(self.node_snapshot, n)) for n in NODES]}
         ids = {s['info']['id']: n for n, s in snaps.items() if s}
         assets = {}
-        default_asset = None
         for s in snaps.values():
-            for a in (s or {}).get('assets', []):
+            for a in config_value((s or {}).get('config', {}), 'channel-asset', []):
                 assets.setdefault(a, asset_label(a))
-                default_asset = default_asset or a
 
         nodes = []
         for name in NODES:
@@ -209,32 +174,29 @@ class Poller:
                 chans[key] = {
                     'id': key, 'a': name, 'b': ids.get(c['peer_id'], c['peer_id'][:10]), 'asset': a,
                     'state': self.state_name(c['state']), 'a_units': ours, 'b_units': total - ours,
-                    'scid': c.get('short_channel_id'), 'announced': not c.get('private', True),
+                    'scid': c.get('short_channel_id'),
                 }
         order = {'open': 0, 'opening': 1, 'closing': 2, 'closed': 3}
         channels = sorted(chans.values(), key=lambda c: (order[c['state']], c['a'], c['b']))
 
-        first = next((s for s in snaps.values() if s), None)
-        info = first['info'] if first else {}
-        elements = {asset_label(k): int(v) for k, v in (first or {}).get('elements', {}).items()}
+        first = next((s for s in snaps.values() if s), None) or {}
+        info, cfg = first.get('info', {}), first.get('config', {})
+        elements = {asset_label(k): int(v) for k, v in first.get('elements', {}).items()}
         block = info.get('blockheight', 0)
         headers = block
         if ELEMENTS is not None:
             try:
                 headers = ELEMENTS.call('getblockchaininfo')['headers']
-            except Fail:
+            except ElementsError:
                 pass
-        state = {
+        return {
             'net': info.get('network', NETWORK), 'block': block, 'headers': headers,
             'syncing': 'warning_lightningd_sync' in info, 'mining': can_mine(),
-            'default_asset': default_asset, 'assets': assets, 'elements': elements,
-            'fee_reserve': first and config(next(n for n in NODES if snaps[n]),
-                                            'assetchan-default-fee-reserve', 2000),
-            'confirms': first and config(next(n for n in NODES if snaps[n]), 'funding-confirms', 1),
+            'assets': assets, 'elements': elements,
+            'fee_reserve': config_value(cfg, 'assetchan-default-fee-reserve', 2000),
+            'confirms': config_value(cfg, 'funding-confirms', 1),
             'nodes': nodes, 'channels': channels,
         }
-        with self.lock:
-            self.state = state
 
     @staticmethod
     def state_name(s):
@@ -246,16 +208,17 @@ class Poller:
             return 'opening'
         return 'closing'
 
-    def loop(self):
-        while True:
-            try:
-                self.poll()
-            except Exception as e:  # keep serving the last good state
-                print('poll failed: {}'.format(e), file=sys.stderr)
-            time.sleep(2)
-
     def snapshot(self):
+        """The state, re-read if older than MAX_AGE (one reader at a time;
+        the others get what it read).  Keeps the last good one if reading
+        fails."""
         with self.lock:
+            if time.time() - self.read_at > self.MAX_AGE:
+                try:
+                    self.state = self.poll()
+                except Exception as e:
+                    print('poll failed: {}'.format(e), file=sys.stderr)
+                self.read_at = time.time()
             return dict(self.state) if self.state else None
 
 
@@ -573,7 +536,6 @@ def main():
             p.error('no nodes under {}: pass --node NAME=LIGHTNING-DIR'.format(base))
     if args.elements_rpc:
         ELEMENTS = ElementsRpc(args.elements_rpc, args.elements_wallet)
-    threading.Thread(target=poller.loop, daemon=True).start()
     srv = ThreadingHTTPServer(('127.0.0.1', PORT), Handler)
     print('{} ({}): http://127.0.0.1:{}'.format(NETWORK, ', '.join(NODES), PORT))
     try:

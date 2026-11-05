@@ -11,7 +11,6 @@ gossip makes of them and what payers with and without the plugin do.
 
     TEST_NETWORK=liquid-regtest pytest tests/test_assetchan.py
 """
-from decimal import Decimal
 from fixtures import *  # noqa: F401,F403
 from pyln.client import RpcError
 from pyln.testing.utils import BITCOIND_CONFIG
@@ -19,19 +18,19 @@ from utils import only_one, sync_blockheight, wait_for, TEST_NETWORK
 
 import os
 import pytest
+import sys
 import unittest
 
 
-PLUGIN = os.path.join(os.getcwd(), 'contrib/assetchan/assetchan.py')
+PLUGIN_DIR = os.path.join(os.getcwd(), 'contrib/assetchan')
+PLUGIN = os.path.join(PLUGIN_DIR, 'assetchan.py')
 CHANNEL_UNITS = 100_000     # asset base units in each asset channel
 FEE_RESERVE = 2000          # L-BTC sats next to each asset channel
 PAY_UNITS = 1000
 HTLC_UNITS = 2000           # the HTLC the on-chain tests leave in flight
 
-
-def units(amount):
-    """An elementsd decimal amount in base units."""
-    return int(Decimal(str(amount)) * 10**8)
+sys.path.insert(0, PLUGIN_DIR)
+from elements import base_units as units  # noqa: E402  (elementsd decimal -> base units)
 
 
 def wallet_units(bitcoind, asset):
@@ -72,19 +71,42 @@ def node_opts(bitcoind, asset):
             'fee-base': 1000, 'fee-per-satoshi': 0}
 
 
-def mine_spends_of(bitcoind, nodes, txid, want, maxblocks=30):
+def issue_asset(bitcoind):
+    """A new asset, confirmed.  (elementsd's wallet learns of the block the
+    fixture just mined asynchronously; the issuance needs its coinbase.)"""
+    bitcoind.rpc.syncwithvalidationinterfacequeue()
+    asset = bitcoind.rpc.issueasset(1000, 0, False)['asset']
+    bitcoind.generate_block(1)
+    return asset
+
+
+def wallet_tx_vout(bitcoind, txid):
+    """Outputs of a tx of elementsd's wallet, mined or not."""
+    return bitcoind.rpc.decoderawtransaction(bitcoind.rpc.gettransaction(txid)['hex'])['vout']
+
+
+def mine_spends_of(bitcoind, nodes, txid, want, maxblocks=30, since=None):
     """Mine block by block (letting the nodes react to each) until `want`
-    txs spending txid got mined; return them by txid."""
+    txs spending txid got mined, counting those in blocks from height
+    `since` on too; return them by txid."""
     mined = {}
-    for _ in range(maxblocks):
-        sync_blockheight(bitcoind, nodes)
-        blockhash = bitcoind.generate_block(1)[0]
+
+    def scan(blockhash):
         for tx in bitcoind.rpc.getblock(blockhash, 2)['tx']:
             if any(vin.get('txid') == txid for vin in tx['vin']):
                 mined[tx['txid']] = bitcoind.rpc.getrawtransaction(tx['txid'], True, blockhash)
+
+    if since is not None:
+        for height in range(since, bitcoind.rpc.getblockcount() + 1):
+            scan(bitcoind.rpc.getblockhash(height))
+    for _ in range(maxblocks):
         if len(mined) >= want:
-            return mined
-    raise ValueError("only {} spends of {} after {} blocks".format(len(mined), txid, maxblocks))
+            break
+        sync_blockheight(bitcoind, nodes)
+        scan(bitcoind.generate_block(1)[0])
+    if len(mined) < want:
+        raise ValueError("only {} spends of {} after {} blocks".format(len(mined), txid, maxblocks))
+    return mined
 
 
 def spends_from(tx, txid):
@@ -153,41 +175,27 @@ def payment_result(bitcoind, payer, payment_hash, nodes):
 @unittest.skipIf(TEST_NETWORK != 'liquid-regtest', 'Liquid only')
 def test_open_pay_close(node_factory, bitcoind):
     lbtc = bitcoind.rpc.dumpassetlabels()['bitcoin']
-    asset = bitcoind.rpc.issueasset(1000, 0, False)['asset']
-    bitcoind.generate_block(1)
+    asset = issue_asset(bitcoind)
 
     l1, l2, l3 = node_factory.get_nodes(3, opts=node_opts(bitcoind, asset))
-    l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
-    l2.rpc.connect(l3.info['id'], 'localhost', l3.port)
 
     # Asset channels l1-l2 and l2-l3, funded by elementsd's wallet (one at a
     # time, so the second can spend the first one's change).
     funding = {}
     for opener, peer in ((l1, l2), (l2, l3)):
-        res = opener.rpc.call('assetchan-open', {'id': peer.info['id'], 'amount': CHANNEL_UNITS,
-                                                 'asset': asset, 'fee_reserve': FEE_RESERVE})
+        res = open_asset_channel(bitcoind, opener, peer, asset)
         assert res['asset'] == asset and res['fee_reserve'] == FEE_RESERVE
         # The asset to the 2-of-2 at output n, the L-BTC fee reserve at n+1.
-        vout = bitcoind.rpc.getrawtransaction(res['txid'], True)['vout']
+        vout = wallet_tx_vout(bitcoind, res['txid'])
         out = res['outnum']
         assert vout[out]['asset'] == asset and units(vout[out]['value']) == CHANNEL_UNITS
         assert vout[out + 1]['asset'] == lbtc and units(vout[out + 1]['value']) == FEE_RESERVE
         assert vout[out + 1]['scriptPubKey']['hex'] == vout[out]['scriptPubKey']['hex']
-        bitcoind.generate_block(1, wait_for_mempool=res['txid'])
         funding[opener] = res['channel_id']
-    bitcoind.generate_block(5)
-    for opener, peer in ((l1, l2), (l2, l3)):
-        wait_normal(opener, funding[opener])
-        wait_normal(peer, funding[opener])
 
     ch12 = channel(l1, funding[l1])
     assert ch12['asset'] == asset
     assert ch12['fee_reserve_msat'] == FEE_RESERVE * 1000
-    # Both sides close to elementsd's wallet: close_to at open, and the
-    # openchannel hook on the other side.
-    for node in (l1, l2):
-        info = bitcoind.rpc.getaddressinfo(channel(node, funding[l1])['close_to_addr'])
-        assert info['ismine']
 
     # An ordinary L-BTC channel l1-l2 alongside.
     l1.fundwallet(10**7)
@@ -260,7 +268,7 @@ def test_open_pay_close(node_factory, bitcoind):
     # The elementsd side of the plugin: an address, a send, the balances.
     addr = l1.rpc.call('assetchan-newaddr', {})['address']
     txid = l1.rpc.call('assetchan-send', {'addr': addr, 'asset': asset, 'amount': 10})['txid']
-    vout = bitcoind.rpc.getrawtransaction(txid, True)['vout']
+    vout = wallet_tx_vout(bitcoind, txid)
     assert any(v.get('asset') == asset and units(v['value']) == 10
                and v['scriptPubKey']['address'] == addr for v in vout)
     bitcoind.generate_block(1, wait_for_mempool=txid)
@@ -282,8 +290,7 @@ def test_unilateral_close(node_factory, bitcoind, closer):
     pays its anchors and fee.  Then each side sweeps its asset output to its
     elementsd close address, paying the L-BTC fee from its CLN wallet."""
     lbtc = bitcoind.rpc.dumpassetlabels()['bitcoin']
-    asset = bitcoind.rpc.issueasset(1000, 0, False)['asset']
-    bitcoind.generate_block(1)
+    asset = issue_asset(bitcoind)
 
     l1, l2 = node_factory.get_nodes(2, opts=node_opts(bitcoind, asset))
     res = open_asset_channel(bitcoind, l1, l2, asset)
@@ -374,8 +381,7 @@ def test_htlc_onchain(node_factory, bitcoind, closer, outcome):
 
     l1 learns the outcome from the chain, so the payment fails or succeeds."""
     lbtc = bitcoind.rpc.dumpassetlabels()['bitcoin']
-    asset = bitcoind.rpc.issueasset(1000, 0, False)['asset']
-    bitcoind.generate_block(1)
+    asset = issue_asset(bitcoind)
 
     # l2 hangs up instead of failing / fulfilling the HTLC (the second one:
     # the first gives l2 a balance), so it stays in flight.
@@ -416,6 +422,7 @@ def test_htlc_onchain(node_factory, bitcoind, closer, outcome):
     # closer after its delay and to_remote by the other side, as in
     # test_unilateral_close, and the HTLC by whoever wins it.  Each spend
     # takes one output, as its input 0, and pays L-BTC from the wallet.
+    first_block = bitcoind.rpc.getblockcount() + 1
     spends = mine_spends_of(bitcoind, [l1, l2], commit_txid, 3, maxblocks=40)
     for tx in spends.values():
         assert [i for i, _ in spends_from(tx, commit_txid)] == [0]
@@ -439,7 +446,9 @@ def test_htlc_onchain(node_factory, bitcoind, closer, outcome):
         assert htlc_spend['locktime'] == (cltv_expiry if outcome == 'timeout' else 0)
         # After the delay, its output goes to the winner's close address
         # (the other inputs are wallet L-BTC, maybe the HTLC tx's change).
-        sweep = only_one(list(mine_spends_of(bitcoind, [l1, l2], htlc_spend['txid'], 1).values()))
+        # (maybe while the other spends were still being waited for).
+        sweep = only_one(list(mine_spends_of(bitcoind, [l1, l2], htlc_spend['txid'], 1,
+                                             since=first_block).values()))
         assert spends_from(sweep, htlc_spend['txid'])[0] == (0, 0)
         assert sweep['vin'][0]['sequence'] == channel(winner, chan)['our_to_self_delay']
         assert len(sweep['vin']) >= 2 and units(sweep['fee'][lbtc]) > 0
@@ -490,8 +499,7 @@ def test_penalty(node_factory, bitcoind, cheater):
     revocation key, and its own to_remote, each in a sweep paid with L-BTC
     from its wallet."""
     lbtc = bitcoind.rpc.dumpassetlabels()['bitcoin']
-    asset = bitcoind.rpc.issueasset(1000, 0, False)['asset']
-    bitcoind.generate_block(1)
+    asset = issue_asset(bitcoind)
 
     # Identical feerates: no gratuitous commitments to update them.
     opts = {**node_opts(bitcoind, asset), 'may_reconnect': True,
@@ -581,8 +589,7 @@ def test_gossip(node_factory, bitcoind):
     private; L-BTC channels l1-l5 and l5-l4 announced.  What gossip makes of
     asset channels, and what payers, with and without the plugin, do with
     that."""
-    asset = bitcoind.rpc.issueasset(1000, 0, False)['asset']
-    bitcoind.generate_block(1)
+    asset = issue_asset(bitcoind)
     # l5 charges 50 sat a forward (the others 1), see 3.
     opts = [node_opts(bitcoind, asset) for _ in range(5)]
     opts[4]['fee-base'] = 50000

@@ -18,78 +18,21 @@ plugin does the rest, with an elementsd wallet holding the assets:
 
 Amounts are in the asset's base units; on the wire a unit is 1000 msat.
 """
-from decimal import Decimal
+from elements import ElementsError, ElementsRpc, base_units, coins, config_value, rpc_url
 from pyln.client import Plugin, RpcError, RpcException
 
-import base64
 import hashlib
 import json
-import urllib.error
-import urllib.parse
-import urllib.request
 
 plugin = Plugin()
 plugin.elements = None       # ElementsRpc, built on first use
 plugin.lbtc = None           # L-BTC's asset id
-plugin.channel_assets = {}   # scid or alias -> asset of that channel of ours
-plugin.gossip_assets = {}    # gossiped scid -> asset of its funding output
+plugin.invoice_assets = {}   # payment_hash -> asset of that invoice of ours
+plugin.gossip_assets = {}    # gossiped scid -> asset of its funding output (None: can't tell)
+plugin.layers = {}           # askrene layer we created -> scids disabled in it
 
-COIN = 10**8
 LBTC = 'lbtc'                           # the "asset" of an ordinary channel
 INVOICE_KEY = ['assetchan', 'invoice']  # datastore: + [payment_hash] -> asset
-
-
-class ElementsError(RpcException):
-    """An elementsd RPC call failed."""
-    def __init__(self, message):
-        super().__init__(message, code=-1)
-
-
-class ElementsRpc:
-    """elementsd's JSON-RPC, with the standard library only (positional params)."""
-
-    def __init__(self, url, user, password, wallet=''):
-        self.url = url.rstrip('/')
-        if wallet:
-            self.url += '/wallet/' + urllib.parse.quote(wallet, safe='')
-        auth = base64.b64encode('{}:{}'.format(user, password).encode()).decode()
-        self.headers = {'Content-Type': 'application/json',
-                        'Authorization': 'Basic ' + auth}
-        self.next_id = 0
-
-    def call(self, method, *params):
-        self.next_id += 1
-        req = {'jsonrpc': '1.0', 'id': self.next_id, 'method': method,
-               'params': list(params)}
-        try:
-            with urllib.request.urlopen(urllib.request.Request(self.url, json.dumps(req).encode(),
-                                                               self.headers), timeout=120) as r:
-                body = r.read()
-        except urllib.error.HTTPError as e:
-            # An RPC error is an HTTP 500 with the usual JSON body.
-            body = e.read()
-        except OSError as e:
-            raise ElementsError('elementsd {}: {}'.format(method, e))
-        try:
-            resp = json.loads(body.decode(), parse_float=Decimal)
-        except ValueError:
-            raise ElementsError('elementsd {}: unexpected reply {!r}'.format(method, body[:200]))
-        err = resp.get('error')
-        if err:
-            if isinstance(err, dict):
-                err = err.get('message', err)
-            raise ElementsError('elementsd {}: {}'.format(method, err))
-        return resp.get('result')
-
-
-def coins(units):
-    """Base units -> the decimal amount string elementsd takes."""
-    return '{}.{:08d}'.format(*divmod(int(units), COIN))
-
-
-def base_units(amount):
-    """elementsd's decimal amount (a number or a string) -> base units."""
-    return int(Decimal(str(amount)) * COIN)
 
 
 def check_asset(asset):
@@ -109,12 +52,6 @@ def check_asset_or_lbtc(asset):
 
 
 # ---------------------------------------------------------------- elementsd
-def config_value(cfg, name):
-    """A lightningd option's value from listconfigs' configs, or None."""
-    opt = cfg.get(name, {})
-    return opt.get('value_str', opt.get('value_int'))
-
-
 def rpc_password(cfg):
     """bitcoin-rpcpassword: listconfigs conceals it as "...", but says where
     it was set; read it back from the config file if that's where."""
@@ -133,12 +70,7 @@ def elements(plugin):
     """Our elementsd client, built on first use."""
     if plugin.elements is None:
         url = plugin.get_option('assetchan-elements-rpc')
-        if url:
-            u = urllib.parse.urlsplit(url)
-            user = urllib.parse.unquote(u.username or '')
-            password = urllib.parse.unquote(u.password or '')
-            base = '{}://{}{}'.format(u.scheme, u.netloc.rpartition('@')[2], u.path)
-        else:
+        if not url:
             cfg = plugin.rpc.listconfigs()['configs']
             user = config_value(cfg, 'bitcoin-rpcuser')
             password = rpc_password(cfg)
@@ -147,10 +79,9 @@ def elements(plugin):
                 raise RpcException("can't find elementsd's RPC credentials (bitcoin-rpcuser,"
                                    " bitcoin-rpcpassword, bitcoin-rpcport): set"
                                    " assetchan-elements-rpc=http://user:password@host:port")
-            base = 'http://{}:{}'.format(config_value(cfg, 'bitcoin-rpcconnect') or '127.0.0.1',
-                                         port)
-        plugin.elements = ElementsRpc(base, user, password,
-                                      plugin.get_option('assetchan-elements-wallet'))
+            url = rpc_url(user, password, config_value(cfg, 'bitcoin-rpcconnect') or '127.0.0.1',
+                          port)
+        plugin.elements = ElementsRpc(url, plugin.get_option('assetchan-elements-wallet'))
     return plugin.elements
 
 
@@ -236,52 +167,45 @@ def funding_outnum(tx, scriptpubkey, asset, amount, lbtc, fee_reserve):
 
 
 # ----------------------------------------------------------------- channels
-def channels(plugin):
+def our_channels(plugin):
     return plugin.rpc.listpeerchannels()['channels']
-
-
-def refresh_channels(plugin):
-    """Rebuild the map from a channel's scid (or alias) to its asset."""
-    assets = {}
-    for c in channels(plugin):
-        for scid in [c.get('short_channel_id')] + list(c.get('alias', {}).values()):
-            if scid:
-                assets[scid] = c.get('asset', LBTC)
-    plugin.channel_assets = assets
-
-
-def channel_asset(plugin, scid):
-    """The asset of our channel scid (a real scid or an alias), or None."""
-    if scid not in plugin.channel_assets:
-        refresh_channels(plugin)
-    return plugin.channel_assets.get(scid)
 
 
 def gossiped_channel_asset(plugin, scid):
     """The asset a gossiped channel is in: gossip doesn't say, its funding
     output's asset tag does (read from elementsd, cached).  'lbtc' for an
-    ordinary channel, None if we can't tell."""
+    ordinary channel, None if we can't tell (cached too, when the output
+    is gone or has no tag; not when elementsd failed)."""
     if scid in plugin.gossip_assets:
         return plugin.gossip_assets[scid]
-    asset = None
     try:
         height, index, outnum = (int(x) for x in scid.split('x'))
         ed = elements(plugin)
         txid = ed.call('getblock', ed.call('getblockhash', height), 1)['tx'][index]
         out = ed.call('gettxout', txid, outnum, False)
-        if out and 'asset' in out:
-            asset = LBTC if out['asset'] == lbtc_asset(plugin) else out['asset']
     except (ElementsError, IndexError, ValueError, KeyError) as e:
         plugin.log("can't tell the asset of channel {}: {}".format(scid, e), 'info')
-    if asset is not None:
-        plugin.gossip_assets[scid] = asset
+        return None
+    asset = None
+    if out and 'asset' in out:
+        asset = LBTC if out['asset'] == lbtc_asset(plugin) else out['asset']
+    plugin.gossip_assets[scid] = asset
     return asset
+
+
+def gossiped_assets(plugin, chans):
+    """scid -> asset (None if we can't tell) for listchannels' `chans`,
+    forgetting the channels gossip no longer has."""
+    scids = {c['short_channel_id'] for c in chans}
+    for scid in set(plugin.gossip_assets) - scids:
+        del plugin.gossip_assets[scid]
+    return {scid: gossiped_channel_asset(plugin, scid) for scid in scids}
 
 
 def find_channel(plugin, id):
     """The one channel `id` names (channel id, scid, alias, or a peer with a
     single channel), or None."""
-    found = [c for c in channels(plugin)
+    found = [c for c in our_channels(plugin)
              if id in [c['channel_id'], c['peer_id'], c.get('short_channel_id')]
              + list(c.get('alias', {}).values())]
     return found[0] if len(found) == 1 else None
@@ -299,13 +223,11 @@ def channel_summary(c):
     return s
 
 
-def invoice_asset(plugin, payment_hash):
-    """The asset an invoice is in: L-BTC unless assetchan-invoice noted one."""
-    key = INVOICE_KEY + [payment_hash]
-    for entry in plugin.rpc.listdatastore(key=key)['datastore']:
-        if entry['key'] == key:
-            return entry['string']
-    return LBTC
+def load_invoice_assets(plugin):
+    """The assets assetchan-invoice noted, by payment hash, from the datastore."""
+    plugin.invoice_assets = {e['key'][-1]: e['string']
+                             for e in plugin.rpc.listdatastore(key=INVOICE_KEY)['datastore']
+                             if len(e['key']) == len(INVOICE_KEY) + 1 and 'string' in e}
 
 
 def allowed_assets(plugin):
@@ -402,17 +324,19 @@ def assetchan_close(plugin, id, destination=None):
 @plugin.method('assetchan-list')
 def assetchan_list(plugin, asset=None):
     """Our asset channels (those in {asset}, if given)."""
-    return {'channels': [channel_summary(c) for c in channels(plugin)
+    return {'channels': [channel_summary(c) for c in our_channels(plugin)
                          if 'asset' in c and asset in (None, c['asset'])]}
 
 
 @plugin.method('assetchan-funds')
-def assetchan_funds(plugin):
-    """What elementsd's wallet holds (by asset id, or label) and what our
-    channels hold, in base units."""
+def assetchan_funds(plugin, channels=True):
+    """What elementsd's wallet holds (by asset id, or label) and, unless
+    {channels} is false, what our channels hold, in base units."""
     balances = elements(plugin).call('getbalances')['mine']['trusted']
-    return {'elements': {name: base_units(amount) for name, amount in balances.items()},
-            'channels': [channel_summary(c) for c in channels(plugin)]}
+    res = {'elements': {name: base_units(amount) for name, amount in balances.items()}}
+    if channels:
+        res['channels'] = [channel_summary(c) for c in our_channels(plugin)]
+    return res
 
 
 @plugin.method('assetchan-send')
@@ -434,8 +358,10 @@ def assetchan_listchannels(plugin, asset=None):
     if asset is not None:
         check_asset_or_lbtc(asset)
     out = []
-    for c in plugin.rpc.listchannels()['channels']:
-        found = gossiped_channel_asset(plugin, c['short_channel_id'])
+    chans = plugin.rpc.listchannels()['channels']
+    assets = gossiped_assets(plugin, chans)
+    for c in chans:
+        found = assets[c['short_channel_id']]
         if asset is None or found == asset:
             out.append({'short_channel_id': c['short_channel_id'],
                         'direction': c['direction'], 'source': c['source'],
@@ -456,7 +382,7 @@ def asset_hints(plugin, asset):
     hints.  Explicit hints: core would otherwise pick channels in any asset,
     and none at all through a peer without public channels."""
     ours = set()
-    for c in channels(plugin):
+    for c in our_channels(plugin):
         if c.get('asset', LBTC) != asset or c.get('state') != 'CHANNELD_NORMAL':
             continue
         ours.update(scid for scid in (c.get('short_channel_id'),
@@ -480,6 +406,7 @@ def assetchan_invoice(plugin, amount, asset, label, description, expiry=None):
                              exposeprivatechannels=asset_hints(plugin, asset))
     plugin.rpc.datastore(key=INVOICE_KEY + [inv['payment_hash']], string=asset,
                          mode='create-or-replace')
+    plugin.invoice_assets[inv['payment_hash']] = asset
     inv['asset'] = asset
     return inv
 
@@ -489,22 +416,29 @@ def asset_layer(plugin, asset):
     in another asset disabled (ours, and the gossiped ones by their funding
     output), so a payment in `asset` is only routed over channels in it."""
     layer = 'assetchan.' + asset
-    if layer not in [lay['layer'] for lay in plugin.rpc.call('askrene-listlayers', {})['layers']]:
-        plugin.rpc.call('askrene-create-layer', {'layer': layer, 'persistent': False})
+    disabled = plugin.layers.get(layer)
+    if disabled is None:
+        layers = plugin.rpc.call('askrene-listlayers', {})['layers']
+        if layer not in [lay['layer'] for lay in layers]:
+            plugin.rpc.call('askrene-create-layer', {'layer': layer, 'persistent': False})
+        disabled = plugin.layers[layer] = set()
 
     def disable(scid):
+        if scid in disabled:
+            return
         for direction in (0, 1):
             plugin.rpc.call('askrene-update-channel',
                             {'layer': layer, 'enabled': False,
                              'short_channel_id_dir': '{}/{}'.format(scid, direction)})
+        disabled.add(scid)
 
-    for c in channels(plugin):
+    for c in our_channels(plugin):
         # (what askrene calls the channel: its scid, or its local alias)
         scid = c.get('short_channel_id') or c.get('alias', {}).get('local')
         if scid is not None and c.get('asset', LBTC) != asset:
             disable(scid)
-    for scid in {c['short_channel_id'] for c in plugin.rpc.listchannels()['channels']}:
-        other = gossiped_channel_asset(plugin, scid)
+    gossiped = gossiped_assets(plugin, plugin.rpc.listchannels()['channels'])
+    for scid, other in gossiped.items():
         if other is not None and other != asset:
             disable(scid)
     return layer
@@ -550,12 +484,13 @@ def on_openchannel(plugin, openchannel, **kwargs):
 
 @plugin.hook('htlc_accepted')
 def on_htlc_accepted(plugin, htlc, onion, **kwargs):
-    """Final hop: the HTLC must arrive in the invoice's asset."""
+    """Final hop: the HTLC must arrive in the invoice's asset (core says
+    which asset channel it came by; an ordinary one, none)."""
     if 'short_channel_id' in onion or 'next_node_id' in onion:
         return {'result': 'continue'}  # a forward: core keeps the asset
-    want = invoice_asset(plugin, htlc['payment_hash'])
-    got = channel_asset(plugin, htlc['short_channel_id'])
-    if got is None or got == want:
+    want = plugin.invoice_assets.get(htlc['payment_hash'], LBTC)
+    got = htlc.get('asset', LBTC)
+    if got == want:
         return {'result': 'continue'}
     plugin.log('HTLC for {} arrived in {} but the invoice is in {}: failing it'
                .format(htlc['payment_hash'], got, want))
@@ -567,30 +502,23 @@ def on_htlc_accepted(plugin, htlc, onion, **kwargs):
 
 
 # ------------------------------------------------------------ notifications
-@plugin.subscribe('channel_state_changed')
-def on_channel_state_changed(plugin, **kwargs):
-    refresh_channels(plugin)
-
-
-@plugin.subscribe('channel_opened')
-def on_channel_opened(plugin, **kwargs):
-    refresh_channels(plugin)
-
-
 @plugin.subscribe('invoice_payment')
 def on_invoice_payment(plugin, invoice_payment, **kwargs):
     """A paid invoice no longer needs its asset noted."""
     payment_hash = hashlib.sha256(bytes.fromhex(invoice_payment['preimage'])).hexdigest()
+    if plugin.invoice_assets.pop(payment_hash, None) is None:
+        return  # an ordinary invoice
     try:
         plugin.rpc.deldatastore(key=INVOICE_KEY + [payment_hash])
-    except RpcError:
-        pass  # an ordinary invoice
+    except RpcError as e:
+        plugin.log('deldatastore: {}'.format(e), level='warn')
 
 
 @plugin.init()
 def init(options, configuration, plugin, **kwargs):
     if options['assetchan-close-to'] not in ('elements', 'none'):
         return {'disable': "assetchan-close-to must be 'elements' or 'none'"}
+    load_invoice_assets(plugin)
     plugin.log('fee reserve {}..{} sat (default {}), closing to {}'.format(
         options['assetchan-min-fee-reserve'], options['assetchan-max-fee-reserve'],
         options['assetchan-default-fee-reserve'], options['assetchan-close-to']))

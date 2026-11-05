@@ -6,7 +6,6 @@
   "mining": false,
   "fee_reserve": 2000,
   "confirms": 2,
-  "default_asset": "ddc8da3f868bd193d25e3bbdd3e3c075d6629fa45dee1c3d829682d82094ba50",
   "assets": {
     "ddc8da3f868bd193d25e3bbdd3e3c075d6629fa45dee1c3d829682d82094ba50": "ASSET(ddc8da3f)"
   },
@@ -22,10 +21,10 @@
   "channels": [
     {"id": "a43d57113597e25b773c94de882c6d857bb8edb589689abd598b491f57db544d", "a": "A", "b": "B",
      "asset": "ddc8da3f868bd193d25e3bbdd3e3c075d6629fa45dee1c3d829682d82094ba50",
-     "state": "open", "a_units": 930000, "b_units": 70000, "scid": "2690367x1x0", "announced": false},
+     "state": "open", "a_units": 930000, "b_units": 70000, "scid": "2690367x1x0"},
     {"id": "f0d002204fb73c4e6b13ceacb6b9d2b90799626fe4964c544a3caad0af74016f", "a": "A", "b": "B",
      "asset": "ddc8da3f868bd193d25e3bbdd3e3c075d6629fa45dee1c3d829682d82094ba50",
-     "state": "closed", "a_units": 900000, "b_units": 100000, "scid": "2690372x1x0", "announced": false}
+     "state": "closed", "a_units": 900000, "b_units": 100000, "scid": "2690372x1x0"}
   ],
   "job": {
     "id": 1, "title": "Open ASSET(ddc8da3f) channel A to B, 1,000,000", "status": "done",
