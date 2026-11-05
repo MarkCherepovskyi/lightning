@@ -63,7 +63,7 @@ Per-chain notes:
   `ecrecover` (secp256k1), `sha256`/`ripemd160` precompiles; a script interpreter for
   the templates above; CSV/CLTV on the contract's block counter; deposit/withdraw.
   Gas → use an L2. Backend plugin synthesizes Bitcoin-format blocks from the contract's
-  event log.
+  event log. Plan: `ETH.md`.
 - **Solana**: program with `secp256k1_recover` and SHA256 syscalls; RIPEMD160 in-program;
   UTXOs as PDAs; height = slot.
 - **Cosmos**: CosmWasm contract (k256/sha2/ripemd crates) or SDK module; IBC denom as
