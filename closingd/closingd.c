@@ -1124,6 +1124,7 @@ exit_thru_the_giftshop:
 	tal_free(their_feerange);
 	tal_free(local_wallet_index);
 	tal_free(local_wallet_ext_key);
+	tal_free(asset);
 	if (developer)
 		closing_dev_memleak(ctx, scriptpubkey, funding_wscript);
 
