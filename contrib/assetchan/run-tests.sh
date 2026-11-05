@@ -14,7 +14,9 @@
 # and without -n it uses -n 4.  The tree is copied in as git sees it: tracked
 # and untracked files, but not ignored ones.
 #
-# Environment: TEST_DEBUG=1 prints the nodes' logs of failed tests;
+# Environment: ASSETCHAN_TEST_NETWORK=regtest runs on Bitcoin regtest
+# instead (e.g. upstream's own tests, to check ordinary channels are
+# untouched); TEST_DEBUG=1 prints the nodes' logs of failed tests;
 # ASSETCHAN_TEST_KEEP_ALL=1 keeps the directories of passed tests too (else
 # only failed ones are kept for `logs`); ASSETCHAN_TEST_REBUILD=1 rebuilds the
 # image; ASSETCHAN_TEST_IMAGE and ASSETCHAN_TEST_VOLUME override their names.
@@ -75,6 +77,7 @@ fi
 COPYFILE_DISABLE=1 tar $tarflags -cf - -T "$list" \
 	| docker run --rm -i --name "assetchan-pytest-$$" -v "$volume":/build \
 		-e TEST_DEBUG="${TEST_DEBUG:-}" -e KEEP_ALL="${ASSETCHAN_TEST_KEEP_ALL:-}" \
+		-e TEST_NETWORK="${ASSETCHAN_TEST_NETWORK:-liquid-regtest}" \
 		"$image" sh -c '
 set -e
 tar -xf - -C /build 2> /dev/null
@@ -89,7 +92,7 @@ make -j"$(nproc)" VERSION=v26.06-assetchan all-programs default-targets > /tmp/m
 	|| { grep -E "error|Error" /tmp/make.log | head -40; tail -20 /tmp/make.log; exit 1; }
 
 export PYTHONPATH=/build/contrib/pyln-testing:/build/contrib/pyln-client:/build/contrib/pyln-proto:/build/contrib/pyln-spec/bolt7:/build/contrib/pyln-grpc-proto
-export TEST_NETWORK=liquid-regtest TEST_DIR=/tmp/ltests SLOW_MACHINE=1
+export TEST_DIR=/tmp/ltests SLOW_MACHINE=1
 mkdir -p /tmp/ltests
 plugins=
 if [ -n "$KEEP_ALL" ]; then
