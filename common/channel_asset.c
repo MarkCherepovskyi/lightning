@@ -63,16 +63,6 @@ char *fmt_channel_asset(const tal_t *ctx, const u8 *asset)
 	return tal_hexstr(ctx, id, sizeof(id));
 }
 
-bool channel_asset_in(const u8 *tag, u8 *const *tags)
-{
-	if (!tag)
-		return false;
-	for (size_t i = 0; i < tal_count(tags); i++)
-		if (memcmp(tag, tags[i], ELEMENTS_ASSET_LEN) == 0)
-			return true;
-	return false;
-}
-
 bool elements_output_is_explicit(const struct wally_tx_output *output)
 {
 	if (!chainparams->is_elements)

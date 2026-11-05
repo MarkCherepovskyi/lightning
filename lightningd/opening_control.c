@@ -921,22 +921,6 @@ static void opening_got_offer(struct subd *openingd,
 		return;
 	}
 
-	/* We only take asset channels in assets we were configured for;
-	 * the openchannel hook may still reject those. */
-	if (uc->asset
-	    && !channel_asset_in(uc->asset->tag, openingd->ld->channel_assets)) {
-		subd_send_msg(openingd,
-			      take(towire_openingd_got_offer_reply(NULL,
-				      tal_fmt(tmpctx,
-					      "Cannot accept channel: %s is"
-					      " not a channel-asset",
-					      fmt_channel_asset(tmpctx,
-								uc->asset->tag)),
-				      NULL, NULL, NULL, 0)));
-		tal_free(payload);
-		return;
-	}
-
 	tal_add_destructor2(openingd, openchannel_payload_remove_openingd, payload);
 	plugin_hook_call_openchannel(openingd->ld, NULL, payload);
 }
@@ -1428,10 +1412,6 @@ static struct command_result *json_fundchannel_start(struct command *cmd,
 		if (!chainparams->is_elements)
 			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
 					    "asset channels only exist on Liquid");
-		if (!channel_asset_in(asset, cmd->ld->channel_assets))
-			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-					    "%s is not a channel-asset",
-					    fmt_channel_asset(tmpctx, asset));
 		if (!fee_reserve)
 			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
 					    "fee_reserve is required with asset");

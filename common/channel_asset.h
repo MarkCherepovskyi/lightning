@@ -71,9 +71,6 @@ u8 *channel_asset_from_hex(const tal_t *ctx, const char *hex, size_t hexlen);
 /* Asset id as printed by elements-cli. */
 char *fmt_channel_asset(const tal_t *ctx, const u8 *asset);
 
-/* Is asset tag @tag one of the (tal array of) @tags? */
-bool channel_asset_in(const u8 *tag, u8 *const *tags);
-
 /* Are this output's asset and value both explicit (always, off Elements)?
  * Only those can fund a channel. */
 bool elements_output_is_explicit(const struct wally_tx_output *output);

@@ -280,10 +280,6 @@ struct lightningd {
 	 * FEERATE_PENALTY). */
 	u32 *force_feerates;
 
-	/* Assets we open and accept asset channels in (--channel-asset):
-	 * asset tags, see common/channel_asset.h. */
-	u8 **channel_assets;
-
 	/* If they force db upgrade on or off this is set. */
 	bool *db_upgrade_ok;
 

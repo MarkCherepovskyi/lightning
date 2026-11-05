@@ -4,6 +4,8 @@
 Core knows a channel's asset and builds and signs its transactions; this
 plugin does the rest, with an elementsd wallet holding the assets:
 
+- it turns asset channels on: core only takes them when a plugin offers
+  their feature bit, and the plugin decides which assets (`assetchan-asset`);
 - `assetchan-open` funds an asset channel from that wallet: the asset to the
   channel's 2-of-2 at output n, an L-BTC fee reserve to it at output n+1;
 - the `openchannel` hook polices incoming offers (allowed assets, fee reserve)
@@ -24,7 +26,11 @@ from pyln.client import Plugin, RpcError, RpcException
 import hashlib
 import json
 
-plugin = Plugin()
+# Asset channels' feature bit (common/features.h OPT_CHANNEL_ASSET, odd:
+# optional).  Plugins can only set feature bits at startup.
+CHANNEL_ASSET_FEATURE = 1 << 233
+plugin = Plugin(dynamic=False, init_features=CHANNEL_ASSET_FEATURE,
+                node_features=CHANNEL_ASSET_FEATURE)
 plugin.elements = None       # ElementsRpc, built on first use
 plugin.lbtc = None           # L-BTC's asset id
 plugin.invoice_assets = {}   # payment_hash -> asset of that invoice of ours
@@ -231,8 +237,16 @@ def load_invoice_assets(plugin):
 
 
 def allowed_assets(plugin):
-    """The assets core takes channels in (--channel-asset)."""
-    return plugin.rpc.listconfigs()['configs'].get('channel-asset', {}).get('values_str', [])
+    """The assets we open and accept channels in (assetchan-asset)."""
+    return plugin.get_option('assetchan-asset') or []
+
+
+def channel_asset(plugin, scid):
+    """The asset of our channel with this scid (or local alias)."""
+    for c in our_channels(plugin):
+        if scid in (c.get('short_channel_id'), c.get('alias', {}).get('local')):
+            return c.get('asset', LBTC)
+    return LBTC
 
 
 # ------------------------------------------------------------------ methods
@@ -484,12 +498,12 @@ def on_openchannel(plugin, openchannel, **kwargs):
 
 @plugin.hook('htlc_accepted')
 def on_htlc_accepted(plugin, htlc, onion, **kwargs):
-    """Final hop: the HTLC must arrive in the invoice's asset (core says
-    which asset channel it came by; an ordinary one, none)."""
+    """Final hop: the HTLC must arrive in the invoice's asset, that is by a
+    channel in that asset."""
     if 'short_channel_id' in onion or 'next_node_id' in onion:
         return {'result': 'continue'}  # a forward: core keeps the asset
     want = plugin.invoice_assets.get(htlc['payment_hash'], LBTC)
-    got = htlc.get('asset', LBTC)
+    got = channel_asset(plugin, htlc['short_channel_id'])
     if got == want:
         return {'result': 'continue'}
     plugin.log('HTLC for {} arrived in {} but the invoice is in {}: failing it'
@@ -516,6 +530,15 @@ def on_invoice_payment(plugin, invoice_payment, **kwargs):
 
 @plugin.init()
 def init(options, configuration, plugin, **kwargs):
+    if not configuration['network'].startswith('liquid'):
+        return {'disable': 'asset channels only exist on Liquid'}
+    if not allowed_assets(plugin):
+        return {'disable': 'no assetchan-asset configured'}
+    try:
+        for a in allowed_assets(plugin):
+            check_asset(a)
+    except RpcException as e:
+        return {'disable': 'assetchan-asset: {}'.format(e)}
     if options['assetchan-close-to'] not in ('elements', 'none'):
         return {'disable': "assetchan-close-to must be 'elements' or 'none'"}
     load_invoice_assets(plugin)
@@ -524,6 +547,9 @@ def init(options, configuration, plugin, **kwargs):
         options['assetchan-default-fee-reserve'], options['assetchan-close-to']))
 
 
+plugin.add_option('assetchan-asset', None,
+                  'Liquid asset id we open and accept asset channels in',
+                  multi=True)
 plugin.add_option('assetchan-min-fee-reserve', 1000,
                   'Smallest L-BTC fee reserve (sat) we accept an asset channel with',
                   opt_type='int')

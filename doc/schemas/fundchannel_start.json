@@ -79,7 +79,7 @@
         "type": "hex",
         "added": "v26.09",
         "description": [
-          "Liquid only: open an asset channel whose balance is in this issued asset (the asset id as printed by elements-cli), which must be one of our `channel-asset`s. The funding transaction must pay `amount` of the asset to the channel at output n and `fee_reserve` of L-BTC to the channel at output n+1, both unblinded. Asset channels are private (`announce` must be false) and use anchors."
+          "Liquid only: open an asset channel whose balance is in this issued asset (the asset id as printed by elements-cli), which a plugin must offer asset channels in (contrib/assetchan). The funding transaction must pay `amount` of the asset to the channel at output n and `fee_reserve` of L-BTC to the channel at output n+1, both unblinded. Asset channels use anchors."
         ]
       },
       "fee_reserve": {

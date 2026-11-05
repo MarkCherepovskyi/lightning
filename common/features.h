@@ -160,7 +160,7 @@ struct feature_set *feature_set_dup(const tal_t *ctx,
 
 /* Asset channels (common/channel_asset.h): on a multi-asset chain a
  * channel's balance can be in an issued asset.  A custom bit, advertised
- * only when --channel-asset is configured. */
+ * only by a plugin that offers asset channels (contrib/assetchan). */
 #define OPT_CHANNEL_ASSET			232
 
 #endif /* LIGHTNING_COMMON_FEATURES_H */

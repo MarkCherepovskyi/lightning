@@ -140,7 +140,7 @@ class Poller:
         ids = {s['info']['id']: n for n, s in snaps.items() if s}
         assets = {}
         for s in snaps.values():
-            for a in config_value((s or {}).get('config', {}), 'channel-asset', []):
+            for a in config_value((s or {}).get('config', {}), 'assetchan-asset', []):
                 assets.setdefault(a, asset_label(a))
 
         nodes = []

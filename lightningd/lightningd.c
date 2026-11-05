@@ -357,7 +357,6 @@ static struct lightningd *new_lightningd(const tal_t *ctx)
 	 * we allow overriding them with --force-feerates, in which
 	 * case this is a pointer to an enum feerate-indexed array of values */
 	ld->force_feerates = NULL;
-	ld->channel_assets = tal_arr(ld, u8 *, 0);
 
 	/*~ We need some funds to help CPFP spend unilateral closes.  How
 	 * much?  But let's assume we want to boost the commitment tx (1112
@@ -1271,6 +1270,16 @@ int main(int argc, char *argv[])
 	trace_span_start("plugins/init", ld->plugins);
 	plugins_init(ld->plugins);
 	trace_span_end(ld->plugins);
+
+	/*~ Asset channels (common/channel_asset.h) are offered by a plugin,
+	 * through its feature bit.  They are built on anchors, which are
+	 * otherwise off on Elements. */
+	if (chainparams->is_elements
+	    && feature_offered(ld->our_features->bits[INIT_FEATURE],
+			       OPT_CHANNEL_ASSET))
+		feature_set_or(ld->our_features,
+			       take(feature_set_for_feature(NULL,
+					OPTIONAL_FEATURE(OPT_ANCHORS_ZERO_FEE_HTLC_TX))));
 
 	/*~ If the plugis are misconfigured we don't want to proceed. A
 	 * misconfiguration could for example be a plugin marked as important

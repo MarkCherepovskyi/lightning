@@ -30,9 +30,9 @@ This file is the spec the POC follows. Step 0 commits it verbatim as
    chain-backend plugin interface (bcli's five methods). CLN's channel code is
    Bitcoin-transaction-shaped and stays so; non-UTXO chains satisfy §2 with a contract
    that emulates a UTXO set.
-5. **Safe without the plugin.** A node that has not configured any asset never
-   negotiates asset channels (feature bit advertised only when `--channel-asset` is set);
-   cross-asset forwarding is refused in core.
+5. **Safe without the plugin.** Core only negotiates asset channels when a plugin
+   offers their feature bit, and the plugin decides which assets; a node without it
+   never takes one. Cross-asset forwarding is refused in core.
 
 ## 2. Chain primitives (what a chain must provide)
 
@@ -87,7 +87,8 @@ Explicit (unblinded) outputs only.
 
 - **Negotiation**: feature `option_channel_asset` (odd bit in the custom range: 233 in
   the POC, `OPT_CHANNEL_ASSET` = 232, provisional until upstream assigns one), advertised
-  only when `--channel-asset` is configured. `open_channel` TLVs
+  by the plugin (plugins can set feature bits at startup); on Elements it also turns
+  anchors back on. `open_channel` TLVs
   `channel_asset` (4243, 33-byte explicit asset tag) and `fee_reserve` (4245, sats);
   `accept_channel` echoes `channel_asset` or the open fails. Channel type must be
   `anchors_zero_fee_htlc_tx`. v2 (dual-fund) and splicing: refused for asset channels.
@@ -131,7 +132,7 @@ Explicit (unblinded) outputs only.
 
 | # | Change | Files | ≈ lines | Why not plugin |
 |---|---|---|---|---|
-| C1 | Channel asset identity: `--channel-asset` (multi) + feature bit; TLVs; `channel->asset`, `fee_reserve`; DB columns; `channeld/closingd/onchaind` init fields; `fundchannel_start asset= fee_reserve=`; `listpeerchannels.asset`, `fee_reserve_msat`; `openchannel` hook payload fields; `common/channel_asset.[ch]` (from `common/liquid_asset.c`) | `wire/peer_wire.csv`, `common/features.[ch]`, `openingd/*`, `lightningd/{options,channel,opening_control,peer_control,channel_control,closing_control}.c`, `wallet/{wallet,migrations}.c`, `*_wire.csv`, `doc/schemas` | 450 | daemons must know the asset |
+| C1 | Channel asset identity: feature bit (set by the plugin); TLVs; `channel->asset`, `fee_reserve`; DB columns; `channeld/closingd/onchaind` init fields; `fundchannel_start asset= fee_reserve=`; `listpeerchannels.asset`, `fee_reserve_msat`; `openchannel` hook payload fields; `common/channel_asset.[ch]` (from `common/liquid_asset.c`) | `wire/peer_wire.csv`, `common/features.[ch]`, `openingd/*`, `lightningd/{options,channel,opening_control,peer_control,channel_control,closing_control}.c`, `wallet/{wallet,migrations}.c`, `*_wire.csv`, `doc/schemas` | 450 | daemons must know the asset |
 | C2 | Asset tags on channel tx outputs; fee computation counts only the fee asset; tx parser reads asset amounts instead of asserting L-BTC | `bitcoin/{tx,psbt,tx_parts}.c`, `common/{initial_commit_tx,htlc_tx,close_tx}.c`, `channeld/commit_tx.c` | 150 | tx builders live in daemons |
 | C3 | Reserve input + second signature + `hsmd` signing both inputs; `sign_last_tx` | `openingd`, `channeld`, `closingd`, `hsmd/{hsmd,libhsmd}.c`, `hsmd_wire.csv`, `lightningd/peer_control.c` | 400 | protocol + signer |
 | C4 | Allow anchors on Elements for asset channels (`lightningd/options.c:1854`); skip fee subtraction; fee output = reserve − anchors; ignore `update_fee` | `lightningd/options.c`, `channeld/{commit_tx,channeld}.c` | 40 | |
@@ -163,7 +164,7 @@ build context and in `run-tests.sh`.
   wallet `assetchan-elements-wallet`.
 - **Options**: `assetchan-min-fee-reserve` (1000), `assetchan-max-fee-reserve` (10000),
   `assetchan-default-fee-reserve` (2000), `assetchan-close-to` (`elements`|`none`).
-  Allowed assets come from core's `--channel-asset` via `listconfigs`.
+  `assetchan-asset` (multi): the assets we open and accept channels in.
 - **RPCs**:
   - `assetchan-open id amount asset [fee_reserve] [announce=false] [close_to]`:
     `fundchannel_start(asset=, fee_reserve=, close_to=<elementsd unconfidential addr>)`
@@ -212,7 +213,7 @@ Branch: `git checkout -b asset-channels master`. Commits:
 0. `contrib/assetchan/DESIGN.md` = this spec.
 1. **C1 + C2** ported from `liquid-merged`: `common/liquid_asset.c` → `common/channel_asset.c`
    (generic names), `bitcoin/tx.c`/`psbt.c`/`tx_parts.c` helpers, openingd TLVs, channel
-   struct/DB/init messages, `listpeerchannels` fields, hook payload, `--channel-asset`.
+   struct/DB/init messages, `listpeerchannels` fields, hook payload, feature bit.
 2. **C3 + C4**: reserve input, `fee_reserve_sig`, hsmd two-input signing, anchors on
    Elements, fixed fee output. Build: `make`, `make check-units`.
 3. **C6 + C7**.

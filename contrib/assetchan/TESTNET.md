@@ -13,7 +13,7 @@ https://blockstream.info/liquidtestnet/tx/TXID
   `nodes.sh`).
 - Two lightningd nodes, A and B, started with `contrib/assetchan/nodes.sh
   start A|B`: this tree's build, `--network=liquid-testnet`, the plugin,
-  `--channel-asset` = our asset, `--watchtime-blocks=6`,
+  `--assetchan-asset` = our asset, `--watchtime-blocks=6`,
   `--funding-confirms=2`, `--developer`; they talk over localhost. bcli runs
   `elements-cli` through a wrapper (`docker exec`), since there is none on the
   host.

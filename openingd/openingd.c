@@ -974,7 +974,7 @@ static u8 *fundee_channel(struct state *state, const u8 *open_channel_msg)
 				     OPT_CHANNEL_ASSET)) {
 			negotiation_failed(state,
 					   "Asset channels not enabled"
-					   " (channel-asset)");
+					   " (no plugin offers them)");
 			return NULL;
 		}
 		if (!chainparams->is_elements

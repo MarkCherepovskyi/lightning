@@ -54,15 +54,6 @@ static void test_eq(void)
 	assert(!channel_asset_eq(x, z));
 	assert(channel_asset_tag(NULL) == NULL);
 	assert(channel_asset_tag(x) == x->tag);
-
-	u8 **list = tal_arr(tmpctx, u8 *, 1);
-	list[0] = c;
-	assert(!channel_asset_in(a, list));
-	assert(channel_asset_in(c, list));
-	assert(!channel_asset_in(NULL, list));
-	tal_arr_expand(&list, a);
-	assert(channel_asset_in(a, list));
-	assert(!channel_asset_in(a, NULL));
 }
 
 static void test_wire(void)

@@ -65,7 +65,7 @@ def node_opts(bitcoind, asset):
     # is a proxy: point the plugin straight at elementsd.
     elements_rpc = 'http://{rpcuser}:{rpcpassword}@127.0.0.1:{port}'.format(
         port=bitcoind.rpcport, **BITCOIND_CONFIG)
-    return {'plugin': PLUGIN, 'channel-asset': asset, 'assetchan-elements-rpc': elements_rpc,
+    return {'plugin': PLUGIN, 'assetchan-asset': asset, 'assetchan-elements-rpc': elements_rpc,
             # Whole-unit routing fees keep channel balances in whole units
             # (regtest's defaults are 1 msat + 10 ppm).
             'fee-base': 1000, 'fee-per-satoshi': 0}

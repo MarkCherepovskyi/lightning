@@ -88,7 +88,7 @@ start)
 		--bitcoin-rpcpassword="${userpass#*:}" \
 		--bitcoin-cli="$dir/elements-cli" \
 		--plugin="$here/assetchan.py" \
-		--channel-asset="$CHANNEL_ASSET" \
+		--assetchan-asset="$CHANNEL_ASSET" \
 		--assetchan-elements-rpc="$rpc" \
 		--assetchan-elements-wallet="$wallet" \
 		--watchtime-blocks=6 \
