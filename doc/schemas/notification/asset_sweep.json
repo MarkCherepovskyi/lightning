@@ -1,0 +1,62 @@
+{
+  "$schema": "../../rpc-schema-draft.json",
+  "type": "object",
+  "additionalProperties": false,
+  "notification": "asset_sweep",
+  "title": "Notification of a spend of an asset output for a plugin to fund",
+  "description": [
+    "Liquid only. The **asset_sweep** notification is sent after a unilateral close of an asset channel, for every output of ours in the channel's asset that onchaind wants to spend: to_local after its delay, to_remote, HTLC outputs, penalties, and our own HTLC transactions.",
+    "",
+    "An asset cannot pay a transaction fee, so the transaction pays none: it spends the asset output as input 0 and pays all of it out at output 0 (to our close script, or the HTLC transaction's output), and that input is signed SIGHASH_SINGLE|SIGHASH_ANYONECANPAY. lightningd does not broadcast it. The asset channel plugin (contrib/assetchan) adds L-BTC inputs and outputs that pay the fee, broadcasts it, and raises the fee until the asset output is spent on chain."
+  ],
+  "added": "v26.09",
+  "request": {},
+  "response": {
+    "required": [
+      "channel_id",
+      "peer_id",
+      "asset",
+      "tx",
+      "minblock",
+      "deadline"
+    ],
+    "properties": {
+      "channel_id": {
+        "type": "hash",
+        "description": [
+          "The asset channel."
+        ]
+      },
+      "peer_id": {
+        "type": "pubkey",
+        "description": [
+          "The peer of that channel."
+        ]
+      },
+      "asset": {
+        "type": "hex",
+        "description": [
+          "The channel's asset (the asset id as printed by elements-cli)."
+        ]
+      },
+      "tx": {
+        "type": "hex",
+        "description": [
+          "The spend, with input 0 signed and paying no fee."
+        ]
+      },
+      "minblock": {
+        "type": "u32",
+        "description": [
+          "The first block it can be mined in (its timelocks)."
+        ]
+      },
+      "deadline": {
+        "type": "u32",
+        "description": [
+          "The block it should be mined by."
+        ]
+      }
+    }
+  }
+}

@@ -1,6 +1,8 @@
 #include "config.h"
 #include <bitcoin/preimage.h>
 #include <ccan/cast/cast.h>
+#include <common/channel_asset.h>
+#include <common/json_stream.h>
 #include <lightningd/channel.h>
 #include <lightningd/coin_mvts.h>
 #include <lightningd/notification.h>
@@ -257,6 +259,37 @@ void notify_invoice_creation(struct lightningd *ld,
 }
 
 /* FIXME: Use outpoint here! */
+static void asset_sweep_notification_serialize(struct json_stream *stream,
+					       const struct channel *channel,
+					       const struct bitcoin_tx *tx,
+					       u32 minblock,
+					       u32 deadline)
+{
+	json_add_channel_id(stream, "channel_id", &channel->cid);
+	json_add_node_id(stream, "peer_id", &channel->peer->id);
+	json_add_string(stream, "asset",
+			fmt_channel_asset(tmpctx, channel->asset->tag));
+	json_add_tx(stream, "tx", tx);
+	json_add_u32(stream, "minblock", minblock);
+	json_add_u32(stream, "deadline", deadline);
+}
+
+REGISTER_NOTIFICATION(asset_sweep)
+
+void notify_asset_sweep(struct lightningd *ld,
+			const struct channel *channel,
+			const struct bitcoin_tx *tx,
+			u32 minblock,
+			u32 deadline)
+{
+	struct jsonrpc_notification *n = notify_start(ld, "asset_sweep");
+	if (!n)
+		return;
+	asset_sweep_notification_serialize(n->stream, channel, tx, minblock,
+					   deadline);
+	notify_send(ld, n);
+}
+
 static void channel_opened_notification_serialize(struct json_stream *stream,
 						  struct lightningd *ld,
 						  const struct node_id *node_id,

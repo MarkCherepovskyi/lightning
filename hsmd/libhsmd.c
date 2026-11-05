@@ -672,6 +672,12 @@ static u8 *handle_sign_to_us_tx(struct hsmd_client *c, const u8 *msg_in,
 		return hsmd_status_bad_request(c, msg_in,
 					       "bad pubkey_from_privkey");
 
+	/* Asset channels (common/channel_asset.h): an output in an asset
+	 * can't pay the fee, so we sign it with just its output, and whoever
+	 * broadcasts adds the L-BTC that does. */
+	if (!psbt_input_in_fee_asset(tx->psbt, input_num))
+		sighash_type = SIGHASH_SINGLE | SIGHASH_ANYONECANPAY;
+
 	sign_tx_input(tx, input_num, NULL, wscript, privkey, &pubkey,
 		      sighash_type, &sig);
 	check_overgrind(&sig);
