@@ -556,7 +556,7 @@ void drop_to_chain(struct lightningd *ld, struct channel *channel,
 			watch_scriptpubkey(inflight, ld->topology,
 					   take(scriptpubkey_p2wsh(NULL, funding_wscript)),
 					   &inflight->funding->outpoint,
-					   inflight->funding->total_funds,
+					   inflight->funding->total_funds, NULL,
 					   closed_inflight_splice_found,
 					   inflight);
 		}
@@ -2866,13 +2866,13 @@ void channel_watch_funding(struct lightningd *ld, struct channel *channel)
 								&channel->local_funding_pubkey,
 								&channel->channel_info.remote_fundingkey);
 
-		watch_scriptpubkey_asset(channel, ld->topology,
-					 take(scriptpubkey_p2wsh(NULL, funding_wscript)),
-					 &channel->funding,
-					 channel->funding_sats,
-					 channel_asset_tag(channel->asset),
-					 channel_funding_found,
-					 channel);
+		watch_scriptpubkey(channel, ld->topology,
+				   take(scriptpubkey_p2wsh(NULL, funding_wscript)),
+				   &channel->funding,
+				   channel->funding_sats,
+				   channel_asset_tag(channel->asset),
+				   channel_funding_found,
+				   channel);
 	}
 
 	/* We watch for closing of course. */

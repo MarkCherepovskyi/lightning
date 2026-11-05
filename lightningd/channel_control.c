@@ -772,7 +772,7 @@ void watch_splice_inflight(struct lightningd *ld,
 	watch_scriptpubkey(inflight, ld->topology,
 			   take(scriptpubkey_p2wsh(NULL, funding_wscript)),
 			   &inflight->funding->outpoint,
-			   inflight->funding->total_funds,
+			   inflight->funding->total_funds, NULL,
 			   splice_found,
 			   inflight);
 }

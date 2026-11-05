@@ -4,6 +4,7 @@
 #include <bitcoin/pubkey.h>
 #include <bitcoin/signature.h>
 #include <bitcoin/tx.h>
+#include <ccan/mem/mem.h>
 
 /* Asset channels: channels whose balance is in an issued asset of a
  * multi-asset chain (Liquid), rather than the chain's own coin.
@@ -46,6 +47,17 @@ static inline const u8 *channel_asset_tag(const struct channel_asset *asset)
 /* Same asset (NULL meaning the chain's own coin)? */
 bool channel_asset_eq(const struct channel_asset *a,
 		      const struct channel_asset *b);
+
+/* Tags are fixed-size byte arrays. */
+static inline u8 *channel_asset_tag_dup(const tal_t *ctx, const u8 *tag)
+{
+	return tal_dup_arr(ctx, u8, tag, ELEMENTS_ASSET_LEN, 0);
+}
+
+static inline bool channel_asset_tag_eq(const u8 *a, const u8 *b)
+{
+	return memeq(a, ELEMENTS_ASSET_LEN, b, ELEMENTS_ASSET_LEN);
+}
 
 /* For wire messages (`?channel_asset` fields). */
 void towire_channel_asset(u8 **pptr, const struct channel_asset *asset);

@@ -1082,6 +1082,7 @@ static struct command_result *json_fundchannel_complete(struct command *cmd,
 	struct peer *peer;
 	struct wally_psbt *funding_psbt;
 	u32 *funding_txout_num = NULL;
+	bool reserve_found = false;
 	struct funding_channel *fc;
 	bool *withhold;
 
@@ -1118,43 +1119,37 @@ static struct command_result *json_fundchannel_complete(struct command *cmd,
 		return command_fail(cmd, LIGHTNINGD, "Could not set PSBT version.");
 	}
 
-	/* Figure out the correct output, and perform sanity checks. */
+	/* Figure out the correct output, and perform sanity checks.  An
+	 * asset channel (common/channel_asset.h) has two to the 2-of-2: the
+	 * funding output n, and the L-BTC fee reserve at n+1. */
 	for (size_t i = 0; i < funding_psbt->num_outputs; i++) {
-		if (memeq(funding_psbt->outputs[i].script,
-			  funding_psbt->outputs[i].script_len,
-			  fc->funding_scriptpubkey,
-			  tal_bytelen(fc->funding_scriptpubkey))) {
-			/* asset channels pay the L-BTC fee
-			 * reserve to the same 2-of-2, right after the
-			 * funding output. */
-			if (funding_txout_num
-			    && fc->asset
-			    && i == *funding_txout_num + 1)
-				continue;
-			if (funding_txout_num)
-				return command_fail(cmd, FUNDING_PSBT_INVALID,
-						    "Two outputs to open channel");
+		if (!memeq(funding_psbt->outputs[i].script,
+			   funding_psbt->outputs[i].script_len,
+			   fc->funding_scriptpubkey,
+			   tal_bytelen(fc->funding_scriptpubkey)))
+			continue;
+		if (!funding_txout_num) {
 			funding_txout_num = tal(cmd, u32);
 			*funding_txout_num = i;
-		}
+		} else if (fc->asset && i == *funding_txout_num + 1)
+			reserve_found = true;
+		else
+			return command_fail(cmd, FUNDING_PSBT_INVALID,
+					    "Two outputs to open channel");
 	}
 	if (!funding_txout_num)
 		return command_fail(cmd, FUNDING_PSBT_INVALID,
 				    "No output to open channel");
 
-	/* Asset channels (common/channel_asset.h): output n must pay exactly
-	 * the asset amount, and n+1 exactly the fee reserve in the fee asset,
-	 * both explicitly (elementsd doesn't blind outputs to unconfidential
-	 * addresses, which is what fundchannel_start gave out). */
+	/* Asset channels: output n must pay exactly the asset amount, and
+	 * n+1 exactly the fee reserve in the fee asset, both explicitly
+	 * (elementsd doesn't blind outputs to unconfidential addresses,
+	 * which is what fundchannel_start gave out). */
 	if (fc->asset) {
 		size_t reserve = *funding_txout_num + 1;
 		struct amount_asset amt;
 
-		if (reserve >= funding_psbt->num_outputs
-		    || !memeq(funding_psbt->outputs[reserve].script,
-			      funding_psbt->outputs[reserve].script_len,
-			      fc->funding_scriptpubkey,
-			      tal_bytelen(fc->funding_scriptpubkey)))
+		if (!reserve_found)
 			return command_fail(cmd, FUNDING_PSBT_INVALID,
 					    "asset channel: output %zu"
 					    " must pay the fee reserve"
@@ -1162,8 +1157,7 @@ static struct command_result *json_fundchannel_complete(struct command *cmd,
 		amt = wally_psbt_output_get_amount(&funding_psbt->outputs
 						   [*funding_txout_num]);
 		if (amt.value == 0
-		    || !memeq(amt.asset, sizeof(amt.asset),
-			      fc->asset->tag, sizeof(fc->asset->tag))
+		    || !channel_asset_tag_eq(amt.asset, fc->asset->tag)
 		    || !amount_sat_eq(amount_sat(amt.value), fc->funding_sats))
 			return command_fail(cmd, FUNDING_PSBT_INVALID,
 					    "asset channel: output %u must pay"

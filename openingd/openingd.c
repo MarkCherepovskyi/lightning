@@ -372,8 +372,7 @@ static u8 *funder_channel_start(struct state *state, u8 channel_flags,
 	 * we'll put in. */
 	if (state->asset) {
 		open_tlvs->channel_asset
-			= tal_dup_arr(open_tlvs, u8, state->asset->tag,
-				      ELEMENTS_ASSET_LEN, 0);
+			= channel_asset_tag_dup(open_tlvs, state->asset->tag);
 		open_tlvs->fee_reserve = tal_dup(open_tlvs, struct amount_sat,
 						 &state->asset->fee_reserve);
 	}
@@ -459,9 +458,9 @@ static u8 *funder_channel_start(struct state *state, u8 channel_flags,
 	 * so they must echo the asset back. */
 	if ((state->asset == NULL) != (accept_tlvs->channel_asset == NULL)
 	    || (state->asset
-		&& !memeq(state->asset->tag, ELEMENTS_ASSET_LEN,
-			  accept_tlvs->channel_asset,
-			  tal_bytelen(accept_tlvs->channel_asset)))) {
+		&& (tal_bytelen(accept_tlvs->channel_asset) != ELEMENTS_ASSET_LEN
+		    || !channel_asset_tag_eq(state->asset->tag,
+					     accept_tlvs->channel_asset)))) {
 		negotiation_failed(state,
 				   "Peer did not accept asset channel"
 				   " (asset %s)",
@@ -1207,8 +1206,7 @@ static u8 *fundee_channel(struct state *state, const u8 *open_channel_msg)
 	/* confirm we'll run it as an asset channel. */
 	if (state->asset)
 		accept_tlvs->channel_asset
-			= tal_dup_arr(accept_tlvs, u8, state->asset->tag,
-				      ELEMENTS_ASSET_LEN, 0);
+			= channel_asset_tag_dup(accept_tlvs, state->asset->tag);
 
 	msg = towire_accept_channel(NULL, &state->channel_id,
 				    state->localconf.dust_limit,

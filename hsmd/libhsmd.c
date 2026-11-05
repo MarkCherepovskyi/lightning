@@ -588,17 +588,15 @@ static void sign_our_inputs(struct hsm_utxo **utxos, struct wally_psbt *psbt)
 					= bitcoin_wscript_to_remote_anchored(tmpctx,
 									     &pubkey,
 									     utxo->close_info->csv);
-				/* a asset channel's to_remote
-				 * output is in the asset, not L-BTC. */
+				/* An asset channel's to_remote output is in
+				 * the asset, not L-BTC: keep what the PSBT
+				 * says. */
 				const u8 *asset = NULL;
 				const struct wally_tx_output *wout
 					= psbt->inputs[j].witness_utxo;
-				if (is_elements(chainparams) && wout
-				    && wout->asset_len == ELEMENTS_ASSET_LEN)
-					asset = tal_dup_arr(tmpctx, u8,
-							    wout->asset,
-							    ELEMENTS_ASSET_LEN,
-							    0);
+				if (wout && wout->asset_len == ELEMENTS_ASSET_LEN)
+					asset = channel_asset_tag_dup(tmpctx,
+								      wout->asset);
 				psbt_input_set_witscript(psbt, j, wscript);
 				psbt_input_set_wit_utxo_asset(psbt, j,
 							      scriptpubkey_p2wsh(psbt, wscript),

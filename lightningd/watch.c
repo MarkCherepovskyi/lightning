@@ -31,7 +31,6 @@
  */
 #include "config.h"
 #include <bitcoin/psbt.h>
-#include <ccan/mem/mem.h>
 #include <ccan/tal/str/str.h>
 #include <common/addr.h>
 #include <common/channel_asset.h>
@@ -381,30 +380,13 @@ bool watch_scriptpubkey_(const tal_t *ctx,
 			 const u8 *scriptpubkey TAKES,
 			 const struct bitcoin_outpoint *expected_outpoint,
 			 struct amount_sat expected_amount,
+			 const u8 *expected_asset,
 			 void (*cb)(struct lightningd *ld,
 				    const struct bitcoin_tx *tx,
 				    u32 outnum,
 				    const struct txlocator *loc,
 				    void *),
 			 void *arg)
-{
-	return watch_scriptpubkey_asset_(ctx, topo, scriptpubkey,
-					 expected_outpoint, expected_amount,
-					 NULL, cb, arg);
-}
-
-bool watch_scriptpubkey_asset_(const tal_t *ctx,
-			       struct chain_topology *topo,
-			       const u8 *scriptpubkey TAKES,
-			       const struct bitcoin_outpoint *expected_outpoint,
-			       struct amount_sat expected_amount,
-			       const u8 *expected_asset,
-			       void (*cb)(struct lightningd *ld,
-					  const struct bitcoin_tx *tx,
-					  u32 outnum,
-					  const struct txlocator *loc,
-					  void *),
-			       void *arg)
 {
 	struct scriptpubkeywatch *w;
 
@@ -424,8 +406,7 @@ bool watch_scriptpubkey_asset_(const tal_t *ctx,
 	w->expected_outpoint = *expected_outpoint;
 	w->expected_amount = expected_amount;
 	w->expected_asset = expected_asset
-		? tal_dup_arr(w, u8, expected_asset, ELEMENTS_ASSET_LEN, 0)
-		: NULL;
+		? channel_asset_tag_dup(w, expected_asset) : NULL;
 	w->cb = cb;
 	w->arg = arg;
 	scriptpubkeywatch_hash_add(topo->scriptpubkeywatches, w);
@@ -481,14 +462,17 @@ bool watch_check_tx_outputs(const struct chain_topology *topo,
 				continue;
 			}
 			if (outnum != w->expected_outpoint.n) {
-				bad_outnum = true;
+				/* An asset channel's fee reserve is the next
+				 * output, to the same script: expected. */
+				if (!w->expected_asset
+				    || outnum != w->expected_outpoint.n + 1)
+					bad_outnum = true;
 				continue;
 			}
-			/* asset channel funding is in the
-			 * channel asset, not L-BTC. */
+			/* An asset channel's funding is in the asset. */
 			if (w->expected_asset) {
-				if (!memeq(outasset.asset, sizeof(outasset.asset),
-					   w->expected_asset, sizeof(outasset.asset))) {
+				if (!channel_asset_tag_eq(outasset.asset,
+							  w->expected_asset)) {
 					bad_amount = true;
 					continue;
 				}
