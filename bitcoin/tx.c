@@ -164,13 +164,8 @@ struct amount_sat bitcoin_tx_compute_fee(const struct bitcoin_tx *tx)
 	for (size_t i = 0; i < tx->psbt->num_inputs; i++) {
 		/* Elements: only the fee asset can pay fees (outputs in other
 		 * assets are skipped below too). */
-		if (chainparams->is_elements
-		    && tx->psbt->inputs[i].witness_utxo) {
-			struct amount_asset asset
-				= wally_tx_output_get_amount(tx->psbt->inputs[i].witness_utxo);
-			if (!amount_asset_is_main(&asset))
-				continue;
-		}
+		if (!psbt_input_in_fee_asset(tx->psbt, i))
+			continue;
 		input_amt = psbt_input_get_amount(tx->psbt, i);
 		ok = amount_sat_add(&input_total, input_total, input_amt);
 		assert(ok);

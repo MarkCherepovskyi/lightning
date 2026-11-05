@@ -143,22 +143,6 @@ msgdata,onchaind_spend_to_us,wscript_len,u32,
 msgdata,onchaind_spend_to_us,wscript,u8,wscript_len
 
 # We tell lightningd to create, sign and broadcast this penalty tx: 
-# Asset channel: our to_remote output in their commitment.  CLN's wallet
-# can't hold the asset, so lightningd sweeps it to our close script (an
-# ordinary channel's to_remote goes to the wallet with onchaind_add_utxo).
-msgtype,onchaind_spend_asset_to_remote,5046
-msgdata,onchaind_spend_asset_to_remote,outpoint,bitcoin_outpoint,
-msgdata,onchaind_spend_asset_to_remote,outpoint_amount,amount_sat,
-msgdata,onchaind_spend_asset_to_remote,sequence,u32,
-msgdata,onchaind_spend_asset_to_remote,minblock,u32,
-# NULL if this is an option_static_remotekey commitment
-msgdata,onchaind_spend_asset_to_remote,per_commit_point,?pubkey,
-msgdata,onchaind_spend_asset_to_remote,scriptpubkey_len,u16,
-msgdata,onchaind_spend_asset_to_remote,scriptpubkey,u8,scriptpubkey_len
-# Empty for a P2WPKH to_remote (no anchors)
-msgdata,onchaind_spend_asset_to_remote,wscript_len,u32,
-msgdata,onchaind_spend_asset_to_remote,wscript,u8,wscript_len
-
 msgtype,onchaind_spend_penalty,5041
 msgdata,onchaind_spend_penalty,outpoint,bitcoin_outpoint,
 msgdata,onchaind_spend_penalty,outpoint_amount,amount_sat,

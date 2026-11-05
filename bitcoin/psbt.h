@@ -274,6 +274,10 @@ void psbt_output_set_unknown(const tal_t *ctx,
 struct amount_sat psbt_input_get_amount(const struct wally_psbt *psbt,
 					size_t in);
 
+/* Elements: is this input in the fee asset?  Only those count towards the
+ * fee (an asset channel's sweep spends an asset output and L-BTC). */
+bool psbt_input_in_fee_asset(const struct wally_psbt *psbt, size_t in);
+
 /* psbt_input_get_value - Like psbt_input_get_amount, but on Elements the input
  * may be in any (explicit) asset: this is what signatures commit to. */
 struct amount_sat psbt_input_get_value(const struct wally_psbt *psbt,

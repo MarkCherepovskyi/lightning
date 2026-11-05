@@ -674,10 +674,6 @@ static u8 *handle_sign_to_us_tx(struct hsmd_client *c, const u8 *msg_in,
 		return hsmd_status_bad_request(c, msg_in,
 					       "bad pubkey_from_privkey");
 
-	/* asset channel sweeps also spend L-BTC to pay the fee. */
-	if (tx->wtx->num_inputs != 1 && !is_elements(chainparams))
-		return hsmd_status_bad_request(c, msg_in, "bad txinput count");
-
 	sign_tx_input(tx, input_num, NULL, wscript, privkey, &pubkey,
 		      sighash_type, &sig);
 	check_overgrind(&sig);
@@ -1598,11 +1594,7 @@ static u8 *do_sign_local_htlc_tx(struct hsmd_client *c,
 		return hsmd_status_bad_request_fmt(c, msg_in,
 						   "bad pubkey_from_privkey");
 
-	/* Asset channel HTLC txs (Elements, with anchors) also spend the
-	 * chain's coin from the wallet to pay the fee; our signature is
-	 * SIGHASH_SINGLE|ANYONECANPAY, so those inputs don't matter. */
-	if (tx->wtx->num_inputs != 1
-	    && !(is_elements(chainparams) && option_anchor_outputs))
+	if (tx->wtx->num_inputs != 1)
 		return hsmd_status_bad_request_fmt(c, msg_in,
 						   "bad txinput count");
 

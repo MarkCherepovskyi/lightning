@@ -421,16 +421,6 @@ static void record_coin_movements(struct tracked_output *out,
 						  mk_mvt_tags(MVT_HTLC_FULFILL));
 	}
 
-	/* Asset channel: we sweep our to_remote ourselves (the wallet can't
-	 * hold the asset), so the channel account never gets the deposit
-	 * lightningd's wallet makes for an L-BTC to_remote; without it the
-	 * withdrawal below underflows the account. */
-	if (chan_asset
-	    && out->tx_type == THEIR_UNILATERAL
-	    && out->output_type == OUTPUT_TO_US)
-		record_channel_deposit(out, out->tx_blockheight,
-				       mk_mvt_tags(MVT_CHANNEL_TO_US));
-
 	if (out->tx_type == THEIR_REVOKED_UNILATERAL
 	    || out->resolved->tx_type == OUR_PENALTY_TX)
 		record_channel_deposit(out, out->tx_blockheight, mk_mvt_tags(MVT_PENALTY));
@@ -1761,7 +1751,6 @@ static void wait_for_resolved(struct tracked_output **outs)
 		case WIRE_ONCHAIND_NOTIFY_COIN_MVT:
 		case WIRE_ONCHAIND_NOTIFY_PENALTY_ADJ:
 		case WIRE_ONCHAIND_SPEND_TO_US:
-		case WIRE_ONCHAIND_SPEND_ASSET_TO_REMOTE:
 		case WIRE_ONCHAIND_SPEND_PENALTY:
 		case WIRE_ONCHAIND_SPEND_HTLC_SUCCESS:
 		case WIRE_ONCHAIND_SPEND_HTLC_TIMEOUT:
@@ -2652,47 +2641,6 @@ static void tell_wallet_to_remote(const struct tx_parts *tx,
 						     csv_lock)));
 }
 
-/* Asset channel: our to_remote output is in the asset, which the wallet
- * can't hold, so lightningd sweeps it to our close script instead. */
-static void their_unilateral_asset_local(struct tracked_output ***outs,
-					 const struct bitcoin_outpoint *outpoint,
-					 u32 tx_blockheight,
-					 struct amount_sat amt,
-					 const u8 *local_scriptpubkey,
-					 enum tx_type tx_type,
-					 const struct pubkey *per_commit_point,
-					 u32 csv_lock)
-{
-	struct tracked_output *out;
-	const u8 *wscript, *msg;
-	u32 sequence;
-
-	out = new_tracked_output(outs, outpoint, tx_blockheight, tx_type, amt,
-				 OUTPUT_TO_US, NULL, NULL, NULL);
-
-	/* With anchors, to_remote is a P2WSH with a CSV lock (see
-	 * scriptpubkey_to_remote), otherwise a P2WPKH. */
-	if (option_anchor_outputs || option_anchors_zero_fee_htlc_tx) {
-		wscript = bitcoin_wscript_to_remote_anchored(tmpctx,
-							     &keyset->other_payment_key,
-							     csv_lock);
-		sequence = csv_lock;
-	} else {
-		wscript = tal_arr(tmpctx, u8, 0);
-		sequence = BITCOIN_TX_RBF_SEQUENCE;
-		csv_lock = 1;
-	}
-
-	msg = towire_onchaind_spend_asset_to_remote(NULL, outpoint, amt,
-						    sequence,
-						    rel_blockheight(out, csv_lock),
-						    per_commit_point,
-						    local_scriptpubkey, wscript);
-	propose_resolution_to_master(out, take(msg),
-				     rel_blockheight(out, csv_lock),
-				     OUR_DELAYED_RETURN_TO_WALLET);
-}
-
 static void their_unilateral_local(struct tracked_output ***outs,
 				   const struct tx_parts *tx,
 				   const struct bitcoin_outpoint *outpoint,
@@ -2704,15 +2652,6 @@ static void their_unilateral_local(struct tracked_output ***outs,
 {
 	struct tracked_output *out;
 
-	if (chan_asset) {
-		/* A NULL per_commit_point: the key doesn't need tweaking. */
-		their_unilateral_asset_local(outs, outpoint, tx_blockheight,
-					     amt, local_scriptpubkey, tx_type,
-					     commit_num >= static_remotekey_start[REMOTE]
-					     ? NULL : remote_per_commitment_point,
-					     csv_lock);
-		return;
-	}
 	/* BOLT #5:
 	 *
 	 * - MAY take no action in regard to the associated
@@ -3447,16 +3386,6 @@ static void handle_unknown_commitment(const struct tx_parts *tx,
 
 			outpoint.txid = tx->txid;
 			outpoint.n = i;
-
-			if (chan_asset) {
-				their_unilateral_asset_local(&outs, &outpoint,
-							     tx_blockheight,
-							     amt, local_script,
-							     UNKNOWN_UNILATERAL,
-							     NULL, csv);
-				to_us_output = i;
-				goto found;
-			}
 
 			/* BOLT #5:
 			 *

@@ -539,6 +539,8 @@ void psbt_elements_normalize_fees(struct wally_psbt *psbt)
 	 * including the fees */
 	struct amount_sat total_fee = AMOUNT_SAT(0), val;
 	for (size_t i = 0; i < psbt->num_inputs; i++) {
+		if (!psbt_input_in_fee_asset(psbt, i))
+			continue;
 		val = psbt_input_get_amount(psbt, i);
 		if (!amount_sat_add(&total_fee, total_fee, val))
 			return;
@@ -619,6 +621,16 @@ struct amount_sat psbt_input_get_amount(const struct wally_psbt *psbt,
 		abort();
 
 	return val;
+}
+
+bool psbt_input_in_fee_asset(const struct wally_psbt *psbt, size_t in)
+{
+	struct amount_asset amt;
+
+	if (!is_elements(chainparams) || !psbt->inputs[in].witness_utxo)
+		return true;
+	amt = wally_tx_output_get_amount(psbt->inputs[in].witness_utxo);
+	return amount_asset_is_main(&amt);
 }
 
 struct amount_sat psbt_input_get_value(const struct wally_psbt *psbt,
@@ -1033,6 +1045,8 @@ struct amount_sat psbt_compute_fee(const struct wally_psbt *psbt)
 
 	fee = AMOUNT_SAT(0);
 	for (size_t i = 0; i < psbt->num_inputs; i++) {
+		if (!psbt_input_in_fee_asset(psbt, i))
+			continue;
 		input_amt = psbt_input_get_amount(psbt, i);
 		ok = amount_sat_add(&fee, fee, input_amt);
 		assert(ok);
