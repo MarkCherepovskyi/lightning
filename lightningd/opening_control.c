@@ -907,6 +907,9 @@ static void opening_got_offer(struct subd *openingd,
 		tal_free(openingd);
 		return;
 	}
+	/* The channel keeps the asset (common/channel_asset.h) long after
+	 * the hook payload is gone. */
+	tal_steal(uc, uc->asset);
 
 	/* Don't allow opening if we don't know any fees; even if
 	 * ignore-feerates is set. */
