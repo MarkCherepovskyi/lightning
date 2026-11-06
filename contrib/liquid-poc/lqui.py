@@ -6,8 +6,9 @@
     ./lqui.py --port 8765
 
 Then open http://127.0.0.1:8765.  It is a thin layer over lq.py and lnpoc.py: the page
-shows nodes, peers, balances and channels, and starts the same open, pay, close, send and
-fund commands.  One command runs at a time; its output shows in the Activity panel.
+shows nodes, peers, balances and channels, and starts the same open, pay, invoice,
+payinvoice, close, send and fund commands.  One command runs at a time; its output shows
+in the Activity panel.
 Python 3 standard library only.  It listens on localhost and spends test coins: don't
 expose it.
 """
@@ -35,6 +36,7 @@ import lq  # noqa: E402
 
 HEX64 = re.compile(r'^[0-9a-f]{64}$')
 ADDRESS = re.compile(r'^[A-Za-z0-9]{20,150}$')
+ASSETINVOICE = re.compile(r'^[A-Za-z0-9_-]{20,4000}$')  # base64url, no padding (assetinvoice.rs)
 ns = argparse.Namespace
 
 
@@ -53,6 +55,7 @@ class Poller:
             'funds': lambda: lq.node_funds(node),
             'peers': lambda: L.ln(node, 'listpeers')['peers'],
             'chans': lambda: L.ln(node, 'listpeerchannels')['channels'],
+            'configs': lambda: L.ln(node, 'listconfigs')['configs'],
         }
         futures = {k: self.pool.submit(fn) for k, fn in calls.items()}
         try:
@@ -113,11 +116,24 @@ class Poller:
         order = {'open': 0, 'opening': 1, 'closing': 2, 'closed': 3}
         channels = sorted(chans.values(), key=lambda c: (order[c['state']], c['a'], c['b']))
 
+        # Every swap-provider's configured rate (CROSS_ASSET_SWAP.md): each
+        # `pricetiers-pair=from:to:rate_ppm:fee_base_msat` line, read straight
+        # off the node's own config (pricetiers-plugin's, not
+        # assetswap-plugin's) rather than tracked separately here.
+        swap_pairs = []
+        for name in nodes:
+            pairs = ((snaps[name] or {}).get('configs', {}).get('pricetiers-pair') or {}).get('values_str', [])
+            for p in pairs:
+                parts = p.split(':')
+                if len(parts) == 4:
+                    swap_pairs.append({'provider': name, 'frm': parts[0], 'to': parts[1],
+                                       'rate_ppm': int(parts[2]), 'fee_base_msat': int(parts[3])})
+
         state = {
             'net': info['chain'], 'block': info['blocks'], 'headers': info['headers'],
             'syncing': bool(info.get('initialblockdownload')),
             'default_asset': asset, 'assets': assets, 'elements': wallet.result(),
-            'nodes': node_rows, 'channels': channels,
+            'nodes': node_rows, 'channels': channels, 'swap_pairs': swap_pairs,
         }
         with self.lock:
             self.state = state
@@ -172,7 +188,7 @@ class Jobs:
                 raise Busy()
             self.counter += 1
             self.job = {'id': self.counter, 'title': title, 'status': 'running',
-                        'started': time.time(), 'ended': None, 'log': []}
+                        'started': time.time(), 'ended': None, 'log': [], 'result': None}
             job = self.job
         threading.Thread(target=self.run, args=(job, fn), daemon=True).start()
         return job['id']
@@ -182,7 +198,7 @@ class Jobs:
         status = 'done'
         try:
             with contextlib.redirect_stdout(out):
-                fn()
+                job['result'] = fn()
         except L.Fail as e:
             job['log'].append(f"error: {node_message(str(e))}")
             status = 'error'
@@ -275,6 +291,32 @@ def build_job(body):
         units, (asset, lbtc) = int_arg(body, 'units'), asset_arg(body)
         args = ns(frm=frm, to=to, units=units, lbtc=lbtc, asset=asset)
         return (f"Pay {units:,} {label(asset)} from {frm} to {to}", lambda: lq.cmd_pay(args))
+    if action == 'invoice':
+        node, units, (asset, lbtc) = node_arg(body, 'node'), int_arg(body, 'units'), asset_arg(body)
+        args = ns(node=node, amount_msat=units * 1000, asset=(asset or 'lbtc'), label=None)
+        return (f"Invoice {units:,} {label(asset)} on {node}",
+                lambda: L.cmd_assetinvoice(args)['assetinvoice'])
+    if action == 'payinvoice':
+        node = node_arg(body, 'node')
+        invoice = (body.get('invoice') or '').strip()
+        if not ASSETINVOICE.match(invoice):
+            raise BadRequest("invoice: paste the invoice string from Request invoice")
+        tier = body.get('tier') or 'medium'
+        if tier not in ('low', 'medium', 'high'):
+            raise BadRequest("tier: pick low, medium or high")
+        # from_asset: the asset the user picked on the Pay invoice form
+        # ("Auto" sends ''/nothing). cmd_payassetinvoice resolves the
+        # amount itself -- direct-only if this equals the invoice's own
+        # asset, swap priced in it otherwise, fully automatic if omitted
+        # (see its own doc comment and assetswap-plugin/src/pay.rs's).
+        from_asset = (body.get('from_asset') or '').strip() or None
+        args = ns(node=node, assetinvoice=invoice, tier=tier,
+                  from_asset=from_asset, from_amount_msat=None)
+
+        def do_pay():
+            L.cmd_payassetinvoice(args)
+
+        return (f"Pay invoice from {node} ({tier} tier)", do_pay)
     if action == 'close':
         frm, to = node_arg(body, 'frm'), node_arg(body, 'to')
         asset, lbtc = asset_arg(body)
@@ -308,8 +350,24 @@ def build_job(body):
             raise BadRequest("fund_sat: enter a whole number")
         if not 0 <= fund_sat <= 10**13:
             raise BadRequest("fund_sat: out of range")
+        swap_provider = bool(body.get('swap_provider'))
+        asset = L.load_state().get('asset')
+        if swap_provider and not asset:
+            raise BadRequest("swap_provider: no asset issued yet -- run setup first")
         args = ns(name=name, fund_sat=fund_sat)
-        return (f"Add node {name}", lambda: L.cmd_add_node(args))
+
+        def do_add():
+            L.cmd_add_node(args)
+            if swap_provider:
+                # Same rate bob gets in cmd_setup: 1:1 plus a flat 500 msat
+                # base fee, both directions, so the pair shows a real quote
+                # as soon as this node holds both assets.
+                for frm, to in (('lbtc', asset), (asset, 'lbtc')):
+                    L.cmd_swap_provider(ns(node=name, from_asset=frm, to_asset=to,
+                                           rate_ppm=1_000_000, fee_base_msat=500))
+
+        title = f"Add node {name}" + (" as a swap service" if swap_provider else "")
+        return (title, do_add)
     raise BadRequest("unknown action")
 
 

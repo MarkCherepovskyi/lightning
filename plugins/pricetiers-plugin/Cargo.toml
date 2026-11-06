@@ -1,0 +1,22 @@
+[package]
+name = "cln-pricetiers"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Quotes low/medium/high price-ceiling tiers for configured asset pairs -- a standalone pricing policy for assetswap-plugin"
+homepage = "https://github.com/ElementsProject/lightning/tree/master/plugins"
+repository = "https://github.com/ElementsProject/lightning"
+rust-version.workspace = true
+
+[[bin]]
+name = "pricetiers-plugin"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+log-panics = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+cln-plugin = { workspace = true }
