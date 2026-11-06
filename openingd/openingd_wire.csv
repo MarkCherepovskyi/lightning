@@ -1,6 +1,7 @@
 #include <bitcoin/chainparams.h>
 #include <bitcoin/signature.h>
 #include <common/cryptomsg.h>
+#include <common/channel_asset.h>
 #include <common/channel_config.h>
 #include <common/channel_id.h>
 #include <common/channel_type.h>
@@ -47,6 +48,8 @@ msgdata,openingd_got_offer,channel_flags,u8,
 msgdata,openingd_got_offer,shutdown_len,u16,
 msgdata,openingd_got_offer,shutdown_scriptpubkey,u8,shutdown_len
 msgdata,openingd_got_offer,ctype,channel_type,
+# Asset channel offer (common/channel_asset.h)?
+msgdata,openingd_got_offer,asset,?channel_asset,
 
 # master->openingd: optional rejection message
 msgtype,openingd_got_offer_reply,6105
@@ -92,6 +95,7 @@ msgdata,openingd_funder_start,temporary_channel_id,channel_id,
 msgdata,openingd_funder_start,channel_flags,u8,
 msgdata,openingd_funder_start,reserve,?amount_sat,
 msgdata,openingd_funder_start,channel_type,channel_type,
+msgdata,openingd_funder_start,asset,?channel_asset,
 
 # openingd->master: send back output script for 2-of-2 funding output
 msgtype,openingd_funder_start_reply,6102

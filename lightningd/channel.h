@@ -207,6 +207,11 @@ struct channel {
 	struct bitcoin_outpoint funding;
 	struct amount_sat funding_sats;
 
+	/* Asset channel (common/channel_asset.h)?  Then funding_sats are
+	 * units of its asset, and the opener put its fee reserve of L-BTC
+	 * at funding.n + 1 to pay fees.  NULL for an ordinary channel. */
+	struct channel_asset *asset;
+
 	/* Watch we have on funding output. */
 	struct txowatch *funding_spend_watch;
 

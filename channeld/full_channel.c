@@ -267,7 +267,8 @@ static void add_htlcs(struct bitcoin_tx ***txs,
 					     htlc_feerate_per_kw,
 					     keyset,
 					     option_anchor_outputs,
-					     option_anchors_zero_fee_htlc_tx);
+					     option_anchors_zero_fee_htlc_tx,
+					     channel_asset_tag(channel->asset));
 		} else {
 			ripemd160(&ripemd, htlc->rhash.u.u8, sizeof(htlc->rhash.u.u8));
 			wscript = htlc_received_wscript(tmpctx, &ripemd,
@@ -281,7 +282,8 @@ static void add_htlcs(struct bitcoin_tx ***txs,
 					     htlc_feerate_per_kw,
 					     keyset,
 					     option_anchor_outputs,
-					     option_anchors_zero_fee_htlc_tx);
+					     option_anchors_zero_fee_htlc_tx,
+					     channel_asset_tag(channel->asset));
 		}
 
 		/* Append to array. */
@@ -399,6 +401,7 @@ struct bitcoin_tx **channel_txs(const tal_t *ctx,
 	    commitment_number ^ channel->commitment_number_obscurer,
 	    channel_has(channel, OPT_ANCHOR_OUTPUTS_DEPRECATED),
 	    channel_has(channel, OPT_ANCHORS_ZERO_FEE_HTLC_TX),
+	    channel->asset,
 	    side, other_anchor_outnum);
 
 	/* Set the remote/local pubkeys on the commitment tx psbt */
@@ -506,7 +509,7 @@ static struct amount_sat fee_for_htlcs(const struct channel *channel,
 					option_anchors_zero_fee_htlc_tx,
 					committed, adding, removing);
 
-	return commit_tx_base_fee(feerate, untrimmed,
+	return commit_tx_base_fee(channel->asset, feerate, untrimmed,
 				  option_anchor_outputs,
 				  option_anchors_zero_fee_htlc_tx);
 }
@@ -595,7 +598,8 @@ static bool local_opener_has_fee_headroom(const struct channel *channel,
 
 	/* Now, how much would it cost us if feerate increases 100% and we added
 	 * another HTLC? */
-	fee = commit_tx_base_fee(marginal_feerate(feerate), untrimmed + 1,
+	fee = commit_tx_base_fee(channel->asset, marginal_feerate(feerate),
+				 untrimmed + 1,
 				 option_anchor_outputs,
 				 option_anchors_zero_fee_htlc_tx);
 	if (amount_msat_greater_eq_sat(remainder, fee))
@@ -1369,7 +1373,7 @@ bool can_opener_afford_feerate(const struct channel *channel, u32 feerate_per_kw
 						  option_anchors_zero_fee_htlc_tx,
 						  !channel->opener);
 
-	fee = commit_tx_base_fee(feerate_per_kw, untrimmed,
+	fee = commit_tx_base_fee(channel->asset, feerate_per_kw, untrimmed,
 				 option_anchor_outputs,
 				 option_anchors_zero_fee_htlc_tx);
 

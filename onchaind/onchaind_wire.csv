@@ -1,3 +1,4 @@
+#include <common/channel_asset.h>
 #include <bitcoin/signature.h>
 #include <bitcoin/tx_parts.h>
 #include <common/bip32.h>
@@ -48,6 +49,8 @@ msgdata,onchaind_init,option_anchor_outputs,bool,
 msgdata,onchaind_init,option_anchors_zero_fee_htlc_tx,bool,
 # We need this for BIP125 rule 4
 msgdata,onchaind_init,min_relay_feerate,u32,
+# Asset channel (common/channel_asset.h)?
+msgdata,onchaind_init,asset,?channel_asset,
 
 # This says we're ready; give us htlcs and preimages.
 msgtype,onchaind_init_reply,5101

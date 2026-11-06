@@ -1120,7 +1120,7 @@ void watch_opening_inflight(struct lightningd *ld,
 	watch_scriptpubkey(inflight, ld->topology,
 			   take(scriptpubkey_p2wsh(NULL, funding_wscript)),
 			   &inflight->funding->outpoint,
-			   inflight->funding->total_funds,
+			   inflight->funding->total_funds, NULL,
 			   dual_funding_found,
 			   inflight);
 }

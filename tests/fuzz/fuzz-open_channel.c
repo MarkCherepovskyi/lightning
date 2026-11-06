@@ -79,7 +79,7 @@ static u8 *test_sync_read(const tal_t *ctx, int fd)
 			out.n = 0;
 
 			return towire_funding_created(ctx, &state->channel_id,
-					&out.txid, out.n, &sig.s);
+					&out.txid, out.n, &sig.s, NULL);
 		}
 		else
 			return create_fuzz_msg(ctx);
@@ -109,6 +109,7 @@ static bool test_sync_write(int fd, const void *msg TAKES)
 			u8 channel_flags;
 			u8 *shutdown_scriptpubkey;
 			struct channel_type *ctype;
+			struct channel_asset *asset;
 
 			assert(fromwire_openingd_got_offer(tmpctx, msg,
 						&funding_satoshis,
@@ -122,7 +123,8 @@ static bool test_sync_write(int fd, const void *msg TAKES)
 						&max_accepted_htlcs,
 						&channel_flags,
 						&shutdown_scriptpubkey,
-						&ctype));
+						&ctype,
+						&asset));
 		}
 	}
 	else if (fd == HSM_FD) /* HSMD message */
@@ -176,6 +178,7 @@ static bool test_sync_write(int fd, const void *msg TAKES)
 			u64 commit_num;
 			struct hsm_htlc *htlcs;
 			u32 feerate;
+			struct channel_asset *asset;
 
 			assert(fromwire_hsmd_sign_remote_commitment_tx(tmpctx, msg,
 								&tx,
@@ -184,7 +187,8 @@ static bool test_sync_write(int fd, const void *msg TAKES)
 								&option_static_remotekey,
 								&commit_num,
 								&htlcs,
-								&feerate));
+								&feerate,
+								&asset));
 		}
 		else
 			assert(false && "Too many HSMD writes!");

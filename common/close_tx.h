@@ -4,6 +4,7 @@
 #include <bitcoin/tx.h>
 
 struct ext_key;
+struct channel_asset;
 
 /* Create close tx to spend the anchor tx output; doesn't fill in
  * input scriptsig. */
@@ -18,7 +19,10 @@ struct bitcoin_tx *create_close_tx(const tal_t *ctx,
 				   struct amount_sat funding_sats,
 				   struct amount_sat to_us,
 				   struct amount_sat to_them,
-				   struct amount_sat dust_limit);
+				   struct amount_sat dust_limit,
+				   const struct channel_asset *asset,
+				   bool we_opened);
+
 /* Create simple close tx (option_simple_close) to spend the anchor tx output.
  * The closer pays the fee; closee output is omitted if closee_script is NULL.
  * Closer output is omitted if closer_script is NULL (or OP_RETURN with amount 0).

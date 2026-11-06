@@ -6,6 +6,7 @@
 #include <ccan/tal/str/str.h>
 #include <channeld/channeld_wiregen.h>
 #include <common/addr.h>
+#include <common/channel_asset.h>
 #include <common/channel_id.h>
 #include <common/features.h>
 #include <common/htlc_trim.h>
@@ -251,7 +252,7 @@ static struct bitcoin_tx *sign_last_tx(const tal_t *ctx,
 				       const struct bitcoin_signature *last_sig)
 {
 	struct lightningd *ld = channel->peer->ld;
-	struct bitcoin_signature sig;
+	struct bitcoin_signature sig, *reserve_sig, *their_reserve_sig;
 	const u8 *msg;
 	u8 **witness;
 	u64 commit_index = channel->next_index[LOCAL] - 1;
@@ -264,12 +265,34 @@ static struct bitcoin_tx *sign_last_tx(const tal_t *ctx,
 					     tx,
 					     &channel->channel_info
 					     .remote_fundingkey,
-					     commit_index);
+					     commit_index,
+					     channel->asset);
 
 	msg = hsm_sync_req(tmpctx, ld, take(msg));
-	if (!fromwire_hsmd_sign_commitment_tx_reply(msg, &sig))
+	if (!fromwire_hsmd_sign_commitment_tx_reply(tmpctx, msg, &sig, &reserve_sig))
 		fatal("HSM gave bad sign_commitment_tx_reply %s",
 		      tal_hex(tmpctx, msg));
+
+	/* Asset channel txs also spend the fee reserve (input 1).  hsmd
+	 * signed it for us; the peer's signature is in the PSBT, where
+	 * channeld/closingd put it when it checked it. */
+	if (reserve_sig) {
+		if (!psbt_input_get_ecdsa_sig(tmpctx, tx->psbt, 1,
+					      &channel->channel_info.remote_fundingkey,
+					      &their_reserve_sig)
+		    || !their_reserve_sig)
+			log_broken(channel->log,
+				   "No peer signature for the fee reserve"
+				   " input of %s: it won't be accepted!",
+				   fmt_bitcoin_tx(tmpctx, tx));
+		else
+			bitcoin_tx_input_set_witness(tx, 1,
+				take(bitcoin_witness_2of2(NULL,
+							  their_reserve_sig,
+							  reserve_sig,
+							  &channel->channel_info.remote_fundingkey,
+							  &channel->local_funding_pubkey)));
+	}
 
 	witness =
 	    bitcoin_witness_2of2(tx, last_sig,
@@ -533,7 +556,7 @@ void drop_to_chain(struct lightningd *ld, struct channel *channel,
 			watch_scriptpubkey(inflight, ld->topology,
 					   take(scriptpubkey_p2wsh(NULL, funding_wscript)),
 					   &inflight->funding->outpoint,
-					   inflight->funding->total_funds,
+					   inflight->funding->total_funds, NULL,
 					   closed_inflight_splice_found,
 					   inflight);
 		}
@@ -835,7 +858,8 @@ static struct amount_sat commit_txfee(const struct channel *channel,
 	 *   handle twice the current `feerate_per_kw` to ensure
 	 *   predictability between implementations.
 	 */
-	fee = commit_tx_base_fee(marginal_feerate(feerate), num_untrimmed_htlcs + 1,
+	fee = commit_tx_base_fee(channel->asset, marginal_feerate(feerate),
+				 num_untrimmed_htlcs + 1,
 				 option_anchor_outputs, option_anchors_zero_fee_htlc_tx);
 
 	if (option_anchor_outputs || option_anchors_zero_fee_htlc_tx) {
@@ -1068,6 +1092,12 @@ static void NON_NULL_ARGS(1, 2, 4, 5) json_add_channel(struct command *cmd,
 			fmt_channel_id(tmpctx, &channel->cid));
 	json_add_txid(response, "funding_txid", &channel->funding.txid);
 	json_add_num(response, "funding_outnum", channel->funding.n);
+	if (channel->asset) {
+		json_add_string(response, "asset",
+				fmt_channel_asset(tmpctx, channel->asset->tag));
+		json_add_amount_sat_msat(response, "fee_reserve_msat",
+					 channel->asset->fee_reserve);
+	}
 
 	has_valid_inflights = false;
 	if (!list_empty(&channel->inflights)) {
@@ -2840,6 +2870,7 @@ void channel_watch_funding(struct lightningd *ld, struct channel *channel)
 				   take(scriptpubkey_p2wsh(NULL, funding_wscript)),
 				   &channel->funding,
 				   channel->funding_sats,
+				   channel_asset_tag(channel->asset),
 				   channel_funding_found,
 				   channel);
 	}

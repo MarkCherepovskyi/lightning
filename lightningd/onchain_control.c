@@ -1,8 +1,10 @@
 #include "config.h"
 #include <bitcoin/feerate.h>
 #include <bitcoin/script.h>
+#include <bitcoin/varint.h>
 #include <ccan/cast/cast.h>
 #include <ccan/tal/str/str.h>
+#include <common/channel_asset.h>
 #include <common/htlc_tx.h>
 #include <common/memleak.h>
 #include <common/psbt_keypath.h>
@@ -18,10 +20,12 @@
 #include <lightningd/coin_mvts.h>
 #include <lightningd/hsm_control.h>
 #include <lightningd/onchain_control.h>
+#include <lightningd/notification.h>
 #include <lightningd/peer_htlcs.h>
 #include <lightningd/subd.h>
 #include <onchaind/onchaind_wiregen.h>
 #include <wallet/txfilter.h>
+#include <wallet/wallet.h>
 
 /* If we're restarting, we keep a per-channel copy of watches, and replay */
 struct replay_tx {
@@ -570,6 +574,14 @@ static void handle_irrevocably_resolved(struct channel *channel, const u8 *msg U
 }
 
 
+static void sweep_asset_to_remote(struct channel *channel,
+				  const struct bitcoin_outpoint *outpoint,
+				  struct amount_sat amount,
+				  u32 blockheight,
+				  const u8 *scriptpubkey,
+				  const struct pubkey *commitment_point,
+				  u32 csv_lock);
+
 /**
  * onchain_add_utxo -- onchaind is telling us about an UTXO we own
  */
@@ -594,6 +606,15 @@ static void onchain_add_utxo(struct channel *channel, const u8 *msg)
 	}
 
 	assert(blockheight);
+
+	/* Asset channel: our wallet can't hold the asset, so we sweep it
+	 * to our close script like every other asset output. */
+	if (channel->asset) {
+		sweep_asset_to_remote(channel, &outpoint, amount, blockheight,
+				      scriptPubkey, commitment_point, csv_lock);
+		return;
+	}
+
 	outpointfilter_add(channel->peer->ld->wallet->owned_outpoints,
 			   &outpoint);
 	log_debug(channel->log, "adding utxo to watch %s, csv %u",
@@ -670,6 +691,13 @@ struct onchain_signing_info {
 	/* Tagged union (for sanity checking!) */
 	enum onchaind_wire msgtype;
 	union {
+		/* WIRE_ONCHAIND_ADD_UTXO: an asset channel's to_remote, which
+		 * we sweep ourselves (sign is NULL: hsmd signs it like the
+		 * to_remote UTXOs in our wallet) */
+		struct {
+			struct unilateral_close_info close_info;
+			u8 *scriptpubkey;
+		} to_remote;
 		/* WIRE_ONCHAIND_SPEND_HTLC_TIMEDOUT */
 		struct {
 			u64 commit_num;
@@ -888,6 +916,55 @@ onchain_witness_htlc_tx(const tal_t *ctx, u8 **witness)
 	return cast_const2(const struct onchain_witness_element **, welements);
 }
 
+/* The key our sweeps pay to: BIP86 (P2TR) where we have it, else BIP32. */
+static bool channel_final_key(struct channel *channel,
+			      struct pubkey *final_key,
+			      struct ext_key *final_wallet_ext_key)
+{
+	struct lightningd *ld = channel->peer->ld;
+	const struct ext_key *base = ld->bip86_base ? ld->bip86_base
+		: ld->bip32_base;
+
+	if (ld->bip86_base)
+		bip86_pubkey(ld, final_key, channel->final_key_idx);
+	else
+		bip32_pubkey(ld, final_key, channel->final_key_idx);
+	if (bip32_key_from_parent(base, channel->final_key_idx,
+				  BIP32_FLAG_KEY_PUBLIC,
+				  final_wallet_ext_key) != WALLY_OK) {
+		channel_internal_error(channel,
+				       "Could not derive final_wallet_ext_key %"PRIu64,
+				       channel->final_key_idx);
+		return false;
+	}
+	return true;
+}
+
+/* Asset channels (common/channel_asset.h): the output is in the asset,
+ * which can't pay the fee, and our wallet can't hold it.  So the sweep
+ * pays all of it to our close script (where a mutual close would have paid
+ * it), and hsmd signs it SIGHASH_SINGLE|ANYONECANPAY: the asset channel
+ * plugin adds the L-BTC that pays the fee, broadcasts it and bumps it
+ * (notify_asset_sweep). */
+static struct bitcoin_tx *asset_sweep_unsigned(const tal_t *ctx,
+					       struct channel *channel,
+					       const struct onchain_signing_info *info,
+					       struct amount_sat *fee)
+{
+	struct bitcoin_tx *tx = bitcoin_tx(ctx, chainparams, 1, 1,
+					   info->locktime);
+
+	bitcoin_tx_add_asset_input(tx, &info->out, info->to_self_delay, NULL,
+				   info->out_sats,
+				   info->msgtype == WIRE_ONCHAIND_ADD_UTXO
+				   ? info->u.to_remote.scriptpubkey : NULL,
+				   info->wscript, channel->asset->tag);
+	bitcoin_tx_add_asset_output(tx, channel->shutdown_scriptpubkey[LOCAL],
+				    NULL, info->out_sats, channel->asset->tag);
+	*fee = AMOUNT_SAT(0);
+	return tx;
+}
+
 /* Make normal 1-input-1-output tx to us, but don't sign it yet.
  *
  * If worthwhile is not NULL, we set it to true normally, or false if
@@ -896,7 +973,7 @@ onchain_witness_htlc_tx(const tal_t *ctx, u8 **witness)
 */
 static struct bitcoin_tx *onchaind_tx_unsigned(const tal_t *ctx,
 					       struct channel *channel,
-					       const struct onchain_signing_info *info,
+					       struct onchain_signing_info *info,
 					       struct amount_sat *fee,
 					       bool *worthwhile)
 {
@@ -909,29 +986,13 @@ static struct bitcoin_tx *onchaind_tx_unsigned(const tal_t *ctx,
 	struct lightningd *ld = channel->peer->ld;
 	bool keypath_ok;
 
-	/* Use BIP86 derivation for P2TR if available, otherwise BIP32 */
-	if (ld->bip86_base) {
-		bip86_pubkey(ld, &final_key, channel->final_key_idx);
-		if (bip32_key_from_parent(ld->bip86_base,
-					  channel->final_key_idx,
-					  BIP32_FLAG_KEY_PUBLIC,
-					  &final_wallet_ext_key) != WALLY_OK) {
-			channel_internal_error(channel,
-					       "Could not derive final_wallet_ext_key (bip86) %"PRIu64,
-					       channel->final_key_idx);
-			return NULL;
-		}
-	} else {
-		bip32_pubkey(ld, &final_key, channel->final_key_idx);
-		if (bip32_key_from_parent(ld->bip32_base,
-					  channel->final_key_idx,
-					  BIP32_FLAG_KEY_PUBLIC,
-					  &final_wallet_ext_key) != WALLY_OK) {
-			channel_internal_error(channel,
-					       "Could not derive final_wallet_ext_key %"PRIu64,
-					       channel->final_key_idx);
-			return NULL;
-		}
+	if (!channel_final_key(channel, &final_key, &final_wallet_ext_key))
+		return NULL;
+
+	if (channel->asset) {
+		if (worthwhile)
+			*worthwhile = true;
+		return asset_sweep_unsigned(ctx, channel, info, fee);
 	}
 
 	tx = bitcoin_tx(ctx, chainparams, 1, 1, info->locktime);
@@ -1043,13 +1104,58 @@ static u8 **sign_and_get_witness(const tal_t *ctx,
 					       info->wscript);
 }
 
+/* Asset channels: hsmd signs a to_remote output like the to_remote UTXOs
+ * in our wallet, but SIGHASH_SINGLE|ANYONECANPAY like any asset sweep. */
+static void sign_asset_to_remote(struct channel *channel,
+				 struct bitcoin_tx *tx,
+				 const struct onchain_signing_info *info)
+{
+	struct lightningd *ld = channel->peer->ld;
+	const struct hsm_utxo **hsm_utxos = tal_arr(tmpctx,
+						    const struct hsm_utxo *, 1);
+	struct hsm_utxo *hutxo = tal(hsm_utxos, struct hsm_utxo);
+	const struct wally_tx_witness_stack *stack;
+	struct wally_psbt *psbt;
+	const u8 *msg;
+	u8 **witness;
+
+	hutxo->outpoint = info->out;
+	hutxo->amount = info->out_sats;
+	hutxo->keyindex = 0;
+	hutxo->close_info = cast_const(struct unilateral_close_info *,
+				       &info->u.to_remote.close_info);
+	hutxo->scriptPubkey = info->u.to_remote.scriptpubkey;
+	hsm_utxos[0] = hutxo;
+	wally_psbt_input_set_sighash(&tx->psbt->inputs[0],
+				     SIGHASH_SINGLE | SIGHASH_ANYONECANPAY);
+
+	msg = towire_hsmd_sign_withdrawal(NULL, hsm_utxos, tx->psbt);
+	msg = hsm_sync_req(tmpctx, ld, take(msg));
+	if (!fromwire_hsmd_sign_withdrawal_reply(tmpctx, msg, &psbt))
+		fatal("HSM gave bad sign_withdrawal_reply %s",
+		      tal_hex(tmpctx, msg));
+	if (!psbt_finalize(psbt)
+	    || !(stack = psbt->inputs[0].final_witness)) {
+		log_broken(channel->log, "Asset sweep: could not finalize %s",
+			   fmt_wally_psbt(tmpctx, psbt));
+		return;
+	}
+
+	/* Copy the witness over: the tx stays what we built. */
+	witness = tal_arr(tmpctx, u8 *, stack->num_items);
+	for (size_t j = 0; j < stack->num_items; j++)
+		witness[j] = tal_dup_arr(witness, u8, stack->items[j].witness,
+					 stack->items[j].witness_len, 0);
+	bitcoin_tx_input_set_witness(tx, 0, take(witness));
+}
+
 /* Always sets *welements, returns tx.  Sets *worthwhile to false if
  * it wasn't worthwhile at the given feerate (and it had to drop feerate).
  * Returns NULL iff it called channel_internal_error().
  */
 static struct bitcoin_tx *onchaind_tx(const tal_t *ctx,
 				      struct channel *channel,
-				      const struct onchain_signing_info *info,
+				      struct onchain_signing_info *info,
 				      struct amount_sat *fee,
 				      bool *worthwhile,
 				      const struct onchain_witness_element ***welements)
@@ -1062,9 +1168,15 @@ static struct bitcoin_tx *onchaind_tx(const tal_t *ctx,
 		return NULL;
 
 	/* Now sign, and set witness */
-	witness = sign_and_get_witness(NULL, channel, tx, info);
-	*welements = onchain_witness_sig_and_element(ctx, witness);
-	bitcoin_tx_input_set_witness(tx, 0, take(witness));
+	if (info->sign) {
+		witness = sign_and_get_witness(NULL, channel, tx, info);
+		*welements = onchain_witness_sig_and_element(ctx, witness);
+		bitcoin_tx_input_set_witness(tx, 0, take(witness));
+	} else
+		*welements = NULL;
+
+	if (channel->asset && info->msgtype == WIRE_ONCHAIND_ADD_UTXO)
+		sign_asset_to_remote(channel, tx, info);
 
 	return tx;
 }
@@ -1076,17 +1188,13 @@ static bool consider_onchain_rebroadcast(struct channel *channel,
 	struct bitcoin_tx *newtx;
 	struct amount_sat newfee;
 	struct bitcoin_txid oldtxid, newtxid;
-	u8 **witness;
+	const struct onchain_witness_element **welements;
 
-	newtx = onchaind_tx_unsigned(tmpctx, channel, info, &newfee, NULL);
+	newtx = onchaind_tx(tmpctx, channel, info, &newfee, NULL, &welements);
 	if (!newtx)
 		return true;
 
 	/* FIXME: Don't RBF if fee is not sufficiently increased? */
-
-	/* OK!  RBF time! */
-	witness = sign_and_get_witness(NULL, channel, newtx, info);
-	bitcoin_tx_input_set_witness(newtx, 0, take(witness));
 
 	bitcoin_txid(newtx, &newtxid);
 	bitcoin_txid(*tx, &oldtxid);
@@ -1190,16 +1298,19 @@ static bool consider_onchain_htlc_tx_rebroadcast(struct channel *channel,
 	if (!amount_sat_eq(change, AMOUNT_SAT(0))) {
 		/* Append change output. */
 		struct pubkey final_key;
-		/* Use BIP86 derivation for P2TR if available, otherwise BIP32 */
-		if (ld->bip86_base) {
-			bip86_pubkey(ld, &final_key, channel->final_key_idx);
-		} else {
-			bip32_pubkey(ld, &final_key, channel->final_key_idx);
-		}
+		struct ext_key final_wallet_ext_key;
+
+		if (!channel_final_key(channel, &final_key,
+				       &final_wallet_ext_key))
+			return true;
 		psbt_append_output(psbt,
-				   scriptpubkey_p2tr(tmpctx, &final_key),
+				   chainparams->is_elements
+				   ? scriptpubkey_p2wpkh(tmpctx, &final_key)
+				   : scriptpubkey_p2tr(tmpctx, &final_key),
 				   change);
 	}
+	/* Elements: the fee is an explicit output. */
+	psbt_elements_normalize_fees(psbt);
 
 	/* Sanity check: are we paying more in fees than HTLC is worth? */
 	if (amount_sat_greater(psbt_compute_fee(psbt), info->out_sats)) {
@@ -1321,6 +1432,24 @@ static void create_onchain_tx(struct channel *channel,
 		return;
 	}
 
+	/* Asset channels: the asset channel plugin funds, broadcasts and
+	 * bumps it. */
+	if (channel->asset) {
+		log_debug(channel->log, "Asset sweep for onchaind tx %s",
+			  fmt_bitcoin_tx(tmpctx, tx));
+		notify_asset_sweep(ld, channel, tx, info->minblock,
+				   info->deadline_block);
+		/* onchaind doesn't wait for a to_remote sweep: that output is
+		 * resolved by the commitment tx itself. */
+		if (info->msgtype != WIRE_ONCHAIND_ADD_UTXO)
+			subd_send_msg(channel->owner,
+				      take(towire_onchaind_spend_created(NULL,
+									 worthwhile,
+									 welements)));
+		tal_free(info);
+		return;
+	}
+
 	log_debug(channel->log, "Broadcast for onchaind tx %s%s",
 		  fmt_bitcoin_tx(tmpctx, tx),
 		  worthwhile ? "" : "(NOT WORTHWHILE, LOWBALL FEE!)");
@@ -1336,6 +1465,35 @@ static void create_onchain_tx(struct channel *channel,
 							 worthwhile,
 							 welements)));
 }
+
+static void sweep_asset_to_remote(struct channel *channel,
+				  const struct bitcoin_outpoint *outpoint,
+				  struct amount_sat amount,
+				  u32 blockheight,
+				  const u8 *scriptpubkey,
+				  const struct pubkey *commitment_point,
+				  u32 csv_lock)
+{
+	struct onchain_signing_info *info;
+
+	info = new_signing_info(channel, channel, WIRE_ONCHAIND_ADD_UTXO);
+	info->minblock = blockheight + csv_lock;
+	info->deadline_block = slow_sweep_deadline(channel->peer->ld->topology,
+						   channel);
+	info->wscript = NULL;
+	info->stack_elem = NULL;
+	info->u.to_remote.scriptpubkey = tal_dup_talarr(info, u8, scriptpubkey);
+	info->u.to_remote.close_info.channel_id = channel->dbid;
+	info->u.to_remote.close_info.peer_id = channel->peer->id;
+	info->u.to_remote.close_info.option_anchors = true;
+	info->u.to_remote.close_info.commitment_point
+		= tal_dup_or_null(info, struct pubkey, commitment_point);
+	info->u.to_remote.close_info.csv = csv_lock;
+	/* BOLT #3: spent by an input with `nSequence` set to `1` (the CSV). */
+	create_onchain_tx(channel, outpoint, amount, csv_lock, 0,
+			  NULL, info, __func__);
+}
+
 
 /* BOLT #5:
  *
@@ -1513,7 +1671,8 @@ static void handle_onchaind_spend_htlc_success(struct channel *channel,
 	 * * locktime: `0` for HTLC-success, `cltv_expiry` for HTLC-timeout
 	 */
 	tx = htlc_tx(NULL, chainparams, &out, info->wscript, out_sats, htlc_wscript, fee,
-		     0, option_anchor_outputs, option_anchors_zero_fee_htlc_tx);
+		     0, option_anchor_outputs, option_anchors_zero_fee_htlc_tx,
+		     channel_asset_tag(channel->asset));
 	tal_free(htlc_wscript);
 	if (!tx) {
 		/* Can only happen if fee > out_sats */
@@ -1540,6 +1699,18 @@ static void handle_onchaind_spend_htlc_success(struct channel *channel,
 
 	info->raw_htlc_tx = clone_bitcoin_tx(info, tx);
 	info->out_sats = out_sats;
+
+	/* Asset channels: zero fee, SIGHASH_SINGLE|ANYONECANPAY from both of
+	 * us; the asset channel plugin adds the L-BTC. */
+	if (channel->asset) {
+		notify_asset_sweep(ld, channel, tx, info->minblock,
+				   info->deadline_block);
+		tal_free(tx);
+		subd_send_msg(channel->owner,
+			      take(towire_onchaind_spend_created(NULL, true,
+								 welements)));
+		return;
+	}
 
 	/* Immediately consider RBF. */
 	consider_onchain_htlc_tx_rebroadcast(channel,
@@ -1593,7 +1764,8 @@ static void handle_onchaind_spend_htlc_timeout(struct channel *channel,
 	 * * locktime: `0` for HTLC-success, `cltv_expiry` for HTLC-timeout
 	 */
 	tx = htlc_tx(NULL, chainparams, &out, info->wscript, out_sats, htlc_wscript, fee,
-		     cltv_expiry, option_anchor_outputs, option_anchors_zero_fee_htlc_tx);
+		     cltv_expiry, option_anchor_outputs, option_anchors_zero_fee_htlc_tx,
+		     channel_asset_tag(channel->asset));
 	tal_free(htlc_wscript);
 	if (!tx) {
 		/* Can only happen if fee > out_sats */
@@ -1622,6 +1794,18 @@ static void handle_onchaind_spend_htlc_timeout(struct channel *channel,
 
 	info->raw_htlc_tx = clone_bitcoin_tx(info, tx);
 	info->out_sats = out_sats;
+
+	/* Asset channels: zero fee, SIGHASH_SINGLE|ANYONECANPAY from both of
+	 * us; the asset channel plugin adds the L-BTC. */
+	if (channel->asset) {
+		notify_asset_sweep(ld, channel, tx, info->minblock,
+				   info->deadline_block);
+		tal_free(tx);
+		subd_send_msg(channel->owner,
+			      take(towire_onchaind_spend_created(NULL, true,
+								 welements)));
+		return;
+	}
 
 	/* Immediately consider RBF. */
 	consider_onchain_htlc_tx_rebroadcast(channel,
@@ -1919,7 +2103,8 @@ enum watch_result onchaind_funding_spent(struct channel *channel,
 				  channel->static_remotekey_start[REMOTE],
 				   channel_has(channel, OPT_ANCHOR_OUTPUTS_DEPRECATED),
 				   channel_has(channel, OPT_ANCHORS_ZERO_FEE_HTLC_TX),
-				  feerate_min(ld, NULL));
+				  feerate_min(ld, NULL),
+				  channel->asset);
 	subd_send_msg(channel->owner, take(msg));
 
 	/* If we're replaying, we just watch this */

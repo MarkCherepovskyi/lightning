@@ -25,6 +25,14 @@ static u8 liquid_regtest_fee_asset[] = {
     0x05, 0x71, 0x49, 0x9c, 0x03, 0x62, 0x8a, 0x38, 0x51, 0xb8, 0xce,
 };
 
+/* L-BTC on Liquid testnet is 144c6543...9a49 as elements-cli prints it; like
+ * the others, stored here in internal (reversed) byte order. */
+static u8 liquid_testnet_fee_asset[] = {
+    0x01, 0x49, 0x9a, 0x81, 0x85, 0x45, 0xf6, 0xba, 0xe3, 0x9f, 0xc0,
+    0x3b, 0x63, 0x7f, 0x2a, 0x4e, 0x1e, 0x64, 0xe5, 0x90, 0xca, 0xc1,
+    0xbc, 0x3a, 0x6f, 0x6d, 0x71, 0xaa, 0x44, 0x43, 0x65, 0x4c, 0x14,
+};
+
 const struct chainparams networks[] = {
     {.network_name = "bitcoin",
      .onchain_hrp = "bc",
@@ -211,6 +219,31 @@ const struct chainparams networks[] = {
      .fee_asset_tag = liquid_fee_asset,
      .bip32_key_version = {.bip32_pubkey_version = BIP32_VER_MAIN_PUBLIC,
 			   .bip32_privkey_version = BIP32_VER_MAIN_PRIVATE},
+     .is_elements = true},
+    {.network_name = "liquid-testnet",
+     .onchain_hrp = "tex",
+     .lightning_hrp = "tex",
+     .bip70_name = "liquidtestnet",
+     .genesis_blockhash = {{{.u.u8 = {0xa7, 0x71, 0xda, 0x8e, 0x52, 0xee, 0x6a,
+				      0xd5, 0x81, 0xed, 0x1e, 0x9a, 0x99, 0x82,
+				      0x5e, 0x5b, 0x3b, 0x79, 0x92, 0x22, 0x55,
+				      0x34, 0xea, 0xa2, 0xae, 0x23, 0x24, 0x4f,
+				      0xe2, 0x6a, 0xb1, 0xc1}}}},
+     .rpc_port = 7039,
+     .ln_port = 19735,
+     .cli = "elements-cli",
+     .cli_args = "-chain=liquidtestnet",
+     .dust_limit = {546},
+     .max_funding = AMOUNT_SAT_INIT((1 << 24) - 1),
+     .max_payment = AMOUNT_MSAT_INIT(0xFFFFFFFFULL),
+     .max_supply = AMOUNT_SAT_INIT(2100000000000000),
+     .when_lightning_became_cool = 1,
+     .p2pkh_version = 36,
+     .p2sh_version = 19,
+     .testnet = true,
+     .fee_asset_tag = liquid_testnet_fee_asset,
+     .bip32_key_version = {.bip32_pubkey_version = BIP32_VER_TEST_PUBLIC,
+			   .bip32_privkey_version = BIP32_VER_TEST_PRIVATE},
      .is_elements = true},
 };
 

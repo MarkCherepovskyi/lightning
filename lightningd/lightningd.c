@@ -1271,6 +1271,16 @@ int main(int argc, char *argv[])
 	plugins_init(ld->plugins);
 	trace_span_end(ld->plugins);
 
+	/*~ Asset channels (common/channel_asset.h) are offered by a plugin,
+	 * through its feature bit.  They are built on anchors, which are
+	 * otherwise off on Elements. */
+	if (chainparams->is_elements
+	    && feature_offered(ld->our_features->bits[INIT_FEATURE],
+			       OPT_CHANNEL_ASSET))
+		feature_set_or(ld->our_features,
+			       take(feature_set_for_feature(NULL,
+					OPTIONAL_FEATURE(OPT_ANCHORS_ZERO_FEE_HTLC_TX))));
+
 	/*~ If the plugis are misconfigured we don't want to proceed. A
 	 * misconfiguration could for example be a plugin marked as important
 	 * not working correctly or a plugin squatting something an important

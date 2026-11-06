@@ -74,6 +74,20 @@
             "Bit number."
           ]
         }
+      },
+      "asset": {
+        "type": "hex",
+        "added": "v26.09",
+        "description": [
+          "Liquid only: open an asset channel whose balance is in this issued asset (the asset id as printed by elements-cli), which a plugin must offer asset channels in (contrib/assetchan). The funding transaction must pay `amount` of the asset to the channel at output n and `fee_reserve` of L-BTC to the channel at output n+1, both unblinded. Asset channels use anchors."
+        ]
+      },
+      "fee_reserve": {
+        "type": "sat",
+        "added": "v26.09",
+        "description": [
+          "Liquid only, required with `asset`: L-BTC we put next to the funding output. It pays the anchors and the fee of every on-chain transaction of the channel (the whole reserve, minus anchors, is the fee), so it only has to cover the minimum relay fee."
+        ]
       }
     },
     "pairedWith": [

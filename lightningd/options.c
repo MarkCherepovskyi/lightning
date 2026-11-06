@@ -13,6 +13,7 @@
 #include <common/configvar.h>
 #include <common/errcode.h>
 #include <common/hsm_secret.h>
+#include <common/channel_asset.h>
 #include <common/version.h>
 #include <dirent.h>
 #include <errno.h>
@@ -1851,7 +1852,8 @@ void handle_early_opts(struct lightningd *ld, int argc, char *argv[])
 	else
 		ld->config = mainnet_config;
 
-	/* No anchors if we're elements */
+	/* No anchors if we're elements (an asset channel plugin turns them
+	 * back on, see lightningd.c) */
 	if (chainparams->is_elements) {
 		feature_set_sub(ld->our_features,
 				feature_set_for_feature(tmpctx,

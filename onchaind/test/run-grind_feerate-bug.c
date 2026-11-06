@@ -83,7 +83,8 @@ struct bitcoin_tx *htlc_success_tx(const tal_t *ctx UNNEEDED,
 				   u32 feerate_per_kw UNNEEDED,
 				   const struct keyset *keyset UNNEEDED,
 				   bool option_anchor_outputs UNNEEDED,
-				   bool option_anchors_zero_fee_htlc_tx UNNEEDED)
+				   bool option_anchors_zero_fee_htlc_tx UNNEEDED,
+				   const u8 *asset_tag UNNEEDED)
 { fprintf(stderr, "htlc_success_tx called!\n"); abort(); }
 /* Generated stub for master_badmsg */
 void master_badmsg(u32 type_expected UNNEEDED, const u8 *msg)
@@ -278,7 +279,8 @@ struct bitcoin_tx *htlc_timeout_tx(const tal_t *ctx,
 				   u32 feerate_per_kw UNNEEDED,
 				   const struct keyset *keyset UNNEEDED,
 				   bool option_anchor_outputs,
-				   bool option_anchors_zero_fee_htlc_tx)
+				   bool option_anchors_zero_fee_htlc_tx,
+				   const u8 *asset_tag UNNEEDED)
 {
  	struct bitcoin_tx *tx;
 	struct amount_sat in_amount;

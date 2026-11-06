@@ -126,10 +126,23 @@ struct wally_tx_output *wally_tx_output(const tal_t *ctx,
 					const u8 *script,
 					struct amount_sat amount);
 
+/* Elements: as above, but in @asset (33-byte explicit tag; NULL means the
+ * chain's fee asset). */
+struct wally_tx_output *wally_tx_output_asset(const tal_t *ctx,
+					      const u8 *script,
+					      struct amount_sat amount,
+					      const u8 *asset);
+
 /* Add one output to tx. */
 int bitcoin_tx_add_output(struct bitcoin_tx *tx, const u8 *script,
 			  const u8 *wscript,
 			  struct amount_sat amount);
+
+/* Elements: add one output in @asset (NULL means the chain's fee asset). */
+int bitcoin_tx_add_asset_output(struct bitcoin_tx *tx, const u8 *script,
+				const u8 *wscript,
+				struct amount_sat amount,
+				const u8 *asset);
 
 /* Remove one output. */
 void bitcoin_tx_remove_output(struct bitcoin_tx *tx, size_t outnum);
@@ -148,6 +161,15 @@ int bitcoin_tx_add_input(struct bitcoin_tx *tx,
 			 u32 sequence, const u8 *scriptSig,
 			 struct amount_sat amount, const u8 *scriptPubkey,
 			 const u8 *input_wscript);
+
+/* Elements: add an input spending an output in @asset (NULL means the chain's
+ * fee asset). */
+int bitcoin_tx_add_asset_input(struct bitcoin_tx *tx,
+			       const struct bitcoin_outpoint *outpoint,
+			       u32 sequence, const u8 *scriptSig,
+			       struct amount_sat amount, const u8 *scriptPubkey,
+			       const u8 *input_wscript,
+			       const u8 *asset);
 
 /* This is useful because wally uses a raw byte array for txids */
 bool wally_tx_input_spends(const struct wally_tx_input *input,

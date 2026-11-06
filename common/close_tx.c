@@ -2,6 +2,7 @@
 #include <assert.h>
 #include <bitcoin/script.h>
 #include <common/close_tx.h>
+#include <common/channel_asset.h>
 #include <common/permute_tx.h>
 #include <common/psbt_keypath.h>
 #include <common/utils.h>
@@ -18,11 +19,14 @@ struct bitcoin_tx *create_close_tx(const tal_t *ctx,
 				   struct amount_sat funding_sats,
 				   struct amount_sat to_us,
 				   struct amount_sat to_them,
-				   struct amount_sat dust_limit)
+				   struct amount_sat dust_limit,
+				   const struct channel_asset *asset,
+				   bool we_opened)
 {
 	struct bitcoin_tx *tx;
-	size_t num_outputs = 0;
+	int our_outnum = -1, their_outnum = -1;
 	struct amount_sat total_out;
+	const u8 *tag = channel_asset_tag(asset);
 	u8 *script;
 
 	/* BOLT #3:
@@ -52,18 +56,23 @@ struct bitcoin_tx *create_close_tx(const tal_t *ctx,
 	 * * locktime: 0
 	 * * txin count: 1
 	 */
-	/* Now create close tx: one input, two outputs. */
-	tx = bitcoin_tx(ctx, chainparams, 1, 2, 0);
+	/* Now create close tx: one input, two outputs (an asset channel's
+	 * also spends the fee reserve, common/channel_asset.h). */
+	tx = bitcoin_tx(ctx, chainparams, asset ? 2 : 1, 2, 0);
 
 	/* Our input spends the anchor tx output. */
-	bitcoin_tx_add_input(tx, funding,
-			     BITCOIN_TX_DEFAULT_SEQUENCE, NULL,
-			     funding_sats, NULL, funding_wscript);
+	bitcoin_tx_add_asset_input(tx, funding,
+				   BITCOIN_TX_DEFAULT_SEQUENCE, NULL,
+				   funding_sats, NULL, funding_wscript, tag);
+	if (asset)
+		add_fee_reserve_input(tx, funding, BITCOIN_TX_DEFAULT_SEQUENCE,
+				      funding_wscript, asset);
 
 	if (amount_sat_greater_eq(to_us, dust_limit)) {
 		script = tal_dup_talarr(tx, u8, our_script);
 		/* One output is to us. */
-		bitcoin_tx_add_output(tx, script, NULL, to_us);
+		our_outnum = bitcoin_tx_add_asset_output(tx, script, NULL,
+							 to_us, tag);
 		assert((local_wallet_index == NULL) == (local_wallet_ext_key == NULL));
 		if (local_wallet_index) {
 			size_t script_len = tal_bytelen(script);
@@ -73,19 +82,25 @@ struct bitcoin_tx *create_close_tx(const tal_t *ctx,
 				    is_p2tr(script, script_len, NULL)))
 				return tal_free(tx);
                 }
-		num_outputs++;
 	}
 
 	if (amount_sat_greater_eq(to_them, dust_limit)) {
 		script = tal_dup_talarr(tx, u8, their_script);
 		/* Other output is to them. */
-		bitcoin_tx_add_output(tx, script, NULL, to_them);
-		num_outputs++;
+		their_outnum = bitcoin_tx_add_asset_output(tx, script, NULL,
+							   to_them, tag);
 	}
 
 	/* Can't have no outputs at all! */
-	if (num_outputs == 0)
+	if (our_outnum < 0 && their_outnum < 0)
 		return tal_free(tx);
+
+	/* Asset channel: the whole fee reserve is the fee, and any asset
+	 * rounding goes back to the opener. */
+	if (asset)
+		channel_asset_finish_tx(tx, asset, funding_sats,
+					we_opened ? our_outnum : their_outnum,
+					we_opened ? their_outnum : our_outnum);
 
 	permute_outputs(tx, NULL, NULL);
 

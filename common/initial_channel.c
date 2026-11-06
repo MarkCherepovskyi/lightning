@@ -45,6 +45,7 @@ struct channel *new_initial_channel(const tal_t *ctx,
 	channel->type = tal_dup(channel, struct channel_type, type);
 
 	channel->cid = *cid;
+	channel->asset = NULL;
 	channel->funding = *funding;
 	channel->funding_sats = funding_sats;
 	channel->minimum_depth = minimum_depth;
@@ -136,6 +137,7 @@ struct bitcoin_tx *initial_channel_tx(const tal_t *ctx,
 				    side, csv_lock,
 				    channel_has(channel, OPT_ANCHOR_OUTPUTS_DEPRECATED),
 				    channel_has(channel, OPT_ANCHORS_ZERO_FEE_HTLC_TX),
+				    channel->asset,
 				    err_reason);
 
 	if (init_tx) {

@@ -9,6 +9,7 @@
 #include <common/fee_states.h>
 #include <common/json_channel_type.h>
 #include <common/json_command.h>
+#include <common/channel_asset.h>
 #include <common/memleak.h>
 #include <connectd/connectd_wiregen.h>
 #include <errno.h>
@@ -95,7 +96,8 @@ wallet_commit_channel(struct lightningd *ld,
 		      const u8 *remote_upfront_shutdown_script,
 		      const struct channel_type *type,
 		      const struct wally_psbt *funding_psbt,
-		      bool withheld)
+		      bool withheld,
+		      const struct channel_asset *asset)
 {
 	struct channel *channel;
 	struct amount_msat our_msat;
@@ -236,6 +238,10 @@ wallet_commit_channel(struct lightningd *ld,
 			      tal_arr(NULL, struct channel_state_change *, 0),
 			      funding_psbt,
 			      withheld);
+
+	/* asset channel? */
+	channel->asset = asset ? tal_dup(channel, struct channel_asset, asset)
+		: NULL;
 
 	/* Now we finally put it in the database. */
 	wallet_channel_insert(ld->wallet, channel);
@@ -454,7 +460,8 @@ static void opening_funder_finished(struct subd *openingd, const u8 *resp,
 					remote_upfront_shutdown_script,
 					type,
 					fc->funding_psbt,
-					fc->withheld);
+					fc->withheld,
+					fc->asset);
 	if (!channel) {
 		was_pending(command_fail(fc->cmd, LIGHTNINGD,
 					 "Key generation failure"));
@@ -572,7 +579,8 @@ static void opening_fundee_finished(struct subd *openingd,
 					remote_upfront_shutdown_script,
 					type,
 					NULL,
-					false);
+					false,
+					uc->asset);
 	if (!channel) {
 		uncommitted_channel_disconnect(uc, LOG_BROKEN,
 					       "Commit channel failed");
@@ -706,6 +714,12 @@ static void openchannel_hook_serialize(struct openchannel_hook_payload *payload,
 		json_add_hex_talarr(stream, "shutdown_scriptpubkey",
 				    payload->shutdown_scriptpubkey);
 	json_add_channel_type(stream, "channel_type", payload->channel_type);
+	if (payload->uc->asset) {
+		json_add_string(stream, "asset",
+				fmt_channel_asset(tmpctx, payload->uc->asset->tag));
+		json_add_amount_sat_msat(stream, "fee_reserve_msat",
+					 payload->uc->asset->fee_reserve);
+	}
 	json_object_end(stream); /* .openchannel */
 }
 
@@ -886,12 +900,16 @@ static void opening_got_offer(struct subd *openingd,
 					&payload->max_accepted_htlcs,
 					&payload->channel_flags,
 					&payload->shutdown_scriptpubkey,
-					&payload->channel_type)) {
+					&payload->channel_type,
+					&uc->asset)) {
 		log_broken(openingd->log, "Malformed opening_got_offer %s",
 			   tal_hex(tmpctx, msg));
 		tal_free(openingd);
 		return;
 	}
+	/* The channel keeps the asset (common/channel_asset.h) long after
+	 * the hook payload is gone. */
+	tal_steal(uc, uc->asset);
 
 	/* Don't allow opening if we don't know any fees; even if
 	 * ignore-feerates is set. */
@@ -1048,6 +1066,7 @@ static struct command_result *json_fundchannel_complete(struct command *cmd,
 	struct peer *peer;
 	struct wally_psbt *funding_psbt;
 	u32 *funding_txout_num = NULL;
+	bool reserve_found = false;
 	struct funding_channel *fc;
 	bool *withhold;
 
@@ -1084,22 +1103,69 @@ static struct command_result *json_fundchannel_complete(struct command *cmd,
 		return command_fail(cmd, LIGHTNINGD, "Could not set PSBT version.");
 	}
 
-	/* Figure out the correct output, and perform sanity checks. */
+	/* Figure out the correct output, and perform sanity checks.  An
+	 * asset channel (common/channel_asset.h) has two to the 2-of-2: the
+	 * funding output n, and the L-BTC fee reserve at n+1. */
 	for (size_t i = 0; i < funding_psbt->num_outputs; i++) {
-		if (memeq(funding_psbt->outputs[i].script,
-			  funding_psbt->outputs[i].script_len,
-			  fc->funding_scriptpubkey,
-			  tal_bytelen(fc->funding_scriptpubkey))) {
-			if (funding_txout_num)
-				return command_fail(cmd, FUNDING_PSBT_INVALID,
-						    "Two outputs to open channel");
+		if (!memeq(funding_psbt->outputs[i].script,
+			   funding_psbt->outputs[i].script_len,
+			   fc->funding_scriptpubkey,
+			   tal_bytelen(fc->funding_scriptpubkey)))
+			continue;
+		if (!funding_txout_num) {
 			funding_txout_num = tal(cmd, u32);
 			*funding_txout_num = i;
-		}
+		} else if (fc->asset && i == *funding_txout_num + 1)
+			reserve_found = true;
+		else
+			return command_fail(cmd, FUNDING_PSBT_INVALID,
+					    "Two outputs to open channel");
 	}
 	if (!funding_txout_num)
 		return command_fail(cmd, FUNDING_PSBT_INVALID,
 				    "No output to open channel");
+
+	/* Asset channels: output n must pay exactly the asset amount, and
+	 * n+1 exactly the fee reserve in the fee asset, both explicitly
+	 * (elementsd doesn't blind outputs to unconfidential addresses,
+	 * which is what fundchannel_start gave out). */
+	if (fc->asset) {
+		size_t reserve = *funding_txout_num + 1;
+		struct amount_asset amt;
+
+		if (!reserve_found)
+			return command_fail(cmd, FUNDING_PSBT_INVALID,
+					    "asset channel: output %zu"
+					    " must pay the fee reserve"
+					    " to the channel too", reserve);
+		amt = wally_psbt_output_get_amount(&funding_psbt->outputs
+						   [*funding_txout_num]);
+		if (amt.value == 0
+		    || !channel_asset_tag_eq(amt.asset, fc->asset->tag)
+		    || !amount_sat_eq(amount_sat(amt.value), fc->funding_sats))
+			return command_fail(cmd, FUNDING_PSBT_INVALID,
+					    "asset channel: output %u must pay"
+					    " exactly %s of asset %s,"
+					    " explicitly",
+					    *funding_txout_num,
+					    fmt_amount_sat(tmpctx,
+							   fc->funding_sats),
+					    fmt_channel_asset(tmpctx,
+							      fc->asset->tag));
+		amt = wally_psbt_output_get_amount(&funding_psbt->outputs
+						   [reserve]);
+		if (amt.value == 0
+		    || !amount_asset_is_main(&amt)
+		    || !amount_sat_eq(amount_sat(amt.value),
+				      fc->asset->fee_reserve))
+			return command_fail(cmd, FUNDING_PSBT_INVALID,
+					    "asset channel: output %zu must pay"
+					    " exactly the %s fee reserve,"
+					    " explicitly",
+					    reserve,
+					    fmt_amount_sat(tmpctx,
+							   fc->asset->fee_reserve));
+	}
 
 	/* Can't really check amounts for elements. */
 	if (!chainparams->is_elements
@@ -1286,6 +1352,21 @@ static void fundchannel_start_after_sync(struct chain_topology *topo,
 /**
  * json_fundchannel_start - Entrypoint for funding a channel
  */
+/* An asset id as printed by elements-cli */
+static struct command_result *param_asset(struct command *cmd,
+					  const char *name,
+					  const char *buffer,
+					  const jsmntok_t *tok,
+					  u8 **asset)
+{
+	*asset = channel_asset_from_hex(cmd, buffer + tok->start,
+					tok->end - tok->start);
+	if (*asset)
+		return NULL;
+	return command_fail_badparam(cmd, name, buffer, tok,
+				     "should be a 32-byte asset id");
+}
+
 static struct command_result *json_fundchannel_start(struct command *cmd,
 						     const char *buffer,
 						     const jsmntok_t *obj UNNEEDED,
@@ -1301,6 +1382,8 @@ static struct command_result *json_fundchannel_start(struct command *cmd,
 	u32 *upfront_shutdown_script_wallet_index;
 	struct channel_id tmp_channel_id;
 	struct channel_type *ctype;
+	u8 *asset;
+	struct amount_sat *fee_reserve;
 
 	fc->cmd = cmd;
 	fc->cancels = tal_arr(fc, struct command *, 0);
@@ -1318,8 +1401,24 @@ static struct command_result *json_fundchannel_start(struct command *cmd,
 			 p_opt("mindepth", param_u32, &mindepth),
 			 p_opt("reserve", param_sat, &reserve),
 			 p_opt("channel_type", param_channel_type, &ctype),
+			 p_opt("asset", param_asset, &asset),
+			 p_opt("fee_reserve", param_sat, &fee_reserve),
 			 NULL))
 		return command_param_failed();
+
+	/* Asset channel: the balance is in @asset, and we put a fee reserve
+	 * right after the funding output (common/channel_asset.h). */
+	if (asset) {
+		if (!chainparams->is_elements)
+			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+					    "asset channels only exist on Liquid");
+		if (!fee_reserve)
+			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+					    "fee_reserve is required with asset");
+	} else if (fee_reserve)
+		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+				    "fee_reserve only applies with asset");
+	fc->asset = asset ? channel_asset_new(fc, asset, *fee_reserve) : NULL;
 
 	if (ctype) {
 		fc->channel_type = tal_steal(fc, ctype);
@@ -1485,7 +1584,8 @@ static struct command_result *json_fundchannel_start(struct command *cmd,
 			&tmp_channel_id,
 			fc->channel_flags,
 			reserve,
-			fc->channel_type);
+			fc->channel_type,
+			fc->asset);
 
 	if (!topology_synced(cmd->ld->topology)) {
 		struct fundchannel_start_info *info

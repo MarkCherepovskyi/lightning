@@ -7,6 +7,7 @@
 #include <ccan/tal/str/str.h>
 #include <common/bolt12_id.h>
 #include <common/bolt12_merkle.h>
+#include <common/channel_asset.h>
 #include <common/hash_u5.h>
 #include <common/hsm_secret.h>
 #include <common/key_derive.h>
@@ -587,10 +588,20 @@ static void sign_our_inputs(struct hsm_utxo **utxos, struct wally_psbt *psbt)
 					= bitcoin_wscript_to_remote_anchored(tmpctx,
 									     &pubkey,
 									     utxo->close_info->csv);
+				/* An asset channel's to_remote output is in
+				 * the asset, not L-BTC: keep what the PSBT
+				 * says. */
+				const u8 *asset = NULL;
+				const struct wally_tx_output *wout
+					= psbt->inputs[j].witness_utxo;
+				if (wout && wout->asset_len == ELEMENTS_ASSET_LEN)
+					asset = channel_asset_tag_dup(tmpctx,
+								      wout->asset);
 				psbt_input_set_witscript(psbt, j, wscript);
-				psbt_input_set_wit_utxo(psbt, j,
-							scriptpubkey_p2wsh(psbt, wscript),
-							utxo->amount);
+				psbt_input_set_wit_utxo_asset(psbt, j,
+							      scriptpubkey_p2wsh(psbt, wscript),
+							      utxo->amount,
+							      asset);
 			}
 			tal_wally_start();
 			if (!is_cache_enabled) {
@@ -661,10 +672,14 @@ static u8 *handle_sign_to_us_tx(struct hsmd_client *c, const u8 *msg_in,
 		return hsmd_status_bad_request(c, msg_in,
 					       "bad pubkey_from_privkey");
 
-	if (tx->wtx->num_inputs != 1)
-		return hsmd_status_bad_request(c, msg_in, "bad txinput count");
+	/* Asset channels (common/channel_asset.h): an output in an asset
+	 * can't pay the fee, so we sign it with just its output, and whoever
+	 * broadcasts adds the L-BTC that does. */
+	if (!psbt_input_in_fee_asset(tx->psbt, input_num))
+		sighash_type = SIGHASH_SINGLE | SIGHASH_ANYONECANPAY;
 
-	sign_tx_input(tx, 0, NULL, wscript, privkey, &pubkey, sighash_type, &sig);
+	sign_tx_input(tx, input_num, NULL, wscript, privkey, &pubkey,
+		      sighash_type, &sig);
 	check_overgrind(&sig);
 
 	return towire_hsmd_sign_tx_reply(NULL, &sig);
@@ -1408,39 +1423,87 @@ static u8 *handle_sign_withdrawal_tx(struct hsmd_client *c, const u8 *msg_in)
 	return towire_hsmd_sign_withdrawal_reply(NULL, psbt);
 }
 
-/* This is used by closingd to sign off on a mutual close tx. */
-static u8 *handle_sign_mutual_close_tx(struct hsmd_client *c, const u8 *msg_in)
+/* Sign input 0 (the funding output) of a commitment or mutual close tx
+ * with our funding key.  An asset channel's tx also spends the fee reserve
+ * (input 1: the output after the funding one, same 2-of-2), so sign that
+ * too. */
+static u8 *sign_funding_inputs(struct hsmd_client *c, const u8 *msg_in,
+			       const struct node_id *peer_id, u64 dbid,
+			       struct bitcoin_tx *tx,
+			       const struct pubkey *remote_funding_pubkey,
+			       const struct channel_asset *asset)
 {
 	struct secret channel_seed;
-	struct bitcoin_tx *tx;
-	struct pubkey remote_funding_pubkey, local_funding_pubkey;
-	struct bitcoin_signature sig;
 	struct secrets secrets;
+	struct pubkey local_funding_pubkey;
 	const u8 *funding_wscript;
-
-	if (!fromwire_hsmd_sign_mutual_close_tx(tmpctx, msg_in,
-					       &tx,
-					       &remote_funding_pubkey))
-		return hsmd_status_malformed_request(c, msg_in);
+	struct bitcoin_signature sig, reserve_sig;
 
 	tx->chainparams = c->chainparams;
-	/* FIXME: We should know dust level, decent fee range and
-	 * balances, and final_keyindex, and thus be able to check tx
-	 * outputs! */
-	get_channel_seed(&c->id, c->dbid, &channel_seed);
+	if (tx->wtx->num_inputs != (asset ? 2 : 1))
+		return hsmd_status_bad_request_fmt(c, msg_in,
+						   "tx must have %u input(s)",
+						   asset ? 2 : 1);
+	if (asset) {
+		struct bitcoin_outpoint funding, reserve, expected;
+
+		bitcoin_tx_input_get_outpoint(tx, 0, &funding);
+		bitcoin_tx_input_get_outpoint(tx, 1, &reserve);
+		expected = fee_reserve_outpoint(&funding);
+		if (!bitcoin_outpoint_eq(&reserve, &expected)
+		    || !amount_sat_eq(psbt_input_get_amount(tx->psbt, 1),
+				      asset->fee_reserve))
+			return hsmd_status_bad_request_fmt(c, msg_in,
+							   "input 1 is not the fee reserve");
+	}
+
+	get_channel_seed(peer_id, dbid, &channel_seed);
 	derive_basepoints(&channel_seed,
 			  &local_funding_pubkey, NULL, &secrets, NULL);
 
+	/*~ Bitcoin signatures cover the (part of) the script they're
+	 * executing; the rules are a bit complex in general, but for
+	 * Segregated Witness it's simply the current script. */
 	funding_wscript = bitcoin_redeem_2of2(tmpctx,
 					      &local_funding_pubkey,
-					      &remote_funding_pubkey);
+					      remote_funding_pubkey);
 	sign_tx_input(tx, 0, NULL, funding_wscript,
 		      &secrets.funding_privkey,
 		      &local_funding_pubkey,
-		      SIGHASH_ALL, &sig);
+		      SIGHASH_ALL,
+		      &sig);
 	check_overgrind(&sig);
+	if (asset) {
+		sign_tx_input(tx, 1, NULL, funding_wscript,
+			      &secrets.funding_privkey,
+			      &local_funding_pubkey,
+			      SIGHASH_ALL,
+			      &reserve_sig);
+		check_overgrind(&reserve_sig);
+	}
 
-	return towire_hsmd_sign_tx_reply(NULL, &sig);
+	return towire_hsmd_sign_commitment_tx_reply(NULL, &sig,
+						    asset ? &reserve_sig : NULL);
+}
+
+/* This is used by closingd to sign off on a mutual close tx. */
+static u8 *handle_sign_mutual_close_tx(struct hsmd_client *c, const u8 *msg_in)
+{
+	struct bitcoin_tx *tx;
+	struct pubkey remote_funding_pubkey;
+	struct channel_asset *asset;
+
+	if (!fromwire_hsmd_sign_mutual_close_tx(tmpctx, msg_in,
+					       &tx,
+					       &remote_funding_pubkey,
+					       &asset))
+		return hsmd_status_malformed_request(c, msg_in);
+
+	/* FIXME: We should know dust level, decent fee range and
+	 * balances, and final_keyindex, and thus be able to check tx
+	 * outputs! */
+	return sign_funding_inputs(c, msg_in, &c->id, c->dbid, tx,
+				   &remote_funding_pubkey, asset);
 }
 
 /* This is used by channeld to sign the final splice tx. */
@@ -1642,17 +1705,14 @@ static u8 *handle_sign_remote_htlc_tx(struct hsmd_client *c, const u8 *msg_in)
 /* FIXME: make sure it meets some criteria? */
 static u8 *handle_sign_remote_commitment_tx(struct hsmd_client *c, const u8 *msg_in)
 {
-	struct pubkey remote_funding_pubkey, local_funding_pubkey;
-	struct secret channel_seed;
+	struct pubkey remote_funding_pubkey;
 	struct bitcoin_tx *tx;
-	struct bitcoin_signature sig;
-	struct secrets secrets;
-	const u8 *funding_wscript;
 	struct pubkey remote_per_commit;
 	bool option_static_remotekey;
 	u64 commit_num;
 	struct hsm_htlc *htlc;
 	u32 feerate;
+	struct channel_asset *asset;
 
 	if (!fromwire_hsmd_sign_remote_commitment_tx(tmpctx, msg_in,
 						    &tx,
@@ -1660,34 +1720,16 @@ static u8 *handle_sign_remote_commitment_tx(struct hsmd_client *c, const u8 *msg
 						    &remote_per_commit,
 						    &option_static_remotekey,
 						    &commit_num,
-						    &htlc, &feerate))
+						    &htlc, &feerate, &asset))
 		return hsmd_status_malformed_request(c, msg_in);
-	tx->chainparams = c->chainparams;
 
 	/* Basic sanity checks. */
-	if (tx->wtx->num_inputs != 1)
-		return hsmd_status_bad_request_fmt(c, msg_in,
-						   "tx must have 1 input");
-
 	if (tx->wtx->num_outputs == 0)
 		return hsmd_status_bad_request_fmt(c, msg_in,
 						   "tx must have > 0 outputs");
 
-	get_channel_seed(&c->id, c->dbid, &channel_seed);
-	derive_basepoints(&channel_seed,
-			  &local_funding_pubkey, NULL, &secrets, NULL);
-
-	funding_wscript = bitcoin_redeem_2of2(tmpctx,
-					      &local_funding_pubkey,
-					      &remote_funding_pubkey);
-	sign_tx_input(tx, 0, NULL, funding_wscript,
-		      &secrets.funding_privkey,
-		      &local_funding_pubkey,
-		      SIGHASH_ALL,
-		      &sig);
-	check_overgrind(&sig);
-
-	return towire_hsmd_sign_tx_reply(NULL, &sig);
+	return sign_funding_inputs(c, msg_in, &c->id, c->dbid, tx,
+				   &remote_funding_pubkey, asset);
 }
 
 /*~ This is used when the remote peer's commitment transaction is revoked;
@@ -1847,52 +1889,27 @@ static u8 *handle_sign_htlc_tx_mingle(struct hsmd_client *c, const u8 *msg_in)
 /* FIXME: Ensure HSM never does this twice for same dbid! */
 static u8 *handle_sign_commitment_tx(struct hsmd_client *c, const u8 *msg_in)
 {
-	struct pubkey remote_funding_pubkey, local_funding_pubkey;
+	struct pubkey remote_funding_pubkey;
 	struct node_id peer_id;
 	u64 dbid;
-	struct secret channel_seed;
 	struct bitcoin_tx *tx;
-	struct bitcoin_signature sig;
 	u64 commit_num;
-	struct secrets secrets;
-	const u8 *funding_wscript;
+	struct channel_asset *asset;
 
 	if (!fromwire_hsmd_sign_commitment_tx(tmpctx, msg_in,
 					     &peer_id, &dbid,
 					     &tx,
 					     &remote_funding_pubkey,
-					     &commit_num))
+					     &commit_num, &asset))
 		return hsmd_status_malformed_request(c, msg_in);
 
-	tx->chainparams = c->chainparams;
-
 	/* Basic sanity checks. */
-	if (tx->wtx->num_inputs != 1)
-		return hsmd_status_bad_request(c, msg_in,
-					       "tx must have 1 input");
-
 	if (tx->wtx->num_outputs == 0)
 		return hsmd_status_bad_request_fmt(c, msg_in,
 						   "tx must have > 0 outputs");
 
-	get_channel_seed(&peer_id, dbid, &channel_seed);
-	derive_basepoints(&channel_seed,
-			  &local_funding_pubkey, NULL, &secrets, NULL);
-
-	/*~ Bitcoin signatures cover the (part of) the script they're
-	 * executing; the rules are a bit complex in general, but for
-	 * Segregated Witness it's simply the current script. */
-	funding_wscript = bitcoin_redeem_2of2(tmpctx,
-					      &local_funding_pubkey,
-					      &remote_funding_pubkey);
-	sign_tx_input(tx, 0, NULL, funding_wscript,
-		      &secrets.funding_privkey,
-		      &local_funding_pubkey,
-		      SIGHASH_ALL,
-		      &sig);
-	check_overgrind(&sig);
-
-	return towire_hsmd_sign_commitment_tx_reply(NULL, &sig);
+	return sign_funding_inputs(c, msg_in, &peer_id, dbid, tx,
+				   &remote_funding_pubkey, asset);
 }
 
 /* ~This stub implementation is overriden by fully validating signers

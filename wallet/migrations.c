@@ -1221,6 +1221,10 @@ static const struct db_migration dbmigrations[] = {
      /* Clamping is idempotent, so no revert needed */
      NULL, NULL},
     /* ^v26.09 */
+    /* Asset channels: the channel's asset tag (NULL for an ordinary
+     * channel) and the fee reserve the opener put next to the funding. */
+    {SQL("ALTER TABLE channels ADD asset BLOB DEFAULT NULL;"), NULL},
+    {SQL("ALTER TABLE channels ADD fee_reserve BIGINT DEFAULT 0;"), NULL},
 };
 
 const struct db_migration *get_db_migrations(size_t *num)

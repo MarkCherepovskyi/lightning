@@ -2,6 +2,7 @@
 #ifndef LIGHTNING_COMMON_INITIAL_COMMIT_TX_H
 #define LIGHTNING_COMMON_INITIAL_COMMIT_TX_H
 #include "config.h"
+#include <common/channel_asset.h>
 #include <bitcoin/pubkey.h>
 #include <bitcoin/tx.h>
 #include <common/htlc.h>
@@ -59,11 +60,17 @@ static inline size_t commit_tx_base_weight(size_t num_untrimmed_htlcs,
 }
 
 /* Helper to calculate the base fee if we have this many htlc outputs */
-static inline struct amount_sat commit_tx_base_fee(u32 feerate_per_kw,
+static inline struct amount_sat commit_tx_base_fee(const struct channel_asset *asset,
+						   u32 feerate_per_kw,
 						   size_t num_untrimmed_htlcs,
 						   bool option_anchor_outputs,
 						   bool option_anchors_zero_fee_htlc_tx)
 {
+	/* Asset channels pay the fee from the fee reserve, not from the
+	 * balances (common/channel_asset.h): no fee, and `update_fee` does
+	 * nothing. */
+	if (asset)
+		return AMOUNT_SAT(0);
 	return amount_tx_fee(feerate_per_kw,
 			     commit_tx_base_weight(num_untrimmed_htlcs,
 						   option_anchor_outputs,
@@ -110,6 +117,7 @@ struct bitcoin_tx *initial_commit_tx(const tal_t *ctx,
 				     u32 csv_lock,
 				     bool option_anchor_outputs,
 				     bool option_anchors_zero_fee_htlc_tx,
+				     const struct channel_asset *asset,
 				     char** err_reason);
 
 /* try_subtract_fee - take away this fee from the opener (and return true), or all if insufficient (and return false). */

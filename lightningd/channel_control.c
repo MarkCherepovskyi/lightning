@@ -772,7 +772,7 @@ void watch_splice_inflight(struct lightningd *ld,
 	watch_scriptpubkey(inflight, ld->topology,
 			   take(scriptpubkey_p2wsh(NULL, funding_wscript)),
 			   &inflight->funding->outpoint,
-			   inflight->funding->total_funds,
+			   inflight->funding->total_funds, NULL,
 			   splice_found,
 			   inflight);
 }
@@ -1448,10 +1448,13 @@ static void peer_start_closingd_after_shutdown(struct channel *channel,
 	peer_fd = new_peer_fd_arr(msg, fds);
 
 	/* If both sides negotiated option_simple_close, use the simple close
-	 * daemon instead of the legacy iterative fee negotiation daemon. */
-	if (feature_negotiated(ld->our_features,
-			       channel->peer->their_features,
-			       OPT_SIMPLE_CLOSE)) {
+	 * daemon instead of the legacy iterative fee negotiation daemon.
+	 * (Asset channels only do the legacy close: their fee is the whole
+	 * fee reserve, and closing_signed carries the reserve signature.) */
+	if (!channel->asset
+	    && feature_negotiated(ld->our_features,
+				  channel->peer->their_features,
+				  OPT_SIMPLE_CLOSE)) {
 		peer_start_simpleclosed(channel, peer_fd);
 		if (channel->state == CHANNELD_SHUTTING_DOWN)
 			channel_set_state(channel,
@@ -2036,7 +2039,8 @@ bool peer_start_channeld(struct channel *channel,
 				       pbases,
 				       cast_const2(const struct inflight **,
 						   inflights),
-				       *channel->alias[LOCAL]);
+				       *channel->alias[LOCAL],
+				       channel->asset);
 
 	/* We don't expect a response: we are triggered by funding_depth_cb. */
 	subd_send_msg(channel->owner, take(initmsg));
@@ -2342,6 +2346,12 @@ static struct command_result *channel_for_splice(struct command *cmd,
 				OPT_SPLICE))
 		return command_fail(cmd, SPLICE_NOT_SUPPORTED,
 				    "Peer does not support splicing");
+
+	/* Asset channels fund two outputs (common/channel_asset.h), which
+	 * splicing doesn't rebuild. */
+	if ((*channel)->asset)
+		return command_fail(cmd, SPLICE_NOT_SUPPORTED,
+				    "Asset channels cannot be spliced");
 
 	if (!(*channel)->owner)
 		return command_fail(cmd, SPLICE_WRONG_OWNER,

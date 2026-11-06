@@ -36,6 +36,9 @@ struct channel {
 	/* The id for this channel */
 	struct channel_id cid;
 
+	/* Asset channel (common/channel_asset.h)?  NULL for ordinary ones. */
+	const struct channel_asset *asset;
+
 	/* Funding txid and output. */
 	struct bitcoin_outpoint funding;
 

@@ -49,6 +49,14 @@ void notify_invoice_creation(struct lightningd *ld,
 			     const struct json_escape *label,
 			     const struct sha256 *offer_id);
 
+/* Asset channels: a signed, zero-fee spend of an asset output of ours, for
+ * the asset channel plugin to add L-BTC to, broadcast and bump. */
+void notify_asset_sweep(struct lightningd *ld,
+			const struct channel *channel,
+			const struct bitcoin_tx *tx,
+			u32 minblock,
+			u32 deadline);
+
 void notify_channel_opened(struct lightningd *ld,
 			   const struct node_id *node_id,
 			   const struct amount_sat *funding_sat,

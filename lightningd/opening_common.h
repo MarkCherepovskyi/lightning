@@ -51,6 +51,9 @@ struct uncommitted_channel {
 
 	/* These are *not* filled in by new_uncommitted_channel: */
 
+	/* Asset channel they offered (common/channel_asset.h)?  NULL otherwise. */
+	struct channel_asset *asset;
+
 	/* Minimum funding depth (if opener == REMOTE). */
 	u32 minimum_depth;
 
@@ -107,6 +110,9 @@ struct funding_channel {
 
 	/* Were we told to withhold the commitment tx? */
 	bool withheld;
+
+	/* Asset channel (common/channel_asset.h)?  NULL otherwise. */
+	struct channel_asset *asset;
 };
 
 struct uncommitted_channel *new_uncommitted_channel(struct peer *peer);

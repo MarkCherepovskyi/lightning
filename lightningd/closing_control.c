@@ -3,6 +3,7 @@
 #include <ccan/tal/str/str.h>
 #include <channeld/channeld_wiregen.h>
 #include <closingd/closingd_wiregen.h>
+#include <common/channel_asset.h>
 #include <common/closing_fee.h>
 #include <common/json_command.h>
 #include <common/shutdown_scriptpubkey.h>
@@ -173,7 +174,10 @@ static bool calc_tx_fee(struct channel *channel,
 			struct amount_sat *fee_result)
 {
 	struct amount_asset amt;
-	struct amount_sat sat_in = channel->funding_sats;
+	/* Asset channels pay the fee from the L-BTC fee reserve; the funding
+	 * output is in the asset, as are the outputs the loop skips. */
+	struct amount_sat sat_in = channel->asset
+		? channel->asset->fee_reserve : channel->funding_sats;
 
 	for (size_t i = 0; i < tx->wtx->num_outputs; i++) {
 		const struct wally_tx_output *txout = &tx->wtx->outputs[i];
@@ -282,6 +286,17 @@ static bool closing_fee_is_acceptable(struct lightningd *ld,
 
 	if (ld->dev_reject_closing_fee) {
 		log_debug(channel->log, "... dev-reject-closing-fee");
+		return false;
+	}
+
+	/* Asset channels pay the whole fee reserve: there is nothing to
+	 * negotiate, and no feerate to bound. */
+	if (channel->asset) {
+		if (amount_sat_eq(fee, channel->asset->fee_reserve))
+			return true;
+		log_debug(channel->log, "... asset channel close must pay the"
+			  " fee reserve %s",
+			  fmt_amount_sat(tmpctx, channel->asset->fee_reserve));
 		return false;
 	}
 
@@ -596,7 +611,8 @@ void peer_start_closingd(struct channel *channel, struct peer_fd *peer_fd)
 				       /* Always use quickclose with anchors */
 				       || option_anchor_outputs
 				       || option_anchors_zero_fee_htlc_tx,
-				       channel->shutdown_wrong_funding);
+				       channel->shutdown_wrong_funding,
+				       channel->asset);
 
 	/* We don't expect a response: it will give us feedback on
 	 * signatures sent and received, then closing_complete. */

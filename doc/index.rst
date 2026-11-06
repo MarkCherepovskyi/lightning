@@ -140,6 +140,7 @@ Core Lightning Documentation
    multifundchannel <multifundchannel.7.md>
    multiwithdraw <multiwithdraw.7.md>
    newaddr <newaddr.7.md>
+   notification-asset_sweep <notification-asset_sweep.7.md>
    notification-balance_snapshot <notification-balance_snapshot.7.md>
    notification-block_added <notification-block_added.7.md>
    notification-channel_open_failed <notification-channel_open_failed.7.md>

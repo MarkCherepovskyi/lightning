@@ -317,7 +317,7 @@ bool fromwire_hsmd_preapprove_keysend_reply(const void *p UNNEEDED, bool *approv
 bool fromwire_hsmd_sign_bolt12_reply(const void *p UNNEEDED, struct bip340sig *sig UNNEEDED)
 { fprintf(stderr, "fromwire_hsmd_sign_bolt12_reply called!\n"); abort(); }
 /* Generated stub for fromwire_hsmd_sign_commitment_tx_reply */
-bool fromwire_hsmd_sign_commitment_tx_reply(const void *p UNNEEDED, struct bitcoin_signature *sig UNNEEDED)
+bool fromwire_hsmd_sign_commitment_tx_reply(const tal_t *ctx UNNEEDED, const void *p UNNEEDED, struct bitcoin_signature *sig UNNEEDED, struct bitcoin_signature **fee_reserve_sig UNNEEDED)
 { fprintf(stderr, "fromwire_hsmd_sign_commitment_tx_reply called!\n"); abort(); }
 /* Generated stub for fromwire_hsmd_sign_invoice_reply */
 bool fromwire_hsmd_sign_invoice_reply(const void *p UNNEEDED, secp256k1_ecdsa_recoverable_signature *sig UNNEEDED)
@@ -657,7 +657,7 @@ u8 *towire_hsmd_preapprove_keysend_check(const tal_t *ctx UNNEEDED, const struct
 u8 *towire_hsmd_sign_bolt12(const tal_t *ctx UNNEEDED, const wirestring *messagename UNNEEDED, const wirestring *fieldname UNNEEDED, const struct sha256 *merkleroot UNNEEDED, const u8 *publictweak UNNEEDED)
 { fprintf(stderr, "towire_hsmd_sign_bolt12 called!\n"); abort(); }
 /* Generated stub for towire_hsmd_sign_commitment_tx */
-u8 *towire_hsmd_sign_commitment_tx(const tal_t *ctx UNNEEDED, const struct node_id *peer_id UNNEEDED, u64 channel_dbid UNNEEDED, const struct bitcoin_tx *tx UNNEEDED, const struct pubkey *remote_funding_key UNNEEDED, u64 commit_num UNNEEDED)
+u8 *towire_hsmd_sign_commitment_tx(const tal_t *ctx UNNEEDED, const struct node_id *peer_id UNNEEDED, u64 channel_dbid UNNEEDED, const struct bitcoin_tx *tx UNNEEDED, const struct pubkey *remote_funding_key UNNEEDED, u64 commit_num UNNEEDED, const struct channel_asset *asset UNNEEDED)
 { fprintf(stderr, "towire_hsmd_sign_commitment_tx called!\n"); abort(); }
 /* Generated stub for towire_hsmd_sign_invoice */
 u8 *towire_hsmd_sign_invoice(const tal_t *ctx UNNEEDED, const u8 *u5bytes UNNEEDED, const u8 *hrp UNNEEDED)
@@ -776,6 +776,7 @@ bool watch_scriptpubkey_(const tal_t *ctx UNNEEDED,
 			 const u8 *scriptpubkey TAKES UNNEEDED,
 			 const struct bitcoin_outpoint *expected_outpoint UNNEEDED,
 			 struct amount_sat expected_amount UNNEEDED,
+			 const u8 *expected_asset UNNEEDED,
 			 void (*cb)(struct lightningd *ld UNNEEDED,
 				    const struct bitcoin_tx *tx UNNEEDED,
 				    u32 outnum UNNEEDED,

@@ -1169,7 +1169,7 @@ static u8 *msg_for_remote_commit(const tal_t *ctx,
 {
 	struct wally_tx_output *direct_outputs[NUM_SIDES];
 	struct bitcoin_tx *remote_commit;
-	struct bitcoin_signature local_sig;
+	struct bitcoin_signature local_sig, *reserve_sig;
 	u32 feerate = 0; // unused since there are no htlcs
 	u64 commit_num = 0;
         u8 *msg;
@@ -1195,12 +1195,14 @@ static u8 *msg_for_remote_commit(const tal_t *ctx,
 						    true,
 						    commit_num,
 						    NULL, /* no HTLCS */
-						    feerate);
+						    feerate, NULL);
 	wire_sync_write(HSM_FD, take(msg));
 	msg = wire_sync_read(tmpctx, HSM_FD);
-	if (!fromwire_hsmd_sign_tx_reply(msg, &local_sig))
+	if (!fromwire_hsmd_sign_commitment_tx_reply(tmpctx, msg, &local_sig,
+						    &reserve_sig))
 		status_failed(STATUS_FAIL_HSM_IO,
-			      "Bad sign_tx_reply %s", tal_hex(tmpctx, msg));
+			      "Bad sign_commitment_tx_reply %s",
+			      tal_hex(tmpctx, msg));
 
 	/* You can tell this has been a problem before, since there's a debug
 	 * message here: */
@@ -2766,6 +2768,7 @@ static void accepter_start(struct state *state, const u8 *oc2_msg)
 				 &tx_state->remoteconf,
 				 &tx_state->localconf,
 				 channel_type_has(state->channel_type, OPT_ANCHORS_ZERO_FEE_HTLC_TX),
+				 NULL,
 				 &err_reason)) {
 		negotiation_failed(state, "%s", err_reason);
 		return;
@@ -3420,6 +3423,7 @@ static void opener_start(struct state *state, u8 *msg)
 				 &tx_state->remoteconf,
 				 &tx_state->localconf,
 				 channel_type_has(state->channel_type, OPT_ANCHORS_ZERO_FEE_HTLC_TX),
+				 NULL,
 				 &err_reason)) {
 		negotiation_failed(state, "%s", err_reason);
 		return;
@@ -3729,6 +3733,7 @@ static void rbf_local_start(struct state *state, u8 *msg)
 				 &tx_state->remoteconf,
 				 &tx_state->localconf,
 				 channel_type_has(state->channel_type, OPT_ANCHORS_ZERO_FEE_HTLC_TX),
+				 NULL,
 				 &err_reason)) {
 		open_abort(state, "%s", err_reason);
 		return;
@@ -3887,6 +3892,7 @@ static void rbf_remote_start(struct state *state, const u8 *rbf_msg)
 				 &tx_state->remoteconf,
 				 &tx_state->localconf,
 				 channel_type_has(state->channel_type, OPT_ANCHORS_ZERO_FEE_HTLC_TX),
+				 NULL,
 				 &err_reason)) {
 		negotiation_failed(state, "%s", err_reason);
 		goto free_rbf_ctx;

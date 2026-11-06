@@ -5,6 +5,7 @@
 #include <ccan/cast/cast.h>
 #include <ccan/mem/mem.h>
 #include <ccan/tal/str/str.h>
+#include <common/channel_asset.h>
 #include <common/htlc_tx.h>
 #include <common/initial_commit_tx.h>
 #include <common/keyset.h>
@@ -210,8 +211,69 @@ static void trim_maximum_feerate(struct amount_sat funding,
 	status_debug("... to %u", max_possible_feerate);
 }
 
+/* Asset channel (common/channel_asset.h)?  NULL for an ordinary one. */
+static const struct channel_asset *chan_asset;
+
+/* Asset channel: the channel's account is in units of its asset, so the
+ * L-BTC outputs of its transactions (anchors, fee outputs) stay out of it. */
+static struct bitcoin_outpoint *lbtc_outpoints;
+
+static bool is_asset_output(const struct wally_tx_output *out)
+{
+	struct amount_asset amt;
+
+	if (!chainparams->is_elements || !out || out->script_len == 0)
+		return false;
+	amt = wally_tx_output_get_amount(out);
+	return !amount_asset_is_main(&amt);
+}
+
+static void note_lbtc_outputs(const struct tx_parts *tx)
+{
+	if (!chan_asset)
+		return;
+	for (size_t i = 0; i < tal_count(tx->outputs); i++) {
+		struct bitcoin_outpoint op;
+
+		if (!tx->outputs[i] || is_asset_output(tx->outputs[i]))
+			continue;
+		op.txid = tx->txid;
+		op.n = i;
+		if (!lbtc_outpoints)
+			lbtc_outpoints = notleak(tal_arr(NULL,
+							 struct bitcoin_outpoint,
+							 0));
+		tal_arr_expand(&lbtc_outpoints, op);
+	}
+}
+
+static bool is_lbtc_outpoint(const struct bitcoin_outpoint *outpoint)
+{
+	for (size_t i = 0; i < tal_count(lbtc_outpoints); i++) {
+		if (bitcoin_outpoint_eq(&lbtc_outpoints[i], outpoint))
+			return true;
+	}
+	return false;
+}
+
+/* The output's amount: on an asset channel, in units of the asset (its
+ * anchors and fee output are L-BTC, which only ever gets recorded in sats). */
+static struct amount_sat output_amount(const struct wally_tx_output *out)
+{
+	struct amount_asset asset = wally_tx_output_get_amount(out);
+
+	if (!chan_asset)
+		assert(amount_asset_is_main(&asset));
+	return amount_sat(asset.value);
+}
+
 static void send_coin_mvt(struct chain_coin_mvt *mvt TAKES)
 {
+	if (chan_asset && is_lbtc_outpoint(&mvt->outpoint)) {
+		tal_free_if_taken(mvt);
+		return;
+	}
+
 	wire_sync_write(REQ_FD,
 			take(towire_onchaind_notify_coin_mvt(NULL, mvt)));
 
@@ -446,8 +508,10 @@ static bool set_htlc_timeout_fee(struct bitcoin_tx *tx,
 	struct amount_asset asset = bitcoin_tx_output_get_amount(tx, 0);
 	size_t weight;
 
-	amount = amount_asset_to_sat(&asset);
-	assert(amount_asset_is_main(&asset));
+	/* Asset channel: the HTLC tx pays out the asset. */
+	if (!chan_asset)
+		assert(amount_asset_is_main(&asset));
+	amount = amount_sat(asset.value);
 
 	/* BOLT #3:
 	 *
@@ -522,7 +586,8 @@ static struct amount_sat get_htlc_success_fee(struct tracked_output *out)
 			     0,
 			     keyset,
 			     option_anchor_outputs,
-			     option_anchors_zero_fee_htlc_tx);
+			     option_anchors_zero_fee_htlc_tx,
+			     channel_asset_tag(chan_asset));
 
 	/* BOLT #3:
 	 *
@@ -1081,7 +1146,6 @@ static void resolve_htlc_tx(struct tracked_output ***outs,
 {
 	struct tracked_output *out;
 	struct amount_sat amt;
-	struct amount_asset asset;
 	struct bitcoin_outpoint outpoint;
 	u8 *msg;
 	u8 *wscript = bitcoin_wscript_htlc_tx(tmpctx, to_self_delay[LOCAL],
@@ -1101,9 +1165,7 @@ static void resolve_htlc_tx(struct tracked_output ***outs,
 	outpoint.txid = htlc_tx->txid;
 	outpoint.n = input_num;
 
-	asset = wally_tx_output_get_amount(htlc_tx->outputs[outpoint.n]);
-	assert(amount_asset_is_main(&asset));
-	amt = amount_asset_to_sat(&asset);
+	amt = output_amount(htlc_tx->outputs[outpoint.n]);
 	out = new_tracked_output(outs, &outpoint,
  				 tx_blockheight,
  				 (*outs)[out_index]->resolved->tx_type,
@@ -1137,7 +1199,6 @@ static void steal_htlc_tx(struct tracked_output *out,
 			  const struct bitcoin_outpoint *htlc_outpoint)
 {
 	struct tracked_output *htlc_out;
-	struct amount_asset asset;
 	struct amount_sat htlc_out_amt;
 	const u8 *msg;
 
@@ -1145,9 +1206,7 @@ static void steal_htlc_tx(struct tracked_output *out,
 					      &keyset->self_revocation_key,
 					      &keyset->self_delayed_payment_key);
 
-	asset = wally_tx_output_get_amount(htlc_tx->outputs[htlc_outpoint->n]);
-	assert(amount_asset_is_main(&asset));
-	htlc_out_amt = amount_asset_to_sat(&asset);
+	htlc_out_amt = output_amount(htlc_tx->outputs[htlc_outpoint->n]);
 
 	htlc_out = new_tracked_output(outs,
 				      htlc_outpoint, htlc_tx_blockheight,
@@ -1783,6 +1842,7 @@ static void handle_mutual_close(struct tracked_output **outs,
 				const struct tx_parts *tx)
 {
 	/* In this case, we don't care about htlcs: there are none. */
+	note_lbtc_outputs(tx);
 	init_reply(tmpctx, "Tracking mutual close transaction");
 
 	/* Annotate the first input as close. We can currently only have a
@@ -1873,7 +1933,8 @@ static size_t resolve_our_htlc_ourcommit(struct tracked_output *out,
 				     htlcs[matches[i]].cltv_expiry,
 				     to_self_delay[LOCAL], 0, keyset,
 				     option_anchor_outputs,
-				     option_anchors_zero_fee_htlc_tx);
+				     option_anchors_zero_fee_htlc_tx,
+				     channel_asset_tag(chan_asset));
 
 		if (set_htlc_timeout_fee(tx, out->remote_htlc_sig,
 					 htlc_scripts[matches[i]]))
@@ -2195,6 +2256,7 @@ static void handle_our_unilateral(const struct tx_parts *tx,
 	size_t i;
 	struct htlcs_info *htlcs_info;
 
+	note_lbtc_outputs(tx);
 	htlcs_info = init_reply(tx, "Tracking our own unilateral close");
 	onchain_annotate_txin(&tx->txid, 0, TX_CHANNEL_UNILATERAL);
 
@@ -2277,15 +2339,11 @@ static void handle_our_unilateral(const struct tx_parts *tx,
 		struct tracked_output *out;
 		const size_t *matches;
 		size_t which_htlc;
-		struct amount_asset asset = wally_tx_output_get_amount(tx->outputs[i]);
-		struct amount_sat amt;
+		struct amount_sat amt = output_amount(tx->outputs[i]);
 		struct bitcoin_outpoint outpoint;
 
 		outpoint.txid = tx->txid;
 		outpoint.n = i;
-
-		assert(amount_asset_is_main(&asset));
-		amt = amount_asset_to_sat(&asset);
 
 		if (chainparams->is_elements
 		    && tx->outputs[i]->script_len == 0) {
@@ -2567,11 +2625,7 @@ static void tell_wallet_to_remote(const struct tx_parts *tx,
 				  bool option_static_remotekey,
 				  u32 csv_lock)
 {
-	struct amount_asset asset = wally_tx_output_get_amount(tx->outputs[outpoint->n]);
-	struct amount_sat amt;
-
-	assert(amount_asset_is_main(&asset));
-	amt = amount_asset_to_sat(&asset);
+	struct amount_sat amt = output_amount(tx->outputs[outpoint->n]);
 
 	/* A NULL per_commit_point is how we indicate the pubkey doesn't need
 	 * changing. */
@@ -2597,6 +2651,7 @@ static void their_unilateral_local(struct tracked_output ***outs,
 				   u32 csv_lock)
 {
 	struct tracked_output *out;
+
 	/* BOLT #5:
 	 *
 	 * - MAY take no action in regard to the associated
@@ -2645,6 +2700,7 @@ static void handle_their_cheat(const struct tx_parts *tx,
 	size_t i;
 	struct htlcs_info *htlcs_info;
 
+	note_lbtc_outputs(tx);
 	htlcs_info = init_reply(tx,
 				"Tracking their illegal close: taking all funds");
 	onchain_annotate_txin(
@@ -2764,15 +2820,11 @@ static void handle_their_cheat(const struct tx_parts *tx,
 		struct tracked_output *out;
 		const size_t *matches;
 		size_t which_htlc;
-		struct amount_asset asset = wally_tx_output_get_amount(tx->outputs[i]);
-		struct amount_sat amt;
+		struct amount_sat amt = output_amount(tx->outputs[i]);
 		struct bitcoin_outpoint outpoint;
 
 		outpoint.txid = tx->txid;
 		outpoint.n = i;
-
-		assert(amount_asset_is_main(&asset));
-		amt = amount_asset_to_sat(&asset);
 
 		if (chainparams->is_elements
 		    && tx->outputs[i]->script_len == 0) {
@@ -2980,6 +3032,7 @@ static void handle_their_unilateral(const struct tx_parts *tx,
 	size_t i;
 	struct htlcs_info *htlcs_info;
 
+	note_lbtc_outputs(tx);
 	htlcs_info = init_reply(tx, "Tracking their unilateral close");
 	onchain_annotate_txin(&tx->txid, 0, TX_CHANNEL_UNILATERAL | TX_THEIRS);
 
@@ -3088,12 +3141,8 @@ static void handle_their_unilateral(const struct tx_parts *tx,
 		struct tracked_output *out;
 		const size_t *matches;
 		size_t which_htlc;
-		struct amount_asset asset = wally_tx_output_get_amount(tx->outputs[i]);
-		struct amount_sat amt;
+		struct amount_sat amt = output_amount(tx->outputs[i]);
 		struct bitcoin_outpoint outpoint;
-
-		assert(amount_asset_is_main(&asset));
-		amt = amount_asset_to_sat(&asset);
 
 		outpoint.txid = tx->txid;
 		outpoint.n = i;
@@ -3313,6 +3362,7 @@ static void handle_unknown_commitment(const struct tx_parts *tx,
 
 	onchain_annotate_txin(&tx->txid, 0, TX_CHANNEL_UNILATERAL | TX_THEIRS);
 
+	note_lbtc_outputs(tx);
 	resolved_by_other(outs[0], &tx->txid, UNKNOWN_UNILATERAL);
 
 	/* Normally, csv is 1, but for option_will_fund, we need to
@@ -3324,7 +3374,6 @@ static void handle_unknown_commitment(const struct tx_parts *tx,
 						      csv);
 
 		for (size_t i = 0; i < tal_count(tx->outputs); i++) {
-			struct amount_asset asset;
 			struct amount_sat amt;
 			struct bitcoin_outpoint outpoint;
 			struct tracked_output *out;
@@ -3333,9 +3382,7 @@ static void handle_unknown_commitment(const struct tx_parts *tx,
 						      local_script))
 				continue;
 
-			asset = wally_tx_output_get_amount(tx->outputs[i]);
-			assert(amount_asset_is_main(&asset));
-			amt = amount_asset_to_sat(&asset);
+			amt = output_amount(tx->outputs[i]);
 
 			outpoint.txid = tx->txid;
 			outpoint.n = i;
@@ -3370,16 +3417,13 @@ found:
 	/* Record every unidentified output on this tx as an external
 	 * 'penalty' */
 	for (size_t i = 0; i < tal_count(tx->outputs); i++) {
-		struct amount_asset asset;
 		struct amount_sat amt;
 		struct bitcoin_outpoint outpoint;
 
 		if (i == to_us_output)
 			continue;
 
-		asset = wally_tx_output_get_amount(tx->outputs[i]);
-		assert(amount_asset_is_main(&asset));
-		amt = amount_asset_to_sat(&asset);
+		amt = output_amount(tx->outputs[i]);
 
 		outpoint.txid = tx->txid;
 		outpoint.n = i;
@@ -3434,6 +3478,7 @@ int main(int argc, char *argv[])
 	struct amount_sat funding_sats;
 	u8 *scriptpubkey[NUM_SIDES];
 	u32 locktime, tx_blockheight;
+	struct channel_asset *asset;
 
 	subdaemon_setup(argc, argv);
 
@@ -3472,9 +3517,13 @@ int main(int argc, char *argv[])
 				   &static_remotekey_start[REMOTE],
 				   &option_anchor_outputs,
 				   &option_anchors_zero_fee_htlc_tx,
-				   &min_relay_feerate)) {
+				   &min_relay_feerate,
+				   &asset)) {
 		master_badmsg(WIRE_ONCHAIND_INIT, msg);
 	}
+
+	/* (Ordinary channels have none, and notleak() can't take NULL.) */
+	chan_asset = asset ? notleak(tal_steal(ctx, asset)) : NULL;
 
 	/* We need to keep tx around, but there's only one: not really a leak */
 	tal_steal(ctx, notleak(tx));

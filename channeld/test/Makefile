@@ -16,6 +16,7 @@ channeld/test/run-full_channel:			\
 	wire/fromwire.o				\
 	common/amount.o				\
 	common/autodata.o			\
+	common/channel_asset.o			\
 	common/channel_type.o			\
 	common/daemon_conn.o			\
 	common/features.o			\

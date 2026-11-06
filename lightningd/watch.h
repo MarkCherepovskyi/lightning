@@ -113,6 +113,7 @@ bool watch_scriptpubkey_(const tal_t *ctx,
 			 const u8 *scriptpubkey TAKES,
 			 const struct bitcoin_outpoint *expected_outpoint,
 			 struct amount_sat expected_amount,
+			 const u8 *expected_asset,
 			 void (*cb)(struct lightningd *ld,
 				    const struct bitcoin_tx *tx,
 				    u32 outnum,
@@ -120,9 +121,10 @@ bool watch_scriptpubkey_(const tal_t *ctx,
 				    void *),
 			 void *arg);
 
-#define watch_scriptpubkey(ctx, topo, scriptpubkey, expected_outpoint, expected_amount, cb, arg) \
+#define watch_scriptpubkey(ctx, topo, scriptpubkey, expected_outpoint, expected_amount, expected_asset, cb, arg) \
 	watch_scriptpubkey_((ctx), (topo), (scriptpubkey),		\
 			    (expected_outpoint), (expected_amount), \
+			    (expected_asset),				\
 			    typesafe_cb_preargs(void, void *,		\
 						(cb), (arg),		\
 						struct lightningd *,	\

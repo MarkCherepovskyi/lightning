@@ -26,6 +26,7 @@
 #include <common/ecdh_hsmd.h>
 #include <common/interactivetx.h>
 #include <common/key_derive.h>
+#include <common/channel_asset.h>
 #include <common/memleak.h>
 #include <common/msg_queue.h>
 #include <common/onionreply.h>
@@ -1064,13 +1065,14 @@ static struct bitcoin_signature *calc_commitsigs(const tal_t *ctx,
 						  u64 commit_index,
 						  const struct pubkey *remote_per_commit,
 						  struct bitcoin_signature *commit_sig,
+						  secp256k1_ecdsa_signature **fee_reserve_sig,
 						  struct pubkey remote_funding_pubkey)
 {
 	struct hsm_htlc *htlcs;
 	size_t i;
 	struct pubkey local_htlckey;
 	const u8 *msg;
-	struct bitcoin_signature *htlc_sigs;
+	struct bitcoin_signature *htlc_sigs, *reserve_sig;
 
 	status_debug("calc_commitsigs(%p, %p, %p, %p, %p, %d, %p, %p)",
 		     ctx, peer, txs, funding_wscript, htlc_map,
@@ -1084,13 +1086,20 @@ static struct bitcoin_signature *calc_commitsigs(const tal_t *ctx,
 								OPT_STATIC_REMOTEKEY),
 						    commit_index,
 						    htlcs,
-						    channel_feerate(peer->channel, REMOTE));
+						    channel_feerate(peer->channel, REMOTE),
+						    peer->channel->asset);
 
 	msg = hsm_req(tmpctx, take(msg));
-	if (!fromwire_hsmd_sign_tx_reply(msg, commit_sig))
+	if (!fromwire_hsmd_sign_commitment_tx_reply(tmpctx, msg, commit_sig,
+						    &reserve_sig))
 		status_failed(STATUS_FAIL_HSM_IO,
 			      "Reading sign_remote_commitment_tx reply: %s",
 			      tal_hex(tmpctx, msg));
+	/* For asset channels hsmd also signs the fee reserve input, and
+	 * that signature goes to the peer in a TLV. */
+	*fee_reserve_sig = reserve_sig
+		? tal_dup(ctx, secp256k1_ecdsa_signature, &reserve_sig->s)
+		: NULL;
 
 	status_debug("Creating commit_sig signature %"PRIu64" %s for tx %s wscript %s key %s",
 		     commit_index,
@@ -1308,6 +1317,7 @@ static u8 *send_commit_part(const tal_t *ctx,
 	htlc_sigs =
 	    calc_commitsigs(tmpctx, peer, txs, funding_wscript, htlc_map,
 			    remote_index, remote_per_commit, &commit_sig,
+			    &cs_tlv->fee_reserve_sig,
 			    remote_funding_pubkey);
 
 	if (direct_outputs[LOCAL] != NULL) {
@@ -2251,6 +2261,16 @@ static struct commitsig_info *handle_peer_commit_sig(struct peer *peer,
 				      &commit_sig))
 		status_failed(STATUS_FAIL_INTERNAL_ERROR,
 			      "Unable to set signature internally");
+
+	/* Asset channel: and their sig for the fee reserve input. */
+	if (peer->channel->asset
+	    && !check_fee_reserve_sig(txs[0], funding_wscript,
+				      &remote_funding,
+				      cs_tlv->fee_reserve_sig))
+		peer_failed_warn(peer->pps, &peer->channel_id,
+				 "Bad or missing fee_reserve_sig %"PRIu64
+				 " for tx %s",
+				 local_index, fmt_bitcoin_tx(msg, txs[0]));
 
 	if (!derive_simple_key(&peer->channel->basepoints[REMOTE].htlc,
 			       local_per_commit, &remote_htlckey))
@@ -4344,6 +4364,12 @@ static void splice_accepter(struct peer *peer, const u8 *inmsg)
 	enum peer_wire type;
 	struct tlv_tx_init_rbf_tlvs *init_rbf_tlvs;
 	struct tlv_tx_ack_rbf_tlvs *ack_rbf_tlvs;
+
+	/* Asset channels fund two outputs (common/channel_asset.h), which
+	 * splicing doesn't rebuild. */
+	if (peer->channel->asset)
+		peer_failed_warn(peer->pps, &peer->channel_id,
+				 "Asset channels cannot be spliced");
 
 	if (peer->splicing)
 		peer_failed_warn(peer->pps, &peer->channel_id, "You can't start"
@@ -7042,6 +7068,7 @@ static void init_channel(struct peer *peer)
 	struct penalty_base *pbases;
 	struct channel_type *channel_type;
 	bool found_locked_inflight;
+	struct channel_asset *asset;
 
 	assert(!(fcntl(MASTER_FD, F_GETFL) & O_NONBLOCK));
 
@@ -7102,7 +7129,8 @@ static void init_channel(struct peer *peer)
 				    &peer->dev_disable_commit,
 				    &pbases,
 				    &peer->splice_state->inflights,
-				    &peer->local_alias)) {
+				    &peer->local_alias,
+				    &asset)) {
 		master_badmsg(WIRE_CHANNELD_INIT, msg);
 	}
 
@@ -7184,6 +7212,7 @@ static void init_channel(struct peer *peer)
 					 feature_offered(peer->their_features,
 							 OPT_LARGE_CHANNELS),
 					 opener);
+	peer->channel->asset = tal_steal(peer->channel, asset);
 
 	if (!channel_force_htlcs(peer->channel,
 			 cast_const2(const struct existing_htlc **, htlcs)))

@@ -7,6 +7,7 @@
 struct amount_sat;
 struct bitcoin_tx;
 struct bitcoin_signature;
+struct channel_asset;
 struct channel_config;
 
 
@@ -18,6 +19,7 @@ bool check_config_bounds(const tal_t *ctx,
 			 const struct channel_config *remoteconf,
 			 const struct channel_config *localconf,
 			 bool option_anchors_zero_fee_htlc_tx,
+			 const struct channel_asset *asset,
 			 char **err_reason);
 
 bool anchors_negotiated(struct feature_set *our_features,

@@ -18,6 +18,7 @@ tlvtype,hsmd_dev_preinit_tlvs,warn_on_overgrind,5
 tlvdata,hsmd_dev_preinit_tlvs,warn_on_overgrind,enable,bool,
 
 #include <bitcoin/chainparams.h>
+#include <common/channel_asset.h>
 # Start the HSM.
 msgtype,hsmd_init,11
 msgdata,hsmd_init,bip32_key_version,bip32_key_version,
@@ -242,9 +243,14 @@ msgdata,hsmd_sign_commitment_tx,channel_dbid,u64,
 msgdata,hsmd_sign_commitment_tx,tx,bitcoin_tx,
 msgdata,hsmd_sign_commitment_tx,remote_funding_key,pubkey,
 msgdata,hsmd_sign_commitment_tx,commit_num,u64,
+# Asset channels: the tx also spends the L-BTC fee reserve (input 1,
+# same 2-of-2 as the funding input), which hsmd signs too.
+msgdata,hsmd_sign_commitment_tx,asset,?channel_asset,
 
+# Also the reply to hsmd_sign_remote_commitment_tx and hsmd_sign_mutual_close_tx.
 msgtype,hsmd_sign_commitment_tx_reply,105
 msgdata,hsmd_sign_commitment_tx_reply,sig,bitcoin_signature,
+msgdata,hsmd_sign_commitment_tx_reply,fee_reserve_sig,?bitcoin_signature,
 
 #include <common/htlc_wire.h> // For enum side and towire_side
 subtype,hsm_htlc
@@ -316,6 +322,7 @@ msgdata,hsmd_sign_remote_commitment_tx,commit_num,u64,
 msgdata,hsmd_sign_remote_commitment_tx,num_htlcs,u16,
 msgdata,hsmd_sign_remote_commitment_tx,htlcs,hsm_htlc,num_htlcs
 msgdata,hsmd_sign_remote_commitment_tx,feerate,u32,
+msgdata,hsmd_sign_remote_commitment_tx,asset,?channel_asset,
 
 # channeld asks HSM to sign remote HTLC tx.
 msgtype,hsmd_sign_remote_htlc_tx,20
@@ -329,6 +336,7 @@ msgdata,hsmd_sign_remote_htlc_tx,option_anchor_outputs,bool,
 msgtype,hsmd_sign_mutual_close_tx,21
 msgdata,hsmd_sign_mutual_close_tx,tx,bitcoin_tx,
 msgdata,hsmd_sign_mutual_close_tx,remote_funding_key,pubkey,
+msgdata,hsmd_sign_mutual_close_tx,asset,?channel_asset,
 
 # channeld asks HSM to sign splice tx.
 msgtype,hsmd_sign_splice_tx,29

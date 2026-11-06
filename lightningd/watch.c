@@ -33,6 +33,7 @@
 #include <bitcoin/psbt.h>
 #include <ccan/tal/str/str.h>
 #include <common/addr.h>
+#include <common/channel_asset.h>
 #include <lightningd/chaintopology.h>
 #include <lightningd/channel.h>
 #include <lightningd/lightningd.h>
@@ -322,6 +323,8 @@ struct scriptpubkeywatch {
 	struct script_with_len swl;
 	struct bitcoin_outpoint expected_outpoint;
 	struct amount_sat expected_amount;
+	/* Asset the output must be in (NULL: the chain's coin) */
+	const u8 *expected_asset;
 	void (*cb)(struct lightningd *ld,
 		   const struct bitcoin_tx *tx,
 		   u32 outnum,
@@ -377,6 +380,7 @@ bool watch_scriptpubkey_(const tal_t *ctx,
 			 const u8 *scriptpubkey TAKES,
 			 const struct bitcoin_outpoint *expected_outpoint,
 			 struct amount_sat expected_amount,
+			 const u8 *expected_asset,
 			 void (*cb)(struct lightningd *ld,
 				    const struct bitcoin_tx *tx,
 				    u32 outnum,
@@ -401,6 +405,8 @@ bool watch_scriptpubkey_(const tal_t *ctx,
 	w->swl.len = tal_bytelen(w->swl.script);
 	w->expected_outpoint = *expected_outpoint;
 	w->expected_amount = expected_amount;
+	w->expected_asset = expected_asset
+		? channel_asset_tag_dup(w, expected_asset) : NULL;
 	w->cb = cb;
 	w->arg = arg;
 	scriptpubkeywatch_hash_add(topo->scriptpubkeywatches, w);
@@ -456,10 +462,26 @@ bool watch_check_tx_outputs(const struct chain_topology *topo,
 				continue;
 			}
 			if (outnum != w->expected_outpoint.n) {
-				bad_outnum = true;
+				/* An asset channel's fee reserve is the next
+				 * output, to the same script: expected. */
+				if (!w->expected_asset
+				    || outnum != w->expected_outpoint.n + 1)
+					bad_outnum = true;
 				continue;
 			}
-			if (!amount_asset_is_main(&outasset)
+			/* An asset channel's funding is in the asset. */
+			if (w->expected_asset) {
+				if (!channel_asset_tag_eq(outasset.asset,
+							  w->expected_asset)) {
+					bad_amount = true;
+					continue;
+				}
+				if (!amount_sat_eq(amount_sat(outasset.value),
+						   w->expected_amount)) {
+					bad_amount = true;
+					continue;
+				}
+			} else if (!amount_asset_is_main(&outasset)
 			    || !amount_sat_eq(amount_asset_to_sat(&outasset), w->expected_amount)) {
 				bad_amount = true;
 				continue;
