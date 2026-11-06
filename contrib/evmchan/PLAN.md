@@ -345,3 +345,45 @@ in an environment variable) to deploy.
 - **The second independent review** found six more problems (one high: a
   missing block was treated as a fork). All are fixed, each with a regression
   test.
+
+### M3: the backend plugin (2026-11-06)
+
+- **What was built:** `evmbackend.py`.
+  - The five backend methods: reads come from the index and never wait on a
+    send.
+  - The send path of SPEC 5.3: success once the node accepts a tx, per-job
+    budgets, same-nonce replacement of re-signed txs, a tracker outside the
+    send path, and filler sends for nonce gaps.
+  - The hooks of 5.4, and the RPCs, alarms and wall-clock option check of 5.5
+    and 5.6.
+- **The scenario:** `scenario_anvil.py` runs spike S1's scenario with two
+  unmodified lightningd on anvil and the real contract. **18/18 in about 3
+  min.** The steps:
+  - deposits, open, pay and gossip;
+  - mutual close;
+  - an exit, then the contract's `withdraw` paying the ETH address;
+  - a force close with taproot sweeps;
+  - an HTLC timed out on chain and swept;
+  - refusals: a non-anchor channel, a node with regtest defaults, a peer
+    without anchors.
+- **Tests:** 172 Python, 46 Foundry.
+- **Reviews:** four fresh-agent reviews.
+  - Two had high findings, all fixed:
+    - one stuck send starved the queue;
+    - receipt polling grew without bound on the index's key;
+    - "pending" answered as failure, so CLN unreserved inputs (double
+      withdraws);
+    - untracked nonce gaps;
+    - HTLC double counting;
+    - dust deposits blocking withdraws;
+    - option minimums in blocks instead of time;
+    - secrets in tracebacks;
+    - a high-water mark that could wedge the key.
+  - SPEC is draft 5.
+- **Open:** our own outbound HTLCs rely on peers following 5.6 (SPEC open
+  question 5).
+- **For M4:**
+  - allow, or avoid by mining, the plugin's tag/lag BROKEN alarms;
+  - allow CLN's upstream CGOSSIP_CHANNEL_DEAD BROKEN line;
+  - fund node keys before start;
+  - wait on chain rather than on RPC results.

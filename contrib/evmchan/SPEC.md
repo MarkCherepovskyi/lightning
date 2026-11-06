@@ -1,6 +1,7 @@
 # EVM channels: specification
 
-Status: draft 4, 2026-11-06. Draft 4 adds the log hash (4.1, 5.2), after M2's review.
+Status: draft 5, 2026-11-06. Draft 5 changes the send path (5.3), the hooks (5.4) and
+the option minimums (5.6), after M3's review. Draft 4 added the log hash (4.1, 5.2).
 Draft 3 was dated 2026-11-05. Draft 2 was revised after an adversarial review
 (the changes are in section 11). Draft 3 fixes the readings that M1's contract
 and the independent Python reference had to choose (end of 4.3.7, and 4.5). It
@@ -511,16 +512,58 @@ using pyln's async method replies.
        - M1 measured a P2TR input at about 35k gas and a P2WPKH input at about
          43k. So a wallet tx with more than roughly 300 inputs can never be
          mined here, though Bitcoin would allow it.
-       - The `rpc_command` hook of 5.4 also rejects `withdraw`, `fundpsbt`,
-         `utxopsbt` and `fundchannel` calls that would spend more than 200 UTXOs.
-  4. Sign `submit` as an EIP-1559 tx from the node key, with the nonce from
-     `eth_getTransactionCount(pending)`, and send it.
-     - Wait for the receipt up to the time limit. If it arrives, ingest it
-       (5.2) and return success or failure.
-     - If it doesn't, return failure ("pending") and keep tracking it. If it is
-       still pending after another `INTERVAL`, replace it with the same nonce at
-       1.25× the fees.
-  5. Sends are serialized per node key.
+       - There is no pre-check on UTXO counts: anyone could defeat one with dust
+         deposits, and this step gives the same answer without spending gas.
+  4. **Persist, sign and send.**
+     - Record the send (txid, nonce, and the calldata, which a replacement
+       needs; no EVM signatures) in `evm-pending.json` *before* sending. The
+       calldata holds only the Bitcoin tx, which is public once sent.
+     - Sign `submit` as an EIP-1559 tx from the node key, with the next nonce
+       the plugin hasn't used (it keeps a high-water mark, starting from
+       `eth_getTransactionCount(pending)`).
+     - Send it with `eth_sendRawTransaction`.
+     - **Once the node accepts it, return success**, as bitcoind does when a tx
+       enters its mempool.
+     - Failure means only that the tx was not handed to the node. CLN reads
+       failure as "unsent": `sendpsbt` unreserves its inputs. So a tx the node
+       accepted MUST NOT be reported as failed.
+  5. **The same tx again.** If CLN rebroadcasts a txid that is already pending,
+     return success at once without sending. That includes a version since
+     replaced by a re-signed one (step 6).
+  6. **A re-signed version.** If a new tx spends any prevout of a pending one
+     (onchaind refreshing a sweep), it replaces the pending one *at the same
+     nonce* with the new calldata, at ≥1.25× the fees. It does not take a new
+     nonce: a new nonce could never overtake the old one.
+  7. **Tracking runs outside the send path**, about once per EVM block:
+     - First one `eth_getTransactionCount(latest)`. Only for tracked nonces
+       below it, look up receipts, newest replacement first, stopping at the
+       first hit.
+     - Ingest mined receipts (5.2). A revert is logged at BROKEN level, and CLN
+       will rebroadcast.
+     - Replace a tx still pending after `INTERVAL` at the same nonce, at 1.25×
+       the fees. There is no fee cap other than the key's balance.
+     - If `latest < pending` and a nonce in between isn't tracked (a crash
+       between send and persist, a lost pending file, a proxy that lied), send
+       a 0-value self-send at that nonce with bumped fees, so the key can't be
+       wedged.
+  8. **Queueing and timing.** Sends are serialized per node key on one worker.
+     - Each job gets its own time budget, counted from when it is dequeued, so a
+       slow job can't starve the ones queued behind it. A penalty queued behind
+       a stuck tx still goes out. The budget is
+       `min(call time + 2 × INTERVAL, dequeue time + the job's limit)`.
+     - Answering failure and sending exclude each other. Once a tx is committed
+       to be sent, the deadline answers success. Once it is refused, it is
+       never answered success.
+     - `sendrawtransaction` returns within `2 × INTERVAL` seconds; if the budget
+       runs out before step 4, it returns failure and the job is not sent.
+     - Steps 1–3 cost the node no gas. Only step 4 sends.
+  9. **Startup.** `init` retries the EVM node for 60 s, then exits (lightningd
+     ignores a backend's init errors, so the plugin must exit itself). Sends
+     tracked in `evm-pending.json` resume.
+  10. **Error messages** are the contract error's name and integer argument, for
+      example `NonFinal` or `BadSignature(0)`. They never contain node reply
+      text or a traceback: exceptions are turned into answers only outside the
+      handler that caught them.
 
 The plugin MUST NOT return a JSON-RPC error from these methods: lightningd
 treats that as fatal.
@@ -545,10 +588,24 @@ treats that as fatal.
   Such a funding tx would never get mined.
 - **Splicing** has no hook to check the peer's inputs. Version 1 runs with
   splicing off (section 5.6); open question 4.
-- **HTLC count.** The `htlc_accepted` hook fails a forward if its outgoing
-  channel already has 30 HTLCs pending, so no commitment can exceed the gas cap
-  (4.5). `openchannel`/`openchannel2` reject peers whose `max_accepted_htlcs`
-  is above 30.
+- **HTLC count.**
+  - The `htlc_accepted` hook fails a forward with `temporary_channel_failure`
+    if its outgoing channel already has 30 outgoing HTLCs. It counts what
+    `listpeerchannels` shows, plus forwards it approved that don't show there
+    yet, matched by payment hash, so nothing is counted twice.
+  - `openchannel`/`openchannel2` reject peers whose `max_accepted_htlcs` is
+    above 30.
+  - **Limit:** channels we open, and our own payments (which don't pass through
+    `htlc_accepted`), rely on the peer also following 5.6. See open question 5.
+    The gas cap holds up to about 390 commitment outputs (M3 measured ~30k gas
+    per output), so it takes a peer allowing hundreds of HTLCs to break it.
+- **Leases and assets** are refused on outbound commands too: `request_amt`,
+  `compact_lease`, and the asset-channel parameters of `fundchannel_start`.
+- **Dual funding** checks every PSBT input, not only the peer's, in
+  `openchannel_init`/`_update`/`_signed` and in the `openchannel2*` hooks.
+- **Before the option check has run, or while the ETH balance is unknown,** every
+  open is refused.
+- `openchannel` and `openchannel2` are registered with `before=['funder']`.
 
 ### 5.5 Its own RPCs and alarms
 
@@ -574,17 +631,22 @@ HTLC only `(cltv-delta + 1)/2` blocks before its expiry (`peer_htlcs.c`). With a
 lag of `L` virtual blocks, penalties and HTLC claims need margins well above
 `2L`, plus time to survive an outage of the EVM chain (3.1).
 
-**Every node on this network MUST run with:**
+**Every node on this network MUST run with these, in wall-clock time.** The
+block values are the time divided by `INTERVAL`, rounded up.
 
-| Option | anvil (INTERVAL 2) | Base Sepolia (INTERVAL 60) | Why |
+| Option | Public chains | anvil (chain id 31337 only) | Why |
 |---|---|---|---|
-| `--watchtime-blocks` | 40 | 1440 (1 day) | the to_self_delay we demand: time to penalise a cheater |
-| `--cltv-delta` | 40 | 144 (2.4 h) | half of it is our on-chain margin for HTLCs |
-| `--cltv-final` | 40 | 144 | the same for payments we receive |
-| `--funding-confirms` | 1 | 3 | depth before using a channel |
-| `--max-concurrent-htlcs` | 30 | 30 | the gas cap (4.5) |
-| `--developer --dev-force-features=-63` | yes | yes | splicing off (5.4) |
-| `--developer --dev-bitcoind-poll=1` | yes | no (CLN's 30 s poll is half a block) | CLN polls the backend every 30 s otherwise |
+| `--watchtime-blocks` | ≥ 24 h | ≥ 80 s (40 blocks at INTERVAL 2) | the to_self_delay we demand: time to penalise a cheater |
+| `--cltv-delta` | ≥ 2.4 h | ≥ 80 s | half of it is our on-chain margin for HTLCs |
+| `--cltv-final` | ≥ 2.4 h | ≥ 80 s | the same for payments we receive |
+| `--funding-confirms` | ≥ 3 | ≥ 1 | depth before using a channel |
+| `--max-concurrent-htlcs` | ≤ 30 | ≤ 30 | the gas cap (4.5) |
+| `--developer --dev-force-features=-63` | yes | yes | splicing off (5.4); checked from `getinfo`'s feature bits 62/63 |
+| CLN's backend poll | ≤ max(1 s, INTERVAL/2) | `--dev-bitcoind-poll=1` | CLN polls the backend every 30 s by default, which is fine for INTERVAL ≥ 60 |
+
+The anvil column applies only when the chain id is 31337. The minimums are in
+time, not blocks, so a chain with a short INTERVAL can't pass with an 80-second
+penalty window.
 
 The plugin checks these after `init`, once lightningd answers `listconfigs`,
 from a background thread.
@@ -706,6 +768,13 @@ Each needs its tests green and your review before the next.
 4. **Splicing.** CLN has no hook to inspect a peer's splice inputs. Options:
    keep splicing off; or check in a `commitment_revocation` or custom-message
    path; or propose a hook upstream.
+5. **Our own HTLCs on channels we open.** The peer's `max_accepted_htlcs`
+   isn't visible after an outbound open, and our own payments skip
+   `htlc_accepted`. Options:
+   - close a channel whose peer allows more than 30;
+   - gate `sendpay`, `sendonion` and `injectpaymentonion` through
+     `rpc_command`;
+   - rely on every node following 5.6, as now.
 
 ## 11. Changes from draft 1 (review)
 

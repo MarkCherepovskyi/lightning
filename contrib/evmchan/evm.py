@@ -466,8 +466,13 @@ class EvmRpc:
             obj['from'] = sender
         return obj
 
-    def estimate_gas(self, sender, to, data=b'', value=0):
-        return int(self.request('eth_estimateGas', self._callobj(to, data, value, sender)), 16)
+    def estimate_gas(self, sender, to, data=b'', value=0, block=None):
+        """block: None leaves it to the node (anvil then estimates against
+        its pool, i.e. `pending`), or a tag/number to pin it."""
+        params = [self._callobj(to, data, value, sender)]
+        if block is not None:
+            params.append(qty(block) if isinstance(block, int) else block)
+        return int(self.request('eth_estimateGas', *params), 16)
 
     def eth_call(self, to, data, block='latest', value=0, sender=None):
         """block: a tag, a number, or {'blockHash': ..., 'requireCanonical': ...} (EIP-1898)."""
