@@ -1,0 +1,5 @@
+out/
+cache/
+__pycache__/
+# written by script/gen_vectors.py from contrib/evmchan/reference/cases (tens of MB)
+test/generated/reference-*.hex
