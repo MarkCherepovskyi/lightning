@@ -310,3 +310,38 @@ in an environment variable) to deploy.
   `replay_tx_hash_lock` (`lightningd/onchain_control.c`, replay code this
   branch doesn't touch). It looks like two replays for one channel at once.
   Check it on master and report it upstream.
+
+### M2: btc.py, evm.py, the index and blocks (2026-11-06)
+
+- **What was built:**
+  - `btc.py`: byte-exact txs, coinbase, blocks and deposit txs, plus bech32 and
+    the exit address.
+  - `evm.py`: JSON-RPC, signing, ABI, chunked `eth_getLogs`, rate-limit
+    retries, and errors that carry no secrets.
+  - `evmindex.py`: the SQLite index of SPEC 5.2, draft 4.
+  - `run-anvil.sh`.
+- **Tests:** 125 Python tests, against a live anvil running the contract, plus
+  a fake adversarial node.
+  - The coinbase is checked at 37 heights against Bitcoin Core's encoding.
+  - Bitcoin's genesis block and block 100000 match.
+  - All 55 real CLN txs round-trip.
+  - Deposit txids match the contract's.
+- **The first independent review** found that the index trusted `eth_getLogs`.
+  A clamped, lagging or load-balanced node could make it drop a confirmed tx
+  for good, or fake a deep reorg. It also found these:
+  - lost progress on a failed sync;
+  - shallow reorg detection with `latest`;
+  - API-key leaks;
+  - a fatal fresh start.
+- **The fix (SPEC draft 4).**
+  - The contract keeps `txCount` and a running `logHash` of every applied tx:
+    23,478 bytes, and about 10.6k more gas per tx.
+  - The index advances the tip only on a checkpoint proven against them with
+    `eth_call` pinned to the tag block's hash (EIP-1898).
+  - Rows are deleted only on a confirmed fork, and repairs are staged and
+    proven.
+  - Stale backends are skipped, progress is committed per range, and
+    rate-limited calls are retried.
+- **The second independent review** found six more problems (one high: a
+  missing block was treated as a fork). All are fixed, each with a regression
+  test.

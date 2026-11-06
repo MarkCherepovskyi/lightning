@@ -41,6 +41,12 @@ contract UtxoChain {
     /// Exits and fees, in wei, pulled with `withdraw`.
     mapping(address => uint256) public withdrawable;
     uint256 public depositNonce;
+    /// The number of TxApplied events emitted so far, and a hash chain over
+    /// them: logHash = keccak256(logHash, uint32 height, txid) per event, in
+    /// order (SPEC 4.1). Read at a block (EIP-1898), they let an index prove
+    /// it has every log up to that block.
+    uint64 public txCount;
+    bytes32 public logHash;
 
     /// @param interval seconds per virtual block (2 on anvil, 60 on Base Sepolia)
     constructor(uint256 interval) {
@@ -80,6 +86,7 @@ contract UtxoChain {
         txid = sha256(abi.encodePacked(sha256(rawTx)));
         depositNonce += 1;
         utxo[utxoKey(txid, 0)] = _commitment(amount, scriptPubKey, h);
+        _chainLog(h, txid);
         emit TxApplied(h, txid, rawTx);
     }
 
@@ -96,6 +103,7 @@ contract UtxoChain {
         txid = t.txid;
         _createOutputs(rawTx, t, h);
         if (fee != 0) withdrawable[msg.sender] += fee * SAT;
+        _chainLog(h, txid);
         emit TxApplied(h, txid, rawTx);
     }
 
@@ -168,6 +176,13 @@ contract UtxoChain {
     }
 
     // ------------------------------------------------------------ helpers
+
+    /// SPEC 4.1/4.4: count the event and extend the log hash, just before
+    /// every TxApplied.
+    function _chainLog(uint32 h, bytes32 txid) internal {
+        txCount += 1;
+        logHash = keccak256(abi.encodePacked(logHash, h, txid));
+    }
 
     function _commitment(uint64 amount, bytes calldata scriptPubKey, uint32 h) internal pure returns (bytes32) {
         return keccak256(abi.encodePacked(amount, scriptPubKey, h));

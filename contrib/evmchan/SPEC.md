@@ -1,6 +1,7 @@
 # EVM channels: specification
 
-Status: draft 3, 2026-11-05. Draft 2 was revised after an adversarial review
+Status: draft 4, 2026-11-06. Draft 4 adds the log hash (4.1, 5.2), after M2's review.
+Draft 3 was dated 2026-11-05. Draft 2 was revised after an adversarial review
 (the changes are in section 11). Draft 3 fixes the readings that M1's contract
 and the independent Python reference had to choose (end of 4.3.7, and 4.5). It
 is what the implementation follows. The reasoning and the spike results behind it are in `PLAN.md`.
@@ -139,6 +140,15 @@ Virtual block `h` is:
 - **`mapping(address => uint256) withdrawable`** holds exits and fees, in wei.
 - **Immutables:** `GENESIS_TIME`, `INTERVAL`, `DEPLOY_BLOCK`.
 - **`depositNonce`.**
+- **`txCount`** (`uint64`) and **`logHash`** (`bytes32`, starts at zero). For
+  every `TxApplied` the contract emits, from deposits and submits alike, in
+  order: `txCount += 1` and
+  `logHash = keccak256(abi.encodePacked(logHash, height, txid))`.
+  - They let an index prove it has every log up to a block. Read with
+    `eth_call` pinned to that block's hash (EIP-1898), they must equal the
+    index's own count and hash of its rows up to that block (5.2).
+  - The cost, measured in M2, is about 10.6k gas per tx (two slots), and 44.8k
+    for the very first tx. Packing both into one slot would halve it (section 9).
 - **Invariant:** `address(this).balance` ≥ the sum of all UTXO amounts × 10^10
   + the sum of `withdrawable`.
 
@@ -156,6 +166,8 @@ function height() external view returns (uint32);
 function isUnspent(bytes32 txid, uint32 vout, uint64 amount, bytes calldata scriptPubKey,
                    uint32 height) external view returns (bool);
 function utxoKey(bytes32 txid, uint32 vout) external pure returns (bytes32);
+function txCount() external view returns (uint64);
+function logHash() external view returns (bytes32);
 ```
 
 - **`deposit`**
@@ -335,6 +347,7 @@ listed is invalid.
   - **OP_RETURN** (first byte `6a`): no UTXO.
   - **Anything else:** store `utxo[key(txid, i)] = commitment(amount, script, h)`.
 - **Fee:** add `fee × 10^10` to `withdrawable[msg.sender]`.
+- **Log hash:** update `txCount` and `logHash` (4.1).
 - **Event:** emit `TxApplied(h, txid, rawTx)`.
 
 ### 4.5 Size, gas, structure
@@ -387,7 +400,7 @@ lightningd --network=regtest --disable-plugin=bcli \
     its own `DEPLOYER_PRIVATE_KEY`.
 - **`evm-confirm`:** `safe` (default) or `latest`.
 - **`evm-poll`:** seconds between polls.
-  - Default 30, which suits Infura's free tier.
+  - Default 45, which suits Infura's free tier (5.2).
   - Use 1 on anvil.
 - **`evm-min-balance`:** the ETH below which the plugin refuses new channels and
   logs at BROKEN level. Default 0.01 ETH.
@@ -409,15 +422,49 @@ lightningd waits on the backend plugin at startup, as it does with bcli.
   - Ranges start at 2,000 blocks and are split in half whenever the node
     reports too many results (Infura caps at 10,000).
   - It does not use log subscriptions, which Infura charges per block.
-  - At a 30 s poll that is about 1.2M Infura credits per node per day, under
-    the 3M free tier for two nodes.
-- **Reorgs:**
-  - each poll re-reads logs from the last tag block forward;
-  - it drops rows whose EVM block hash no longer matches;
-  - blocks are rebuilt from what remains (section 3.4).
+  - With the two proof `eth_call`s (Completeness, below), a poll is about 575
+    Infura credits. At a 45 s poll that is about 1.1M credits per node per day,
+    so two nodes fit in the 3M free tier.
+- **Completeness: the tip advances only on proof.** A node's `eth_getLogs` can
+  silently return too little: it may clamp `toBlock` to its own head, lag in
+  indexing, or answer from another backend behind a load balancer. So:
+  - after applying logs, the plugin reads `txCount` and `logHash` with
+    `eth_call` pinned to the tag block's hash;
+  - only if they equal the count and hash of the indexed rows in EVM blocks up
+    to that block (in EVM order) does it record a **checkpoint**: block number,
+    block hash, count, hash;
+  - the reported tip advances only to the candidate of the newest checkpoint.
+- **On a mismatch:**
+  - the plugin re-reads from the newest checkpoint whose block hash still
+    matches the node's block at that number, walking back older checkpoints if
+    needed;
+  - it re-applies those logs and checks again;
+  - if it still mismatches, it keeps the tip, logs at BROKEN level, and retries
+    next poll.
+- **Rows are deleted only on a confirmed fork.** That means the node's block
+  at the row's number now has another hash, or a re-read from a still-valid
+  checkpoint no longer returns the row. Never just because a reply lacked it.
+- **Stale backend.** A `latest` or tag below the previous poll's is a stale
+  backend, not a reorg. The poll is skipped.
+- **Reorgs:** each poll re-reads logs from the newest checkpoint forward, so
+  reorgs above it, of any depth, are caught. Blocks are rebuilt from what
+  remains (section 3.4).
+- **Progress:** state is committed per log range, so a failed sync resumes
+  where it stopped. Rate-limit errors (HTTP 429, or -32005 that isn't "too many
+  results") are retried with exponential backoff.
+- **Undecodable events.** An event whose raw tx btc.py can't parse, or whose
+  txid doesn't match its raw tx, is logged at BROKEN level.
+  - It still counts in the log hash.
+  - It is left out of served blocks, so that no node serves CLN a block CLN
+    can't parse.
+  - It never stops the index.
+- **Secrets:** errors and logs MUST NOT contain the RPC URL or any part of a
+  response body. Only the method name and the error's type and code are
+  allowed.
 - **Our own submits:** after a successful submit the plugin MUST add the
   receipt's `TxApplied` log to the index at once, before the next poll, marked
-  with its EVM block. This is so children of that tx find their prevouts:
+  with its EVM block. It replaces an existing row only if the receipt's block
+  hash is the node's block at that number. This is so children of that tx find their prevouts:
   anchor CPFP, and HTLC txs re-signed with new wallet inputs. It also makes
   "already in chain" and `getutxout` correct straight away.
 
@@ -429,8 +476,13 @@ lightningd waits on the backend plugin at startup, as it does with bcli.
 using pyln's async method replies.
 
 - **`getchaininfo`:** `{chain: "regtest", headercount: tip, blockcount: tip,
-  ibd: false}`. Until the first index sync after startup is done, it reports
-  `ibd: true`.
+  ibd: false}`.
+  - Until the first sync after startup has reached a checkpoint, it reports
+    `ibd: true`, with `headercount` = the candidate tip from a live read of the
+    tag, and `blockcount` = the tip so far.
+  - lightningd checks `headercount` against its own height before it looks at
+    `ibd`. A new or deleted index file would otherwise report 0 and make it
+    exit ("gone backwards", `chaintopology.c:1543`).
 - **`getrawblockbyheight h`:** for h ≤ tip, the block from 3.2 with its hash;
   above the tip, `{blockhash: null, block: null}`.
 - **`getutxout txid vout`:**
@@ -554,7 +606,7 @@ from a background thread.
   - RPC `https://base-sepolia.infura.io/v3/${INFURA_API_KEY}`;
   - deploy with `DEPLOYER_PRIVATE_KEY`, funded from a faucet;
   - nodes have their own key files, funded from the deployer;
-  - `INTERVAL` 60, `evm-confirm=safe`, `evm-poll` 30.
+  - `INTERVAL` 60, `evm-confirm=safe`, `evm-poll` 45.
 - **OP Sepolia** is the fallback; the same settings work.
 
 ## 7. Tests
@@ -635,7 +687,8 @@ Each needs its tests green and your review before the next.
 - **Splicing**, with a check of the peer's splice inputs (open question 4).
 - **Gas:** hashing slices of the calldata instead of re-serializing, which
   spike S3 shows is a third of the cost; optional hints, to save the modexp and
-  second `ecrecover` calls.
+  second `ecrecover` calls; `txCount` and `logHash` packed into one slot,
+  saving about 5k per tx.
 - **Before real value:** an audit, and mainnet.
 
 ## 10. Open questions
