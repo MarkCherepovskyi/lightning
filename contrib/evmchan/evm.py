@@ -3,9 +3,11 @@
 JSON-RPC client over urllib, just enough ABI (static types, bytes, string,
 dynamic arrays and tuples) and eth_getLogs with adaptive range splitting.
 Standard library + coincurve. From spike S6 (spikes/s6-pysigner)."""
+import collections
 import itertools
 import json
 import re
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -369,6 +371,8 @@ class EvmRpc:
 
     def __init__(self, url, timeout=60):
         self.url, self.timeout, self._ids, self._chain_id = url, timeout, itertools.count(1), None
+        self.calls = collections.Counter()      # HTTP requests by method (for credit accounting)
+        self._calls_lock = threading.Lock()
 
     def call(self, method, *params):
         """One JSON-RPC call; raises EvmError on any failure. Safe to call from
@@ -376,6 +380,8 @@ class EvmRpc:
         itertools.count is atomic under the GIL)."""
         req = json.dumps({'jsonrpc': '2.0', 'id': next(self._ids), 'method': method,
                           'params': list(params)}).encode()
+        with self._calls_lock:
+            self.calls[method] += 1
         status = None
         try:
             with urllib.request.urlopen(urllib.request.Request(

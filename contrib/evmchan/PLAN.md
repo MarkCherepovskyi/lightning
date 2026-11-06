@@ -454,3 +454,84 @@ in an environment variable) to deploy.
     `_changed` always refuses first.
   - No test covers the 30-HTLC cap, pending sends resuming after a restart,
     or a send in flight during an outage.
+
+### M5: Base Sepolia (2026-11-06)
+
+- **Setup:**
+  - The deployer key was made locally and funded from a faucet. The faucet
+    paid on Ethereum Sepolia, so 0.15 ETH went over Base's L1StandardBridge;
+    it arrived in about 5 min.
+  - UtxoChain is at `0xB8203517Ee8718d59b93d9E7c8F6Ee55BB3a940E`, INTERVAL 60.
+    Deploying cost about 0.00003 ETH.
+  - The source is verified as an exact match on Blockscout
+    (base-sepolia.blockscout.com) and Sourcify, but not on Basescan.
+  - Infura is reached through `${INFURA_API_KEY}` in `--evm-rpc`, filled from
+    the environment. Neither secret is written to a file.
+- **`smoke_base_sepolia.py`:** two unmodified lightningd on the plugin, with
+  the 5.6 public-chain options (1440/144/144 blocks, 3 confirmations).
+  - It runs: fund the node keys, start, deposit (P2TR), open, pay both ways,
+    gossip, mutual close, exit and withdraw, then refund the ETH to the
+    deployer.
+  - `--cleanup DIR` frees a failed run's nodes: it closes their channels,
+    exits their coins and refunds their ETH.
+- **Result:** passed in 17 min, with no BROKEN lines.
+
+  | Step | Time |
+  |---|---|
+  | deposits confirmed | 205 s |
+  | channel normal after 3 confirmations | 360 s |
+  | two payments | 5 s |
+  | gossip after 6 confirmations | 201 s |
+  | close output in the wallet | 186 s |
+  | exits and withdraws | 29 s |
+
+  The whole run cost the deployer about 0.001 ETH, most of it 25k-sat
+  emergency reserves left in the wallets (below).
+- **Routing and gossip (`smoke_route4.py`):** four nodes in a line,
+  A–B–C–D, one 200k-sat channel per hop, each node connected only to its
+  neighbours. Passed in 22 min, with no BROKEN lines.
+  - The three opens ran at once; all three were normal after 338 s, with
+    their funding txs in one block.
+  - Every node saw 3 channels × 2 directions and all 4 nodes 330 s later.
+    D learned A–B only through C and B, and verified its funding output with
+    its own `getutxout`.
+  - askrene routed A→B→C→D. A paid D 20,000 sat (fee 402 msat) and D paid A
+    5,000 sat back. B and C each settled both forwards and earned 252 msat
+    each.
+  - All three channels closed mutually, and the coins exited and were
+    withdrawn.
+  - Credits were 1.70–2.08M/day per node, the same problem as below.
+- **The lag `L`:** `safe` trailed by 46–132 s, which is 2.5–4.5 virtual
+  blocks. `finalized` trailed by about 19 min. The 5.6 margins (2.4 h, 24 h)
+  are about 30× `L`.
+- **Infura credits:** too high. Each node used about 1.85M credits/day:
+  - 21.9k and 20.8k credits in 0.28 h, priced at docs.infura.io's per-method
+    costs;
+  - that is about 62% of the free tier's 3M/day per node, so two nodes on
+    one key would go over.
+  - Per 45 s poll: `eth_getLogs` 255, two `eth_getBlockByNumber` 160, two
+    `eth_call` for the checkpoint 160.
+  - On top of that, the send tracker reads the nonce about every 20 s even
+    with nothing pending, about 330k/day.
+  - Fix proposed below; not done yet.
+- **Findings:**
+  - **Height 0 lasts one INTERVAL after deploy** (`TooEarly`). Nothing can be
+    deposited in the first minute; the script now waits for height 1.
+  - **CLN's `min-emergency-msat`:** with anchor channels, `withdraw all`
+    keeps 25,000 sat in the wallet until the closed channel is forgotten
+    (about 100 blocks). For now, `--cleanup` can sweep those reserves later.
+  - **Two script races,** both fixed:
+    - B paid before the A→B HTLC was irrevocably removed; the script now
+      waits on `spendable_msat`;
+    - the refund ran after a failed run, leaving nodes without gas to close;
+      the refund now runs only after a pass.
+- **Proposed credit fix:**
+  1. Read the tag block's `(txCount, logHash)` first, and skip
+     `eth_getLogs` when they equal the last proven checkpoint. Logs above
+     `safe` are then fetched once they reach it, which costs nothing, since
+     the tip only moves at checkpoints anyway.
+  2. Read the nonce only while a send is pending, or while a mined send is
+     still above the tag (the reorg watch).
+  3. `evm-poll` 60 on Base Sepolia.
+
+  Estimate when idle: about 0.3–0.45M/day per node.

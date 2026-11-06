@@ -561,6 +561,9 @@ def test_deposit_withdraw_status(chain, backend):
               'lag', 'pending_sends', 'alarms', 'opens_refused'):
         assert k in s
     assert s['withdrawable_wei'] == 0 and s['pending_sends'] == [] and s['opens_refused'] is None
+    # Every HTTP request is counted by method (credit accounting, M5).
+    assert s['rpc_calls'].get('eth_sendRawTransaction', 0) >= 3 and s['rpc_calls'].get('eth_call', 0) >= 1
+    assert backend.status()['rpc_calls']['eth_getBalance'] > s['rpc_calls']['eth_getBalance']
     assert backend.exitaddr(backend.address)['address'].startswith('bcrt1s')
 
 

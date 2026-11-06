@@ -690,7 +690,11 @@ from a background thread.
   - RPC `https://base-sepolia.infura.io/v3/${INFURA_API_KEY}`;
   - deploy with `DEPLOYER_PRIVATE_KEY`, funded from a faucet;
   - nodes have their own key files, funded from the deployer;
-  - `INTERVAL` 60, `evm-confirm=safe`, `evm-poll` 45.
+  - `INTERVAL` 60, `evm-confirm=safe`, `evm-poll` 45;
+  - height 0 lasts the first `INTERVAL` after deploy, and nothing applies
+    there (`TooEarly`);
+  - M5's deployment: `0xB8203517Ee8718d59b93d9E7c8F6Ee55BB3a940E`. `safe`
+    trails by 46–132 s (2.5–4.5 blocks).
 - **OP Sepolia** is the fallback; the same settings work.
 
 ## 7. Tests
@@ -801,6 +805,10 @@ Each needs its tests green and your review before the next.
    - gate `sendpay`, `sendonion` and `injectpaymentonion` through
      `rpc_command`;
    - rely on every node following 5.6, as now.
+6. **Infura credits (M5).** Measured at about 1.85M/day per node with
+   `evm-poll` 45, which is too close to the free tier's 3M/day. PLAN M5
+   proposes skipping `eth_getLogs` while the tag's `(txCount, logHash)` is
+   unchanged, and reading the nonce only while sends are pending.
 
 ## 11. Changes from draft 1 (review)
 

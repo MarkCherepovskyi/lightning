@@ -737,6 +737,7 @@ class Backend:
         self.balance_at = 0.0
         self.balance_dirty = True
         self.alarms = {}         # name -> {'since', 'logged', 'message'}
+        self.started_at = time.time()   # rpc_calls in evm-status count from here
         self.sync_error_since = None
         self.last_sync_error = None
         self.tag_seen = None     # (tag block number, time.time() when it changed)
@@ -2061,6 +2062,12 @@ class Backend:
         out['alarms'] = {k: v['message'] for k, v in self.alarms.items()}
         if self.sync_error_since is not None:
             out['sync_error'] = self.last_sync_error
+        calls = collections.Counter()
+        for r in {id(r): r for r in (self.rpc, self.srpc) if hasattr(r, 'calls')}.values():
+            with r._calls_lock:
+                calls.update(r.calls)
+        out['rpc_calls'] = dict(sorted(calls.items()))
+        out['rpc_calls_since'] = self.started_at
         out['options_checked'] = self.options_checked
         out['option_problems'] = list(self.option_problems)
         out['opens_refused'] = self.open_refusal()
