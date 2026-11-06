@@ -1436,3 +1436,32 @@ def test_sends_seen_mined_survive_a_restart(tmp_path):
     assert list(b2.pending) == [0] and b2.pending[0].kind == 'submit'
     assert b2.pending[0].hash_txid[b2.srpc.sent[-1]] == tx.txid_hex() and len(b2.srpc.sent) == 1
     assert not any('self-send' in m for m in b2._log.at('unusual'))
+
+
+def test_idle_tracker_reads_the_nonce_only_while_a_send_is_exposed(tmp_path):
+    """M5 (Infura credits): idle, the tracker reads the nonce each poll only
+    while a send we saw mined is above the tag block (a reorg could take its
+    nonce back); otherwise only the gap check every IDLE_GAP_POLLS polls."""
+    b = offline_backend(tmp_path)
+
+    class Ix:
+        tb = None
+
+        def tag_block(self):
+            return self.tb
+    b.ix = Ix()
+    assert not b._reorg_exposed()                       # nothing mined
+    p = eb.Pending('submit', 'aa' * 32, 3, 100_000, b.contract, b'', 0, 1, 10, '0x' + '11' * 32)
+    p.mined_block = 120
+    b.recent[3] = p
+    assert b._reorg_exposed()                           # tag unknown
+    b.ix.tb = (119, '0x' + '22' * 32, 0)
+    assert b._reorg_exposed()                           # mined above the tag
+    b.ix.tb = (120, '0x' + '22' * 32, 0)
+    assert not b._reorg_exposed()                       # the tag covers it
+    # mined_block survives a restart (evm-pending.json).
+    q = eb.Pending.from_dict(p.to_dict())
+    assert q.mined_block == 120
+    legacy = p.to_dict()
+    del legacy['mined_block']
+    assert eb.Pending.from_dict(legacy).mined_block is None

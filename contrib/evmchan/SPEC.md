@@ -401,7 +401,7 @@ lightningd --network=regtest --disable-plugin=bcli \
     its own `DEPLOYER_PRIVATE_KEY`.
 - **`evm-confirm`:** `safe` (default) or `latest`.
 - **`evm-poll`:** seconds between polls.
-  - Default 45, which suits Infura's free tier (5.2).
+  - Default 60, which suits Infura's free tier (5.2).
   - Use 1 on anvil.
 - **`evm-min-balance`:** the ETH below which the plugin refuses new channels and
   logs at BROKEN level. Default 0.01 ETH.
@@ -420,12 +420,24 @@ lightningd waits on the backend plugin at startup, as it does with bcli.
   - their spent status.
 - **Polling:** each poll is one `eth_getBlockByNumber` for the tag and one for
   `latest`, then `eth_getLogs` over the new range.
+  - **Quiet polls.** Once the index is caught up (its cursor at or past the
+    previous poll's tag block) and no repair is under way, the poll first
+    reads `logHash` with `eth_call` pinned to `latest`'s hash.
+    - `logHash` chains every applied tx. If it equals the newest
+      checkpoint's, nothing was applied from that checkpoint up to `latest`.
+      Then there are no logs to read, the cursor moves to `latest`, and the
+      checkpoint is recorded again at the new tag block with the same count
+      and hash.
+    - Otherwise the poll goes on as below.
+    - A node with a backlog reads logs first, so a rate-limited provider's
+      budget goes to making progress.
   - Ranges start at 2,000 blocks and are split in half whenever the node
     reports too many results (Infura caps at 10,000).
   - It does not use log subscriptions, which Infura charges per block.
-  - With the two proof `eth_call`s (Completeness, below), a poll is about 575
-    Infura credits. At a 45 s poll that is about 1.1M credits per node per day,
-    so two nodes fit in the 3M free tier.
+  - **Cost.** A quiet poll is 240 Infura credits: two block reads and one
+    `eth_call`. A poll with new txs is about 655: `eth_getLogs` plus three
+    `eth_call`s. At a 60 s poll an idle node used about 0.41M credits a day on
+    Base Sepolia, against 1.7–2.1M with the earlier design (PLAN M5).
 - **Completeness: the tip advances only on proof.** A node's `eth_getLogs` can
   silently return too little: it may clamp `toBlock` to its own head, lag in
   indexing, or answer from another backend behind a load balancer. So:
@@ -447,8 +459,10 @@ lightningd waits on the backend plugin at startup, as it does with bcli.
   checkpoint no longer returns the row. Never just because a reply lacked it.
 - **Stale backend.** A `latest` or tag below the previous poll's is a stale
   backend, not a reorg. The poll is skipped.
-- **Reorgs:** each poll re-reads logs from the newest checkpoint forward, so
-  reorgs above it, of any depth, are caught. Blocks are rebuilt from what
+- **Reorgs:** each poll that isn't quiet re-reads logs from the newest
+  checkpoint forward, so reorgs above it, of any depth, are caught. A quiet
+  poll is pinned to `latest`'s hash: a reorg that changed any applied tx
+  changes `logHash` there, so the poll is not quiet. Blocks are rebuilt from what
   remains (section 3.4).
 - **Progress:** state is committed per log range, so a failed sync resumes
   where it stopped. Rate-limit errors (HTTP 429, or -32005 that isn't "too many
@@ -534,7 +548,12 @@ using pyln's async method replies.
      (onchaind refreshing a sweep), it replaces the pending one *at the same
      nonce* with the new calldata, at ≥1.25× the fees. It does not take a new
      nonce: a new nonce could never overtake the old one.
-  7. **Tracking runs outside the send path**, about once per EVM block:
+  7. **Tracking runs outside the send path**, about once per EVM block while
+     a send is pending. When nothing is pending, it runs at most once per poll,
+     and only while a send we saw mined is still above the tag block (a reorg
+     could take its nonce back). Otherwise it runs every 10th poll, for the gap
+     check below, which also catches a reorg through the tag. Each run costs
+     credits (M5).
      - First one `eth_getTransactionCount(latest)`. Only for tracked nonces
        below it, look up receipts, newest replacement first, stopping at the
        first hit.
@@ -690,7 +709,7 @@ from a background thread.
   - RPC `https://base-sepolia.infura.io/v3/${INFURA_API_KEY}`;
   - deploy with `DEPLOYER_PRIVATE_KEY`, funded from a faucet;
   - nodes have their own key files, funded from the deployer;
-  - `INTERVAL` 60, `evm-confirm=safe`, `evm-poll` 45;
+  - `INTERVAL` 60, `evm-confirm=safe`, `evm-poll` 60;
   - height 0 lasts the first `INTERVAL` after deploy, and nothing applies
     there (`TooEarly`);
   - M5's deployment: `0xB8203517Ee8718d59b93d9E7c8F6Ee55BB3a940E`. `safe`
@@ -805,10 +824,10 @@ Each needs its tests green and your review before the next.
    - gate `sendpay`, `sendonion` and `injectpaymentonion` through
      `rpc_command`;
    - rely on every node following 5.6, as now.
-6. **Infura credits (M5).** Measured at about 1.85M/day per node with
-   `evm-poll` 45, which is too close to the free tier's 3M/day. PLAN M5
-   proposes skipping `eth_getLogs` while the tag's `(txCount, logHash)` is
-   unchanged, and reading the nonce only while sends are pending.
+6. **Infura credits (M5): addressed.** Measured at about 1.85M/day per node
+   with `evm-poll` 45, too close to the free tier's 3M/day. Now there are
+   quiet polls (5.2), the idle tracker reads less (5.3 step 7), and
+   `evm-poll` is 60. Re-measured in PLAN M5.
 
 ## 11. Changes from draft 1 (review)
 

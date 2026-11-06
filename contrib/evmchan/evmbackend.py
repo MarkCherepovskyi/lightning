@@ -67,6 +67,7 @@ BUMP_NUM, BUMP_DEN = 5, 4             # replacement fees: 1.25x
 FEE_ALARM_MULTIPLE = 10               # BROKEN once a replacement's fees pass 10x the first send's
 CONNECT_RETRY = 60                    # seconds init keeps trying the EVM node (bcli's default)
 RECENT_KEEP = 64                      # mined sends remembered, to re-send if a reorg takes their nonce back
+IDLE_GAP_POLLS = 10                   # idle: the nonce gap check runs every 10th poll (M5: Infura credits)
 CLN_DEFAULT_POLL = 30                 # lightningd polls the backend every 30 s without --dev-bitcoind-poll
 SUBMIT_SIG = 'submit(bytes,(uint64,bytes,uint32)[])'
 SUBMIT_TYPES = ['bytes', '(uint64,bytes,uint32)[]']
@@ -649,7 +650,7 @@ class Pending:
     is sent, so a restart keeps tracking and replacing it."""
 
     FIELDS = ('kind', 'btc_txid', 'nonce', 'gas', 'to', 'value', 'tip', 'max_fee', 'first_max_fee',
-              'hashes', 'replacements', 'outpoints', 'hash_txid', 'requeued', 'bodies')
+              'hashes', 'replacements', 'outpoints', 'hash_txid', 'requeued', 'bodies', 'mined_block')
 
     def __init__(self, kind, btc_txid, nonce, gas, to, data, value, tip, max_fee, txhash, outpoints=()):
         self.kind, self.btc_txid, self.nonce = kind, btc_txid, nonce
@@ -669,6 +670,7 @@ class Pending:
         self.replacements = 0
         self.alarmed = False
         self.requeued = False                    # tracked again after a reorg took its nonce back, not re-sent yet
+        self.mined_block = None                  # EVM block of its receipt, once mined
         self.scan_pos = 0                        # receipt lookups: next hash to try (from the newest)
         self.missing = 0
         self.missing_since = 0.0
@@ -688,6 +690,7 @@ class Pending:
         p.hashes, p.first_max_fee, p.replacements = list(d['hashes']), int(d['first_max_fee']), int(d['replacements'])
         p.hash_txid = dict(d.get('hash_txid') or {h: p.btc_txid for h in p.hashes})
         p.requeued = bool(d.get('requeued'))
+        p.mined_block = d.get('mined_block') if isinstance(d.get('mined_block'), int) else None
         if isinstance(d.get('bodies'), dict):
             p.bodies = {t: {'data': b['data'], 'outpoints': list(b['outpoints']), 'gas': int(b['gas'])}
                         for t, b in d['bodies'].items()}
@@ -1257,23 +1260,45 @@ class Backend:
 
     # --- step 7: the tracker
 
+    def _reorg_exposed(self):
+        """True while a send we saw mined is above the tag block (or the tag
+        is unknown): a reorg could still take its nonce back."""
+        tb = self.ix.tag_block() if self.ix is not None else None
+        with self._plock:
+            blocks = [p.mined_block for p in self.recent.values() if p.mined_block is not None]
+        if not blocks:
+            return False
+        return tb is None or max(blocks) > tb[0]
+
     def _tracker_loop(self):
-        last, ticks = 0.0, 0
+        last, ticks, idle_polls = 0.0, 0, IDLE_GAP_POLLS
         while not self.stop_event.is_set():
             self.stop_event.wait(self.track_tick())
             with self._plock:
                 busy = bool(self.pending)
-            # Idle, only the gap check is left: once per poll is enough.
-            if not busy and time.monotonic() - last < self.cfg.poll:
-                continue
             if self._save_dirty:
                 with self._plock:
                     self._save_pending()
+            gap_due = False
+            if not busy:
+                # Idle: at most once per poll, and only while a mined send is
+                # still exposed to a reorg, or for the gap check every
+                # IDLE_GAP_POLLS polls (a send we don't know about; a reorg
+                # through the tag). Each read costs credits (M5).
+                if time.monotonic() - last < self.cfg.poll:
+                    continue
+                last = time.monotonic()
+                idle_polls += 1
+                gap_due = idle_polls >= IDLE_GAP_POLLS
+                if not gap_due and not self._reorg_exposed():
+                    continue
+                if gap_due:
+                    idle_polls = 0
             last = time.monotonic()
             ticks += 1
             failed = None
             try:
-                self._track(check_gaps=not busy or ticks % 10 == 0)
+                self._track(check_gaps=gap_due if not busy else ticks % 10 == 0)
             except evm.EvmError as e:
                 failed = ('unusual', self.scrub(e))
             except Exception as e:           # noqa: B902
@@ -1520,6 +1545,10 @@ class Backend:
         which = p.hash_txid.get(receipt.get('transactionHash'), p.btc_txid)
         with self._plock:
             self._as_mined(p, receipt.get('transactionHash'))     # its receipt is that version's
+        try:
+            p.mined_block = int(receipt.get('blockNumber'), 16)
+        except (TypeError, ValueError):
+            p.mined_block = None
         if status == 1:
             if p.to == self.contract:
                 self.ix.add_receipt(receipt)
@@ -2087,7 +2116,7 @@ def main():
     plugin.add_option('evm-key-file', None, 'file with this node\'s ETH key (default <lightning-dir>/evm-key, '
                       'created 0600)')
     plugin.add_option('evm-confirm', 'safe', 'confirmation tag: safe or latest')
-    plugin.add_option('evm-poll', '45', 'seconds between index polls (1 on anvil)')
+    plugin.add_option('evm-poll', '60', 'seconds between index polls (1 on anvil)')
     plugin.add_option('evm-min-balance', '0.01', 'ETH below which new channels are refused')
     plugin.add_flag_option(DEV_NO_OUTBOUND_FILTER, 'tests only, needs --developer: our own channel opens skip '
                            'the rpc_command checks, so the peer\'s hooks refuse them')

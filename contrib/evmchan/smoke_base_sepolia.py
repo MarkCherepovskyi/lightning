@@ -10,7 +10,7 @@ RPC call by method (evm-status's rpc_calls), priced in Infura credits.
 
     INFURA_API_KEY=... DEPLOYER_PRIVATE_KEY=0x... \\
     PATH=<venv>/bin:$PATH PYTHONPATH=<tree>/contrib/pyln-client:<tree>/contrib/pyln-proto \\
-        python3 smoke_base_sepolia.py [--contract 0x...] [--workdir /tmp/evs] [--no-refund]
+        caffeinate -i python3 smoke_base_sepolia.py [--contract 0x...] [--workdir /tmp/evs] [--no-refund]
 
 Without --contract it deploys one (deploy.sh, INTERVAL 60) and writes its
 address to <workdir>/../evs-contract. Neither secret is written to a file or
@@ -98,7 +98,7 @@ class Node:
         self.args = [lightningd, '--network=regtest', '--lightning-dir=' + self.dir,
                      '--disable-plugin=bcli', '--plugin=' + os.path.join(HERE, 'evmbackend.py'),
                      '--evm-rpc=' + RPC_TEMPLATE, '--evm-contract=' + contract,
-                     '--evm-confirm=safe', '--evm-poll=45',
+                     '--evm-confirm=safe', '--evm-poll=60',
                      '--bind-addr=127.0.0.1:%d' % self.port, '--log-level=debug',
                      '--log-file=' + os.path.join(self.dir, 'log'), '--alias=' + name] + OPTIONS_56
         self.rpc = LightningRpc(os.path.join(self.dir, 'regtest', 'lightning-rpc'))
@@ -223,6 +223,8 @@ def main():
     ap.add_argument('--workdir', default='/tmp/evs')
     ap.add_argument('--lightningd', default=os.path.join(HERE, '../../lightningd/lightningd'))
     ap.add_argument('--no-refund', action='store_true', help='leave the coins and ETH with the nodes')
+    ap.add_argument('--idle-minutes', type=float, default=0,
+                    help='measure the credits of both nodes idle for this long, after they sync')
     ap.add_argument('--cleanup', metavar='DIR', help='close, exit and refund a failed run\'s nodes in DIR')
     args = ap.parse_args()
     key = os.environ.get('INFURA_API_KEY')
@@ -290,6 +292,19 @@ def main():
         wait_for(lambda: a.status()['current_height'] >= 1, 2 * INTERVAL + 60, 'height 1')
         sample_lag(a)
         step('both nodes start on evmbackend.py, pass the 5.6 option check and sync')
+        if args.idle_minutes:
+            before = {n.name: (time.time(), dict(n.status()['rpc_calls'])) for n in nodes}
+            time.sleep(args.idle_minutes * 60)
+            results['idle'] = {}
+            for n in nodes:
+                t0, c0 = before[n.name]
+                c1 = n.status()['rpc_calls']
+                delta = {m: c1.get(m, 0) - c0.get(m, 0) for m in c1 if c1.get(m, 0) != c0.get(m, 0)}
+                per_day = round(credits(delta) / (time.time() - t0) * 86400)
+                results['idle'][n.name] = {'calls': delta, 'credits_per_day': per_day}
+                log('{} idle: {:,} credits/day ({:.1%} of the free tier); calls {}'.format(
+                    n.name, per_day, per_day / FREE_TIER_PER_DAY, delta))
+            step('idle for {} min'.format(args.idle_minutes))
 
         p2tr = a.rpc.newaddr('p2tr')['p2tr']
         d1 = a.rpc.call('evm-deposit', {'amount': 400_000, 'address': p2tr})

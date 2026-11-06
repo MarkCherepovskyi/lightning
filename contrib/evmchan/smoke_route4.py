@@ -11,7 +11,7 @@ closed, the coins exit and the ETH goes back to the deployer.
 
     INFURA_API_KEY=... DEPLOYER_PRIVATE_KEY=0x... \\
     PATH=<venv>/bin:$PATH PYTHONPATH=<tree>/contrib/pyln-client:<tree>/contrib/pyln-proto \\
-        python3 smoke_route4.py --contract 0x... [--workdir /tmp/evr]
+        caffeinate -i python3 smoke_route4.py --contract 0x... [--workdir /tmp/evr]
 
 A failed run keeps its nodes' ETH: free it with
 `smoke_base_sepolia.py --cleanup <workdir> --contract 0x...`."""

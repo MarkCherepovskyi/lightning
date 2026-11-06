@@ -535,3 +535,26 @@ in an environment variable) to deploy.
   3. `evm-poll` 60 on Base Sepolia.
 
   Estimate when idle: about 0.3–0.45M/day per node.
+- **The credit fix, done and re-measured.**
+  - **Quiet polls (SPEC 5.2):** once caught up, a poll reads `logHash` at
+    `latest`. If it equals the newest checkpoint's, `eth_getLogs` and
+    `txCount` are skipped.
+  - **Idle tracker:** it reads the nonce only while a mined send is above
+    the tag, or every 10th poll.
+  - **`evm-poll` 60.**
+  - **Unit tests:** 185 pass; one rate-limit test was updated, since a
+    caught-up poll no longer calls `eth_getLogs`.
+  - **anvil suite:** 22 passed, 1 xfailed.
+- **Re-measured on Base Sepolia** (`smoke_base_sepolia.py --idle-minutes 10`,
+  then the full cycle; passed, with no BROKEN lines):
+  - **Idle:** 9 polls of about 284 credits each:
+    - 2 block reads and 1 `eth_call` per poll;
+    - plus 2 balance reads and 2 nonce reads in the whole window.
+  - At one poll a minute that is about **0.41M/day per node (14% of the free
+    tier)**, against 1.85M before, so about 7 idle nodes fit one free key.
+  - **Whole run** (10 min idle plus a full channel cycle): about
+    1.1–1.3M/day per node. Each poll with new txs still reads logs and proves
+    them, as it should.
+  - The Mac slept for 8 min during the idle wait, so these rates are
+    computed over the awake time. Run the smoke scripts under
+    `caffeinate -i`.

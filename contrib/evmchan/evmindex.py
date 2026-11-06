@@ -453,13 +453,28 @@ class Index:
                 self._set_meta('cursor', last)
         return added, dropped
 
-    def _contract_state(self, tagb):
-        """(txCount, logHash) at the tag block, pinned to its hash (EIP-1898);
-        None if the tag is below DEPLOY_BLOCK or the node can't say."""
-        if _int(tagb['number']) < self.deploy_block:
-            return None
+    def _contract_state(self, tagb, latestb=None):
+        """((txCount, logHash) at the tag block, pinned to its hash
+        (EIP-1898), quiet). The state is None if the tag is below DEPLOY_BLOCK
+        or the node can't say. With latestb, logHash is first read at the
+        latest block (pinned to its hash): it chains every applied tx, so if
+        it equals the newest checkpoint's (and no repair is under way),
+        nothing was applied from that checkpoint up to latest, the tag's
+        state is the checkpoint's, and quiet is True: one eth_call."""
+        tag_n = _int(tagb['number'])
+        if tag_n < self.deploy_block:
+            return None, False
         at = {'blockHash': tagb['hash'], 'requireCanonical': True}
+        with self._lock:
+            _, cp_count, cp_hash = self._base_checkpoint(tag_n)
+            calm = self._meta('repair', REPAIR_NONE) == REPAIR_NONE and self._meta('cursor', -1) >= 0
         try:
+            if latestb is not None and calm:
+                at_latest = {'blockHash': latestb['hash'], 'requireCanonical': True}
+                newest = evm.abi_decode(['bytes32'], self.rpc.eth_call(
+                    self.contract, evm.selector('logHash()'), at_latest))[0]
+                if bytes(newest) == bytes(cp_hash):
+                    return (cp_count, bytes(cp_hash)), True
             count = self._read_const('txCount', at)
             loghash = evm.abi_decode(['bytes32'], self.rpc.eth_call(
                 self.contract, evm.selector('logHash()'), at))[0]
@@ -467,11 +482,11 @@ class Index:
             if e.rate_limited:
                 raise
             self.log('unusual', 'contract state at the {} block not readable: {}'.format(self.tag, e))
-            return None
+            return None, False
         except ValueError:
             self.log('unusual', 'contract state at the {} block: bad reply to eth_call'.format(self.tag))
-            return None
-        return count, loghash
+            return None, False
+        return (count, loghash), False
 
     def _base_checkpoint(self, upto):
         """(number, count, loghash) of the newest checkpoint <= upto, or the
@@ -699,8 +714,24 @@ class Index:
             self._repaired = (0, 0)
             with self._lock, self._tx():
                 self._set_meta('polls', self._meta('polls', 0) + 1)
-            added, dropped = self._scan(lat_n)
-            state = self._contract_state(tagb)
+            with self._lock:
+                caught_up = 0 <= last_tag <= self._meta('cursor', -1)
+            if caught_up:
+                # Nothing applied anywhere after the newest checkpoint (up to
+                # latest): no logs to read, which saves the poll's eth_getLogs
+                # (M5: Infura credits). Only once caught up: a backlog is
+                # read first, so a rate-limited provider's budget goes to
+                # making progress.
+                state, quiet = self._contract_state(tagb, latest)
+                added, dropped = (0, 0) if quiet else self._scan(lat_n)
+            else:
+                added, dropped = self._scan(lat_n)
+                state, quiet = self._contract_state(tagb, None)
+            if quiet:
+                # logHash at latest proves there are no logs up to it.
+                with self._lock, self._tx():
+                    self._set_meta('quiet_polls', self._meta('quiet_polls', 0) + 1)
+                    self._set_meta('cursor', max(self._meta('cursor', -1), lat_n))
             proven = None if state is None else self._prove(tagb, state)
             if proven is False:
                 self.log('unusual', 'log hash mismatch at {} block {}'.format(self.tag, tag_n))

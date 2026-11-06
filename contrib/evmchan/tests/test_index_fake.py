@@ -377,3 +377,67 @@ def test_readers_during_sync(tmp_path):
             t.join()
     assert not errors
     check_chain(ix, node)
+
+
+def test_quiet_polls_read_no_logs_and_miss_nothing(tmp_path):
+    """M5 (Infura credits): once caught up, a poll with nothing applied since
+    the newest checkpoint is two block reads and one eth_call (logHash at
+    latest), with no eth_getLogs. A tx at latest is still read the next poll,
+    served by utxo() before the tag reaches it, and proven once it does."""
+    node = FakeChain()
+    ix = fresh(tmp_path, node)
+    node.add_block(node.T(1))
+    node.add_block(node.T(2))
+    ix.sync()
+    ix.sync()
+    for i in range(3):
+        node.add_block(node.T(3) + i)
+        n = len(node.calls)
+        r = ix.sync()
+        assert [m for m, _ in node.calls[n:]] == ['eth_getBlockByNumber', 'eth_getBlockByNumber', 'eth_call'], i
+        assert r['proven']
+    d = node.deposit()
+    node.add_block(node.T(5), [d])          # at latest, above safe
+    n = len(node.calls)
+    ix.sync()
+    assert 'eth_getLogs' in [m for m, _ in node.calls[n:]]
+    txid = btc.Tx.parse(d).txid_hex()
+    assert ix.utxo(txid, 0)                 # read above the tag, as before
+    assert ix.tip() < 5                     # but not served yet
+    node.add_block(node.T(6))
+    node.add_block(node.T(7))               # safe is now at T(6): candidate 5
+    r = ix.sync()
+    assert r['proven'] and ix.tip() == 5
+    assert txid in [t.txid_hex() for t in btc.parse_block(ix.block(5)[1])[1]]
+    check_chain(ix, node)
+    # Quiet again: nothing applied after the new checkpoint.
+    node.add_block(node.T(8))
+    n = len(node.calls)
+    ix.sync()
+    assert 'eth_getLogs' not in [m for m, _ in node.calls[n:]]
+    check_chain(ix, node)
+
+
+def test_quiet_check_is_pinned_to_latest_and_sees_a_reorg(tmp_path):
+    """A reorg that replaces the newest checkpoint's history changes logHash
+    at latest, so the poll is not quiet and the repair runs as before."""
+    node = FakeChain()
+    ix = fresh(tmp_path, node)
+    node.add_block(node.T(1))
+    d = node.deposit()
+    at = node.add_block(node.T(2), [d])['number']
+    node.add_block(node.T(3))
+    node.add_block(node.T(3) + 1)
+    ix.sync()
+    txid = btc.Tx.parse(d).txid_hex()
+    assert ix.utxo(txid, 0)
+    node.reorg(at)                          # drop the deposit's block and later
+    node.add_block(node.T(2) + 1)
+    node.add_block(node.T(3) + 2)
+    node.add_block(node.T(3) + 3)
+    node.add_block(node.T(5))
+    n = len(node.calls)
+    r = ix.sync()
+    assert [m for m, _ in node.calls[n:]].count('eth_call') >= 2     # not quiet: tag state read
+    assert r['proven'] and ix.utxo(txid, 0) is None
+    check_chain(ix, node)

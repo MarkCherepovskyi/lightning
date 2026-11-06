@@ -119,10 +119,17 @@ def test_catch_up_makes_progress_under_rate_limits(tmp_path):
             ix.sync()
         except evm.EvmError:
             pass
-        first = next(p for m, p in node.calls[n:] if m == 'eth_getLogs')
-        starts.append(int(first[0]['fromBlock'], 16))
-    assert starts[-1] > node.deploy_block, starts   # FAILS: [5, 5, 5, 5, 5, 5]
+        first = next((p for m, p in node.calls[n:] if m == 'eth_getLogs'), None)
+        if first is not None:
+            starts.append(int(first[0]['fromBlock'], 16))
+    assert len(starts) >= 2 and starts[-1] > node.deploy_block, starts   # FAILS: [5, 5, 5, 5, 5, 5]
     assert not ix.ibd
+    # Caught up and nothing new (M5): a poll is the two block reads and one
+    # eth_call of logHash at latest, without eth_getLogs.
+    node.budget = 10
+    n = len(node.calls)
+    ix.sync()
+    assert [m for m, _ in node.calls[n:]] == ['eth_getBlockByNumber', 'eth_getBlockByNumber', 'eth_call']
 
 
 def test_latest_tag_reorg_deeper_than_margin(tmp_path):
