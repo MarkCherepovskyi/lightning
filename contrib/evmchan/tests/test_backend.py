@@ -90,6 +90,7 @@ def backend(chain, tmp_path):
     for t in ts:
         t.start()
     b.log_capture = log
+    b.test_threads = ts
     yield b
     b.stop()
     for t in ts:
@@ -257,14 +258,16 @@ def test_success_on_accept_then_replaced_at_the_same_nonce(chain, backend):
         while len(p.hashes) < 2 and time.monotonic() < wait:
             time.sleep(0.1)
         assert len(p.hashes) >= 2
-        second = chain.rpc.request('eth_getTransactionByHash', p.hashes[1])
+        # The newest version (on a slow machine a third may already have
+        # replaced the second in anvil's pool).
+        second = chain.rpc.request('eth_getTransactionByHash', p.hashes[-1])
         assert second['nonce'] == first['nonce']
         assert int(second['maxFeePerGas'], 16) * 4 >= int(first['maxFeePerGas'], 16) * 5
         assert int(second['maxPriorityFeePerGas'], 16) * 4 >= int(first['maxPriorityFeePerGas'], 16) * 5
         assert txpool_pending(chain) == 1
         assert any('replaced submit ' + tx.txid_hex() in m for m in backend.log_capture.at('info'))
         # Tracked sends survive a restart (evm-pending.json: calldata, no signatures).
-        saved = json.load(open(backend.pending_file))
+        saved = json.load(open(backend.pending_file))['pending']
         assert [d['nonce'] for d in saved] == [p.nonce] and saved[0]['hashes'] == p.hashes
         assert backend.cfg.key.hex() not in json.dumps(saved)
         again = eb.Backend(backend.cfg, Log())
@@ -280,7 +283,7 @@ def test_success_on_accept_then_replaced_at_the_same_nonce(chain, backend):
     end = time.monotonic() + 10
     while (backend.pending or backend.ix.tx(tx.txid_hex()) is None) and time.monotonic() < end:
         time.sleep(0.1)
-    assert not backend.pending and json.load(open(backend.pending_file)) == []
+    assert not backend.pending and json.load(open(backend.pending_file))['pending'] == []
     assert backend.ix.tx(tx.txid_hex()) is not None        # ingested from the replacement's receipt
     assert backend.send_now(tx.serialize().hex())['success']
 
@@ -344,6 +347,60 @@ def test_filler_self_send_frees_an_untracked_nonce(chain, backend):
     assert backend.send_now(spend(backend, txid, 0, 100_000).serialize().hex())['success']
 
 
+@pytest.mark.parametrize('restart', [False, True])
+def test_reorg_taking_back_a_mined_nonce_resends_it(chain, backend, restart):
+    """M4 (found by tests/test_evmchan.py::test_reorg): a reorg drops the
+    block that mined our submit, so the chain's nonce goes back below the
+    one we saw mined. mined_floor used to hide that gap from the filler for
+    good: every later send queued behind it, the key wedged, and the tx was
+    lost (CLN doesn't rebroadcast a wallet tx). Now the tracker re-sends the
+    same tx at that nonce, and later sends get mined. With a restart between
+    the send and the reorg: the sends seen mined are persisted, so it is
+    re-sent then too, not replaced by a 0-value filler."""
+    txid, _ = deposit(chain, backend)
+    tx = spend(backend, txid, 0, 100_000)
+    assert backend.send_now(tx.serialize().hex())['success']
+    wait_until(lambda: not backend.pending and backend.ix.tx(tx.txid_hex()) is not None, 5)
+    n = chain.rpc.nonce(backend.address, 'latest')
+    assert backend.mined_floor == n
+    b = backend
+    if restart:
+        backend.stop()
+        for t in backend.test_threads:
+            t.join(5)
+        b = eb.Backend(backend.cfg, Log())
+        b.connect(retry_for=0)
+        assert list(b.recent) == [n - 1] and b.mined_floor == n and not b.pending
+        b.apply_option_check(GOOD_CONFIGS, GOOD_INFO)
+        ts = [threading.Thread(target=f, daemon=True) for f in (b._worker_loop, b._tracker_loop)]
+        for t in ts:
+            t.start()
+    try:
+        assert chain.rpc.call('anvil_reorg', 1, []) is None        # anvil drops the block's txs
+        assert chain.rpc.nonce(b.address, 'latest') == n - 1
+        assert not [x for x in chain.logs() if x['topics'][2] == '0x' + tx.txid().hex()]
+        wait_until(lambda: chain.rpc.nonce(b.address, 'latest') == n, 4 * INTERVAL + 5)
+        again = [x for x in chain.logs() if x['topics'][2] == '0x' + tx.txid().hex()]
+        assert len(again) == 1                                  # the same Bitcoin tx, mined again
+        log = b._log
+        assert any('a reorg took back nonces [{}]'.format(n - 1) in m for m in log.at('unusual'))
+        assert not any('0-value self-send' in m for m in log.at('unusual'))
+        wait_until(lambda: not b.pending, 5)
+        b.ix.sync()        # the poll thread's job: the old fork's row goes (SPEC 5.2)
+        assert b.ix.tx(tx.txid_hex())['evm_hash'] == again[0]['blockHash']
+        child = spend(b, tx.txid(), 0, 99_000)
+        r = b.send_now(child.serialize().hex())
+        assert r['success'], r
+        wait_until(lambda: chain.rpc.nonce(b.address, 'latest') == n + 1, 5)
+        assert [x for x in chain.logs() if x['topics'][2] == '0x' + child.txid().hex()]
+    finally:
+        if restart:
+            b.stop()
+            for t in ts:
+                t.join(5)
+            b.ix.close()
+
+
 def test_persisted_before_sending(chain, backend, monkeypatch):
     txid, _ = deposit(chain, backend)
     tx = spend(backend, txid, 0, 100_000)
@@ -351,7 +408,7 @@ def test_persisted_before_sending(chain, backend, monkeypatch):
     push = backend._push
 
     def spy(raw):
-        seen.append([(d['nonce'], d['btc_txid']) for d in json.load(open(backend.pending_file))])
+        seen.append([(d['nonce'], d['btc_txid']) for d in json.load(open(backend.pending_file))['pending']])
         return push(raw)
     monkeypatch.setattr(backend, '_push', spy)
     assert backend.send_now(tx.serialize().hex())['success']
@@ -579,6 +636,28 @@ def test_rpc_command_leases_assets_and_refusals(tmp_path):
     assert rc({'method': 'withdraw', 'params': {'destination': 'x', 'satoshi': 1000}}) == {'result': 'continue'}
 
 
+def test_dev_no_outbound_filter(tmp_path):
+    """Tests only: with evm-dev-no-outbound-filter (accepted only under
+    lightningd --developer) our own opens skip the rpc_command checks, so a
+    peer's openchannel* hooks are what refuses them; those hooks still refuse."""
+    opt = options(**{eb.DEV_NO_OUTBOUND_FILTER: True})
+    with pytest.raises(eb.ConfigError, match='--developer'):
+        eb.Config.from_options(opt, str(tmp_path), {}, None)
+    assert not eb.Config.from_options(options(), str(tmp_path), {}, None, developer=True).dev_no_outbound_filter
+    cfg = eb.Config.from_options(opt, str(tmp_path), {}, None, developer=True)
+    assert cfg.dev_no_outbound_filter
+    b = eb.Backend(cfg, Log())
+    b.interval, b._chain_id, b.balance = INTERVAL, 31337, 10**18
+    b.apply_option_check(GOOD_CONFIGS, GOOD_INFO)
+    bad = psbt_v0([(P2PKH, 'nonwitness')])
+    for req in ({'method': 'fundchannel', 'params': {'id': 'x', 'amount': 1000, 'channel_type': [12]}},
+                {'method': 'openchannel_init', 'params': ['x', 1000, bad]},
+                {'method': 'openchannel_update', 'params': ['c', bad]}):
+        assert b.rpc_command(req) == {'result': 'continue'}
+    assert b.openchannel(open_payload(channel_type={'bits': [12]}))['result'] == 'reject'
+    assert b.openchannel2_psbt({'channel_id': 'c', 'psbt': bad}, 'openchannel2_changed') == {'result': 'reject'}
+
+
 def test_no_utxo_count_precheck(tmp_path):
     """Draft 5 dropped the 200-UTXO rule (dust deposits could block every
     withdraw); sendrawtransaction step 3 answers it. Nothing calls listfunds."""
@@ -693,6 +772,29 @@ def test_openchannel2_psbt_hooks(tmp_path):
     assert refused(rc({'method': 'openchannel_init', 'params': ['x', 1000, bad]}))
     b.apply_option_check({}, {})
     assert b.openchannel2_psbt({'channel_id': 'c', 'psbt': good}, 'openchannel2_sign') == {'result': 'reject'}
+
+
+def test_openchannel2_psbt_refusal_aborts_first(tmp_path):
+    """lightningd crashes on a 'reject' from openchannel2_changed/_sign while
+    dualopend runs (upstream): a refusal aborts the open first, then answers
+    'continue' (ignored once dualopend is gone); if the abort fails, a forced
+    disconnect of the channel's peer."""
+    bad = psbt_v0([(P2WSH, 'witness')])
+    ln = FakeLn({'openchannel_abort': {'channel_canceled': True}})
+    b = offline_backend(tmp_path, ln=ln)
+    for hook in ('openchannel2_changed', 'openchannel2_sign'):
+        assert b.openchannel2_psbt({'channel_id': 'c', 'psbt': bad}, hook) == {'result': 'continue', 'psbt': bad}
+    assert ln.calls == [('openchannel_abort', {'channel_id': 'c'})] * 2
+
+    def no_abort(params):
+        raise RuntimeError('Another openchannel command is in progress')
+    ln = FakeLn({'openchannel_abort': no_abort, 'disconnect': {},
+                 'listpeerchannels': {'channels': [{'channel_id': 'c', 'peer_id': '02' * 33}]}})
+    b = offline_backend(tmp_path, ln=ln)
+    assert b.openchannel2_psbt({'channel_id': 'c', 'psbt': bad}, 'openchannel2_changed')['result'] == 'continue'
+    assert ln.calls[-1] == ('disconnect', {'id': '02' * 33, 'force': True})
+    ln.answers['listpeerchannels'] = {'channels': []}          # nothing to end: reject
+    assert b.openchannel2_psbt({'channel_id': 'c', 'psbt': bad}, 'openchannel2_changed') == {'result': 'reject'}
 
 
 def test_htlc_accepted_cap(tmp_path):
@@ -1004,6 +1106,7 @@ class StubNode:
         self.refuse = 0           # refuse this many sends (JSON-RPC error, tx unknown)
         self.lost_reply = 0       # accept but answer with a JSON-RPC error body (a proxy's 5xx)
         self.pool = {}
+        self.sent = []            # hashes of the txs handed over, in order
         self.calls = []
 
     def eth_call(self, *a, **k):
@@ -1027,6 +1130,7 @@ class StubNode:
                 self.refuse -= 1
                 raise evm.EvmError('eth_sendRawTransaction: JSON-RPC error -32000', -32000)
             self.pool[h] = True
+            self.sent.append(h)
             if self.lost_reply:
                 self.lost_reply -= 1
                 raise evm.EvmError('eth_sendRawTransaction: JSON-RPC error -32603', -32603)
@@ -1169,3 +1273,163 @@ def test_refusal_answered_as_failure_never_success(tmp_path, monkeypatch):
     job(time.monotonic())
     reply.event.wait(5)
     assert len(got) == 1 and not got[0]['success'] and not b.pending      # refused or 'not sent': never success
+
+
+# --- reorgs taking back mined nonces (M4), offline
+
+def mined(b, p, version=-1):
+    """The tracker saw p's version `version` mined."""
+    b._finish(p, {'status': '0x1', 'transactionHash': p.hashes[version], 'blockHash': '0x' + '11' * 32})
+
+
+def reorged_back(b, nonce):
+    """The chain's nonce reads below a nonce b saw mined."""
+    b.srpc.latest_nonce = b.srpc.pending_nonce = nonce
+
+
+def test_one_stale_nonce_read_requeues_nothing(tmp_path):
+    """A single read of the chain's nonce below mined_floor (a lagging node
+    behind a load balancer) is not a reorg: nothing is re-sent, not even
+    after another one an INTERVAL later once a read in between was fine.
+    Below it for an INTERVAL, it is."""
+    b = stub_backend(tmp_path)
+    tx = mk_tx()
+    assert send_direct(b, tx)['success']
+    mined(b, b.pending[0])
+    b.srpc.latest_nonce = b.srpc.pending_nonce = 1
+    assert b.mined_floor == 1 and list(b.recent) == [0] and not b.pending
+    sent = len(b.srpc.sent)
+    reorged_back(b, 0)
+    b._track(check_gaps=False)
+    assert not b.pending and list(b.recent) == [0] and b.mined_floor == 1
+    reorged_back(b, 1)
+    b._track(check_gaps=False)
+    assert b._behind_since is None
+    time.sleep(INTERVAL + 0.1)
+    reorged_back(b, 0)
+    b._track(check_gaps=False)
+    assert not b.pending and len(b.srpc.sent) == sent and not b._log.at('unusual')
+    time.sleep(INTERVAL + 0.1)
+    b._track(check_gaps=False)
+    assert list(b.pending) == [0] and len(b.srpc.sent) == sent + 1
+    assert b.pending[0].hash_txid[b.srpc.sent[-1]] == tx.txid_hex()
+
+
+def test_requeued_nonces_are_all_sent_at_once_in_order(tmp_path):
+    """A reorg taking back three mined nonces re-sends all three at once,
+    lowest first (one per INTERVAL would keep the later ones waiting)."""
+    b = stub_backend(tmp_path)
+    txs = [mk_tx() for _ in range(3)]
+    for tx in txs:
+        assert send_direct(b, tx)['success']
+    for n in range(3):
+        mined(b, b.pending[n])
+    assert b.mined_floor == 3 and list(b.recent) == [0, 1, 2]
+    sent = len(b.srpc.sent)
+    reorged_back(b, 0)
+    b._behind_since = time.monotonic() - INTERVAL      # below mined_floor for an INTERVAL
+    b._track(check_gaps=False)
+    assert sorted(b.pending) == [0, 1, 2] and b.mined_floor == 0
+    again = b.srpc.sent[sent:]
+    assert again == [b.pending[n].hashes[-1] for n in range(3)]
+    assert [b.pending[n].hash_txid[h] for n, h in enumerate(again)] == [tx.txid_hex() for tx in txs]
+    assert not any(p.requeued for p in b.pending.values())
+
+
+def test_rebroadcast_of_a_reorged_send_keeps_its_nonce(tmp_path):
+    """Between the reorg and the tracker's requeue, CLN rebroadcasts the
+    same tx (the index no longer has it): it is re-sent at the nonce it was
+    mined at, not at a new one, where the second copy would only revert."""
+    b = stub_backend(tmp_path)
+    tx = mk_tx()
+    assert send_direct(b, tx)['success']
+    mined(b, b.pending[0])
+    other = mk_tx()                                    # an unrelated send, mined at nonce 1
+    assert send_direct(b, other)['success']
+    mined(b, b.pending[1])
+    b.srpc.latest_nonce = b.srpc.pending_nonce = 2
+    assert b.mined_floor == 2 and b.nonce_hwm == 2
+    sent = len(b.srpc.sent)
+    reorged_back(b, 0)
+    assert send_direct(b, tx)['success']
+    assert sorted(b.pending) == [0, 1] and b.nonce_hwm == 2 and b.mined_floor == 0
+    assert b.srpc.sent[sent:] == [b.pending[0].hashes[-1], b.pending[1].hashes[-1]]
+    assert b.pending[0].hash_txid[b.pending[0].hashes[-1]] == tx.txid_hex()
+    # The tracker doesn't send it again, at this nonce or another.
+    b._behind_since = time.monotonic() - INTERVAL
+    b._track(check_gaps=False)
+    assert sorted(b.pending) == [0, 1] and len(b.srpc.sent) == sent + 2
+
+
+def test_requeue_resends_the_version_that_was_mined(tmp_path):
+    """The mined version of a nonce may not be its last: here the submit
+    was mined while a cancel had replaced it. A reorg re-sends the submit.
+    A refused re-send leaves it requeued (and persisted so), and it is
+    re-sent later."""
+    b = stub_backend(tmp_path)
+    tx = mk_tx()
+    assert send_direct(b, tx)['success']
+    p = b.pending[0]
+    data = p.data
+    b.ix.known.add(tx.txid_hex())          # a third party's copy is in the chain: cancel ours
+    p.replace_at = 0
+    b._track(check_gaps=False)
+    assert p.kind == 'cancel' and len(p.hashes) == 2 and p.data == b''
+    b.ix.known.clear()
+    mined(b, p, version=0)                 # ... but our submit was mined first
+    r = b.recent[0]
+    assert (r.kind, r.to, r.data, r.btc_txid) == ('submit', b.contract, data, tx.txid_hex())
+    saved = json.load(open(b.pending_file))
+    assert [d['kind'] for d in saved['recent']] == ['submit'] and saved['mined_floor'] == 1
+    reorged_back(b, 0)
+    b.srpc.refuse = 1
+    b._behind_since = time.monotonic() - INTERVAL
+    b._track(check_gaps=False)
+    p = b.pending[0]
+    assert p.requeued and len(p.hashes) == 2 and (p.kind, p.data) == ('submit', data)
+    assert json.load(open(b.pending_file))['pending'][0]['requeued'] is True
+    again = eb.Backend(b.cfg, Log())
+    again.interval = INTERVAL
+    again._load_pending()
+    assert again.pending[0].requeued and again.pending[0].data == data
+    p.replace_at = 0
+    b._track(check_gaps=False)
+    assert not p.requeued and len(p.hashes) == 3 and p.kind == 'submit'
+    assert p.hash_txid[p.hashes[-1]] == tx.txid_hex() and b.srpc.sent[-1] == p.hashes[-1]
+
+
+def test_resigned_and_mined_version_survives(tmp_path):
+    """A submit re-signed with a new tx (step 6) but whose first version was
+    mined: that first version is what a reorg re-sends."""
+    b = stub_backend(tmp_path)
+    tx = mk_tx()
+    assert send_direct(b, tx)['success']
+    p = b.pending[0]
+    first = p.data
+    tx2 = btc.Tx(2, [btc.TxIn(tx.inputs[0].prev_txid, 0)], [(900, A.p2wpkh)], 0, [[b'\x02']])
+    assert send_direct(b, tx2)['success'] and p.btc_txid == tx2.txid_hex() and p.data != first
+    mined(b, p, version=0)
+    assert (b.recent[0].btc_txid, b.recent[0].data) == (tx.txid_hex(), first)
+    assert list(b.recent[0].bodies) == [tx.txid_hex()]
+
+
+def test_sends_seen_mined_survive_a_restart(tmp_path):
+    """evm-pending.json keeps the sends seen mined and mined_floor: after a
+    restart a reorg still re-sends the tx at its nonce (without them the gap
+    looked untracked and got a 0-value filler)."""
+    b = stub_backend(tmp_path)
+    tx = mk_tx()
+    assert send_direct(b, tx)['success']
+    mined(b, b.pending[0])
+    b2 = stub_backend(tmp_path)
+    b2._load_pending()
+    assert list(b2.recent) == [0] and b2.mined_floor == 1 and b2.nonce_hwm == 1 and not b2.pending
+    assert b2.recent[0].data == b.recent[0].data
+    reorged_back(b2, 0)
+    b2._track()                            # gaps checked too: none
+    assert not b2.pending and not b2.srpc.sent
+    b2._behind_since = time.monotonic() - INTERVAL
+    b2._track()
+    assert list(b2.pending) == [0] and b2.pending[0].kind == 'submit'
+    assert b2.pending[0].hash_txid[b2.srpc.sent[-1]] == tx.txid_hex() and len(b2.srpc.sent) == 1
+    assert not any('self-send' in m for m in b2._log.at('unusual'))

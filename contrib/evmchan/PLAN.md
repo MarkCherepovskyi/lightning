@@ -387,3 +387,70 @@ in an environment variable) to deploy.
   - allow CLN's upstream CGOSSIP_CHANNEL_DEAD BROKEN line;
   - fund node keys before start;
   - wait on chain rather than on RPC results.
+
+### M4: CLN's integration suite on anvil (2026-11-06)
+
+- **What was built:**
+  - `tests/test_evmchan.py` and `tests/evmchan_utils.py`: pyln-testing with
+    no bitcoind. `EvmChain` runs one anvil and contract per test and stands
+    in for the `bitcoind` fixture. `EvmNode` runs unmodified lightningd with
+    `--disable-plugin=bcli`, the plugin and the 5.6 options.
+  - `contrib/evmchan/run-tests.sh` and `Dockerfile`: image `evmchan/pytest`,
+    with Foundry v1.9.0 pinned by sha256, pinned pip packages and a base image
+    pinned by digest. It uses its own volume, and the tree is copied in without
+    git.
+- **Results:** every SPEC 7 scenario passes, with 182 unit tests, on macOS and
+  in Docker (Linux arm64).
+  - The scenarios:
+    - deposits, open, pay and gossip;
+    - mutual and unilateral close;
+    - HTLCs on chain, both directions, from either commitment;
+    - penalty;
+    - refusals from both the opener and the accepter;
+    - exits and `withdraw`;
+    - restart mid-close;
+    - reorgs above and through `safe`;
+    - an outage;
+    - regtest defaults;
+    - `max_payment`.
+  - Integration runs in about 3.5–4 min at `-n 4`.
+- **Answered:** SPEC open question 1. `max_payment` does not cap large
+  channels.
+- **Plugin bugs found and fixed:**
+  - **A reorg that takes back one of our mined sends wedged the key.** The
+    plugin now keeps the last 64 mined sends, persisted. If the chain's nonce
+    stays below them for an INTERVAL, it re-sends the mined version at the
+    same nonce, all at once. A rebroadcast in that window reuses the nonce.
+  - **A flaky M3 unit test.**
+- **Upstream CLN bugs found:** both are worked around or xfailed, and neither
+  is fixed in CLN. Report them upstream.
+  - **A crash:** a `reject` from `openchannel2_changed` or
+    `openchannel2_sign` is a use-after-free.
+    - `hook_extract_psbt` returns false, and `plugin_hook.c` frees the
+      payload, but `openchannel2_psbt_remove_dualopend` stays on dualopend.
+    - Any peer offering a P2WSH input could crash the accepter.
+    - The plugin aborts the open with `openchannel_abort` and then answers
+      `continue`. The fail message is queued to dualopend first, so it exits
+      before the PSBT is used.
+  - **A replay bug:** when a tx spends two outputs onchaind watches, and
+    onchaind ignores one of them, `replay_unwatch_txid` drops the whole tx
+    after a restart. Its output's later spend is never seen, and the channel
+    is never forgotten.
+    - A strict xfail checks this exact symptom from after the restart. It
+      also checks that the node is synced and serves the reference block.
+    - `test_restart_mid_close[htlc]` goes to xfail only when CLN's coin choice
+      triggers the bug.
+  - **The M1 replay segfault** didn't happen in any M4 run. It is still to be
+    checked on master.
+- **Reviews:** two fresh-agent reviews of the tests. All findings are fixed:
+  - vacuous xfails and log checks;
+  - races in the reorg test;
+  - a tautological fee assert;
+  - accepter-side refusals that weren't exercised; they now use the dev-only
+    `--evm-dev-no-outbound-filter`;
+  - an unpinned runner.
+- **Open:**
+  - `openchannel2_sign` refusal is covered by unit tests only, because
+    `_changed` always refuses first.
+  - No test covers the 30-HTLC cap, pending sends resuming after a restart,
+    or a send in flight during an outage.

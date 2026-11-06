@@ -546,6 +546,14 @@ using pyln's async method replies.
        between send and persist, a lost pending file, a proxy that lied), send
        a 0-value self-send at that nonce with bumped fees, so the key can't be
        wedged.
+     - **Reorgs.** The last 64 sends seen mined are kept (in
+       `evm-pending.json` too, with the highest nonce seen mined), each as
+       the version that was mined. If `latest` stays below a nonce seen mined
+       for `INTERVAL` (one low read is not enough), a reorg took it back:
+       those sends are tracked again and re-sent at once, lowest nonce first,
+       at their own nonces. A rebroadcast in that window of a tx spending a
+       prevout of one of them re-sends it the same way, rather than at a new
+       nonce where one copy would only revert.
   8. **Queueing and timing.** Sends are serialized per node key on one worker.
      - Each job gets its own time budget, counted from when it is dequeued, so a
        slow job can't starve the ones queued behind it. A penalty queued behind
@@ -586,6 +594,13 @@ treats that as fatal.
 - **Dual funding.** `openchannel2`, `openchannel2_changed` and
   `openchannel2_sign` reject a PSBT whose peer inputs aren't P2WPKH or P2TR.
   Such a funding tx would never get mined.
+  - CLN itself refuses a non-segwit peer input (P2PKH, P2SH) in the
+    interactive tx (BOLT 2), so the hooks see segwit ones such as P2WSH.
+  - `openchannel2_changed` and `openchannel2_sign` refuse by calling
+    `openchannel_abort` (else a forced `disconnect` of the peer) before
+    answering. Upstream lightningd crashes on a plain `reject` from these two
+    hooks while `dualopend` runs (`dual_open_control.c` frees the hook payload
+    but leaves its destructor on `dualopend`), which any peer could trigger.
 - **Splicing** has no hook to check the peer's inputs. Version 1 runs with
   splicing off (section 5.6); open question 4.
 - **HTLC count.**
@@ -606,6 +621,11 @@ treats that as fatal.
 - **Before the option check has run, or while the ETH balance is unknown,** every
   open is refused.
 - `openchannel` and `openchannel2` are registered with `before=['funder']`.
+- **Tests only:** the flag `--evm-dev-no-outbound-filter` makes the
+  `rpc_command` hook let this node's own opens through, so the integration
+  tests can check that a peer's `openchannel*` hooks refuse them. The plugin
+  refuses to start with it unless lightningd runs with `--developer`. It
+  MUST NOT be used outside tests.
 
 ### 5.5 Its own RPCs and alarms
 
@@ -655,6 +675,8 @@ from a background thread.
   restarted with correct values.
 - The anvil values are for tests only. The integration tests set them through
   pyln-testing's options.
+- `--developer` is also what lets the tests-only `--evm-dev-no-outbound-filter`
+  (5.4) be set; no network may run with that flag.
 
 ## 6. Networks and deployment
 
@@ -755,8 +777,12 @@ Each needs its tests green and your review before the next.
 
 ## 10. Open questions
 
-1. **Payment size.** Regtest's `max_payment` (2^32 msat ≈ 0.043 ETH) may cap
-   single payments. Check whether it applies with large channels (M3).
+1. **Payment size: answered (M4, `test_max_payment`).** Regtest's
+   `max_payment` (2^32 msat ≈ 0.043 ETH) does not cap large channels.
+   - With the default features, `option_support_large_channel` is negotiated,
+     and a single 5,000,000,000 msat HTLC completes on a 20M-sat channel.
+   - Without feature 19, `spendable_msat` is exactly 2^32−1 msat. A larger
+     payment fails, as on Bitcoin.
 2. **Network identity.** Two contracts on the same chain look like one CLN
    network: same chain hash, `bcrt` addresses. Gossip for channels on another
    contract fails verification and is dropped, but nodes must be pointed at the

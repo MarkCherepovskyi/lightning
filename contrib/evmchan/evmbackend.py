@@ -66,6 +66,7 @@ MAX_HTLCS = 30                        # SPEC 5.4 / 5.6
 BUMP_NUM, BUMP_DEN = 5, 4             # replacement fees: 1.25x
 FEE_ALARM_MULTIPLE = 10               # BROKEN once a replacement's fees pass 10x the first send's
 CONNECT_RETRY = 60                    # seconds init keeps trying the EVM node (bcli's default)
+RECENT_KEEP = 64                      # mined sends remembered, to re-send if a reorg takes their nonce back
 CLN_DEFAULT_POLL = 30                 # lightningd polls the backend every 30 s without --dev-bitcoind-poll
 SUBMIT_SIG = 'submit(bytes,(uint64,bytes,uint32)[])'
 SUBMIT_TYPES = ['bytes', '(uint64,bytes,uint32)[]']
@@ -150,6 +151,7 @@ PARAMS = {
 OPEN_COMMANDS = ('fundchannel', 'fundchannel_start', 'multifundchannel', 'openchannel_init')
 RPC_FILTER = OPEN_COMMANDS + ('openchannel_update', 'openchannel_signed', 'fundchannel_complete')
 ERR_REFUSED = -32602    # JSONRPC2_INVALID_PARAMS: what the rpc_command hook returns
+DEV_NO_OUTBOUND_FILTER = 'evm-dev-no-outbound-filter'   # tests only, with --developer (SPEC 5.4)
 
 
 class ConfigError(Exception):
@@ -385,16 +387,20 @@ def psbt_problem(b64):
 
 class Config:
     def __init__(self, rpc_url, contract, key, key_file, confirm, poll, min_balance_wei, lightning_dir,
-                 secrets=()):
+                 secrets=(), dev_no_outbound_filter=False):
         self.rpc_url, self.contract, self.key, self.key_file = rpc_url, contract, key, key_file
         self.confirm, self.poll, self.min_balance_wei = confirm, poll, min_balance_wei
         self.lightning_dir = lightning_dir
         self.secrets = [s for s in secrets if s]
+        # Tests only (SPEC 5.4): the rpc_command hook lets our own opens
+        # through, so a peer's hooks are what refuses them.
+        self.dev_no_outbound_filter = dev_no_outbound_filter
 
     @classmethod
-    def from_options(cls, get_option, lightning_dir, env, log=None):
+    def from_options(cls, get_option, lightning_dir, env, log=None, developer=False):
         """From the plugin's options (get_option(name)) and the environment.
-        Creates the key file if it doesn't exist. Raises ConfigError."""
+        developer: lightningd runs with --developer. Creates the key file if
+        it doesn't exist. Raises ConfigError."""
         url = get_option('evm-rpc')
         if not url:
             raise ConfigError('--evm-rpc is required')
@@ -431,9 +437,13 @@ class Config:
             raise ConfigError('--evm-min-balance must be a non-negative amount of ETH') from None
         key_file = get_option('evm-key-file') or os.path.join(lightning_dir, 'evm-key')
         key_file = os.path.join(lightning_dir, key_file)   # relative to the lightning dir
+        no_filter = get_option(DEV_NO_OUTBOUND_FILTER) in (True, 'true')
+        if no_filter and not developer:
+            raise ConfigError('--{} is for tests: it needs lightningd --developer'.format(DEV_NO_OUTBOUND_FILTER))
         key = load_or_create_key(key_file, log)
         secrets.append(key.hex())
-        return cls(url, contract, key, key_file, confirm, poll, min_balance_wei, lightning_dir, secrets)
+        return cls(url, contract, key, key_file, confirm, poll, min_balance_wei, lightning_dir, secrets,
+                   dev_no_outbound_filter=no_filter)
 
 
 def load_or_create_key(path, log=None):
@@ -639,7 +649,7 @@ class Pending:
     is sent, so a restart keeps tracking and replacing it."""
 
     FIELDS = ('kind', 'btc_txid', 'nonce', 'gas', 'to', 'value', 'tip', 'max_fee', 'first_max_fee',
-              'hashes', 'replacements', 'outpoints', 'hash_txid')
+              'hashes', 'replacements', 'outpoints', 'hash_txid', 'requeued', 'bodies')
 
     def __init__(self, kind, btc_txid, nonce, gas, to, data, value, tip, max_fee, txhash, outpoints=()):
         self.kind, self.btc_txid, self.nonce = kind, btc_txid, nonce
@@ -647,12 +657,18 @@ class Pending:
         self.tip, self.max_fee, self.first_max_fee = tip, max_fee, max_fee
         self.hashes = [txhash]
         self.hash_txid = {txhash: btc_txid}      # which btc tx each version carries
+        # The submit calldata of each btc tx sent at this nonce (step 6 and a
+        # cancel overwrite p.data): a reorg re-sends the version that was mined.
+        self.bodies = {}
+        if kind == 'submit' and btc_txid:
+            self.add_body(btc_txid, data, outpoints, gas)
         self.sent = set()                        # versions handed to the node (step 5 answers only these)
         self.outpoints = list(outpoints)         # 'txid:vout' the submit spends
         self.sent_at = time.monotonic()
         self.replace_at = None
         self.replacements = 0
         self.alarmed = False
+        self.requeued = False                    # tracked again after a reorg took its nonce back, not re-sent yet
         self.scan_pos = 0                        # receipt lookups: next hash to try (from the newest)
         self.missing = 0
         self.missing_since = 0.0
@@ -671,8 +687,15 @@ class Pending:
                 int(d['value']), int(d['tip']), int(d['max_fee']), d['hashes'][0], d.get('outpoints') or [])
         p.hashes, p.first_max_fee, p.replacements = list(d['hashes']), int(d['first_max_fee']), int(d['replacements'])
         p.hash_txid = dict(d.get('hash_txid') or {h: p.btc_txid for h in p.hashes})
+        p.requeued = bool(d.get('requeued'))
+        if isinstance(d.get('bodies'), dict):
+            p.bodies = {t: {'data': b['data'], 'outpoints': list(b['outpoints']), 'gas': int(b['gas'])}
+                        for t, b in d['bodies'].items()}
         p.sent = set(p.hashes)                   # persisted before sending: may have gone out
         return p
+
+    def add_body(self, btc_txid, data, outpoints, gas):
+        self.bodies[btc_txid] = {'data': data.hex(), 'outpoints': list(outpoints), 'gas': gas}
 
     def describe(self):
         return {'kind': self.kind, 'txid': self.btc_txid, 'nonce': self.nonce, 'evm_txs': list(self.hashes),
@@ -722,6 +745,11 @@ class Backend:
         self.nonce_hwm = 0       # one above the highest nonce we have used
         self._hwm_init = False
         self.mined_floor = 0     # one above the highest nonce we saw mined
+        # Sends seen mined, by nonce (the last RECENT_KEEP), each as the
+        # version that was mined: if a reorg takes their nonces back, they are
+        # tracked and re-sent again (M4). Persisted with the pending sends.
+        self.recent = collections.OrderedDict()
+        self._behind_since = None    # when the chain's nonce first read below mined_floor
         self._save_dirty = False
         self._klock = threading.RLock()   # signing and sending from the key (5.3 step 8)
         self._chain_id = None    # for tests without an index
@@ -787,31 +815,49 @@ class Backend:
     def _load_pending(self):
         try:
             with open(self.pending_file) as f:
-                items = json.load(f)
+                saved = json.load(f)
+            if isinstance(saved, list):          # before M4: the pending sends only
+                saved = {'pending': saved}
+            if not isinstance(saved, dict):
+                raise ValueError
+            mined_floor = int(saved.get('mined_floor') or 0)
         except FileNotFoundError:
             return
-        except (OSError, ValueError) as e:
+        except (OSError, ValueError, TypeError) as e:
             self.log('broken', '{} unreadable ({}): tracked sends lost'.format(self.pending_file, type(e).__name__))
             return
-        for d in items:
-            try:
-                p = Pending.from_dict(d)
-            except (KeyError, TypeError, ValueError, IndexError):
-                continue
-            p.replace_at = time.monotonic() + self.interval
+
+        def parsed(key):
+            out = []
+            for d in saved.get(key) or []:
+                try:
+                    out.append(Pending.from_dict(d))
+                except (KeyError, TypeError, ValueError, IndexError, AttributeError):
+                    continue
+            return sorted(out, key=lambda p: p.nonce)
+        for p in parsed('pending'):
+            p.replace_at = time.monotonic() if p.requeued else time.monotonic() + self.interval
             self.pending[p.nonce] = p
             self.nonce_hwm = max(self.nonce_hwm, p.nonce + 1)
+        for p in parsed('recent')[-RECENT_KEEP:]:
+            p.done.set()
+            self.recent[p.nonce] = p
+            self.nonce_hwm = max(self.nonce_hwm, p.nonce + 1)
+        self.mined_floor = max(self.mined_floor, mined_floor)
         if self.pending:
             self.log('info', 'tracking {} sends from before the restart (nonces {})'.format(
                 len(self.pending), sorted(self.pending)))
 
     def _save_pending(self):
-        """Writes the tracked sends; the caller holds _plock."""
+        """Writes the tracked sends, and the ones seen mined; the caller
+        holds _plock."""
         tmp = self.pending_file + '.tmp'
         try:
             fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
             with os.fdopen(fd, 'w') as f:
-                json.dump([p.to_dict() for p in self.pending.values()], f)
+                json.dump({'pending': [p.to_dict() for p in self.pending.values()],
+                           'recent': [p.to_dict() for p in self.recent.values()],
+                           'mined_floor': self.mined_floor}, f)
                 f.flush()
                 os.fsync(f.fileno())
             os.replace(tmp, self.pending_file)
@@ -982,6 +1028,9 @@ class Backend:
             return time.monotonic() >= budget_end or reply.expired()
         if self._known(txid):
             return ok(), None
+        outpoints = ['{}:{}'.format(btc.display(i.prev_txid), i.vout) for i in tx.inputs]
+        if self._requeue_if_reorged(outpoints) and self._known(txid):
+            return ok(), None                # the reorged send, re-sent at its own nonce
         prevouts = self.ix.prevouts(tx)
         if prevouts is None:
             return fail('missing or spent inputs'), None
@@ -991,7 +1040,6 @@ class Backend:
             return fail(why), None
         if out_of_time():
             return fail(NOT_SENT), None
-        outpoints = ['{}:{}'.format(btc.display(i.prev_txid), i.vout) for i in tx.inputs]
         with self._klock:
             old = self._pending_spending(outpoints)
             if old is not None:
@@ -1044,9 +1092,10 @@ class Backend:
     def _gas_limit(self, gas):
         return min(gas + gas // 5 + 30_000, GAS_LIMIT_MAX)
 
-    def _bumped(self, p):
-        """1.25x p's fees, at least +1 wei and the network's current fees."""
-        cur_tip, cur_max = self.srpc.fees()
+    def _bumped(self, p, cur=None):
+        """1.25x p's fees, at least +1 wei and the network's current fees
+        (cur: (tip, max fee) already read)."""
+        cur_tip, cur_max = cur if cur is not None else self.srpc.fees()
         tip = max(-(-p.tip * BUMP_NUM // BUMP_DEN), p.tip + 1, cur_tip)
         return tip, max(-(-p.max_fee * BUMP_NUM // BUMP_DEN), p.max_fee + 1, cur_max, tip)
 
@@ -1154,10 +1203,17 @@ class Backend:
             p.btc_txid, p.data, p.outpoints, p.gas, p.tip, p.max_fee = saved
             p.hashes.pop()
             p.hash_txid.pop(txhash, None)
+            if had_body is None:
+                p.bodies.pop(txid, None)
+            else:
+                p.bodies[txid] = had_body
+        had_body = None
         with self._plock:
             p.btc_txid, p.data, p.outpoints, p.gas, p.tip, p.max_fee = txid, data, outpoints, gas_limit, tip, max_fee
             p.hashes.append(txhash)
             p.hash_txid[txhash] = txid
+            had_body = p.bodies.get(txid)
+            p.add_body(txid, data, outpoints, gas_limit)
             p.scan_pos = 0
             if not self._save_pending():
                 restore()
@@ -1228,9 +1284,19 @@ class Backend:
         latest = self.srpc.nonce(self.address, 'latest')
         with self._klock:
             self.nonce_hwm = max(self.nonce_hwm, latest)   # never below the chain's (H1)
+        now = time.monotonic()
+        if latest < self.mined_floor:
+            # A nonce we saw mined isn't any more: one stale read, or a reorg
+            # (one that lasts an INTERVAL). mined_floor would otherwise hide
+            # that gap from _fill_gaps for good, and wedge the key.
+            if self._behind_since is None:
+                self._behind_since = now
+            elif now - self._behind_since >= self.interval:
+                self._requeue_reorged(latest, now)
+        else:
+            self._behind_since = None
         with self._plock:
             items = sorted(self.pending.values(), key=lambda q: q.nonce)
-        now = time.monotonic()
         for p in items:
             if p.nonce < latest:
                 r = self._scan_receipts(p)
@@ -1241,7 +1307,7 @@ class Backend:
                     self.log('unusual', 'nonce {} was mined, but by none of the {} versions we sent of {} {}; '
                              'no longer tracked'.format(p.nonce, len(p.hashes), p.kind, p.btc_txid or ''))
             elif p.replace_at is not None and now >= p.replace_at:
-                if p.nonce != latest:
+                if p.nonce != latest and not p.requeued:
                     p.replace_at = now + self.interval    # queued behind a lower nonce: can't mine yet
                     continue
                 fees = self._bumped(p)                    # outside the key lock (step 8)
@@ -1252,6 +1318,56 @@ class Backend:
                         self._replace(p, fees)
         if check_gaps or latest < self.nonce_hwm:
             self._fill_gaps(latest)
+
+    def _requeue_reorged(self, latest, now):
+        """A reorg took back nonces we had seen mined (the chain's nonce has
+        stayed below mined_floor for an INTERVAL, or CLN rebroadcast a tx
+        whose mined nonce is no longer below it): those sends are tracked
+        again and re-sent at once, lowest nonce first, each as the version
+        that was mined, as a mempool would keep them (bitcoind does; CLN
+        doesn't rebroadcast a wallet tx), so neither the txs nor the key are
+        lost. Nonces we no longer remember are left to _fill_gaps."""
+        cur = self.srpc.fees()               # outside the key lock (step 8)
+        with self._klock:
+            with self._plock:
+                back = sorted(n for n in self.recent if n >= latest and n not in self.pending)
+                for n in back:
+                    p = self.recent.pop(n)
+                    p.replace_at, p.missing, p.scan_pos, p.requeued = now, 0, 0, True
+                    self.pending[n] = p
+                self.mined_floor = latest
+                self._behind_since = None
+                self._save_pending()
+            if not back:
+                return
+            self.log('unusual', 'a reorg took back nonces {} that were mined: re-sending {}'.format(
+                back, ', '.join('{} {}'.format(self.pending[n].kind, self.pending[n].btc_txid or '')
+                                for n in back)))
+            for n in back:
+                with self._plock:
+                    p = self.pending.get(n)
+                if p is not None and p.requeued:
+                    self._replace(p, self._bumped(p, cur))
+
+    def _requeue_if_reorged(self, outpoints):
+        """Before a new nonce goes to a tx (5.3 step 4): if a send we saw
+        mined spends any of its prevouts and the chain's nonce is no longer
+        above that send's, a reorg took it back. It is re-sent at its own
+        nonce now (with the other sends the reorg took), instead of a second
+        copy at a new nonce, one of which would only revert. True if so."""
+        want = set(outpoints)
+
+        def hits(latest):
+            with self._plock:
+                return [n for n, p in self.recent.items()
+                        if n >= latest and p.kind == 'submit' and want & set(p.outpoints)]
+        if not hits(0):
+            return False
+        latest = self.srpc.nonce(self.address, 'latest')
+        if not hits(latest):
+            return False
+        self._requeue_reorged(latest, time.monotonic())
+        return True
 
     def _scan_receipts(self, p, per_tick=3):
         """Receipts of p's versions, newest first, stopping at the first hit;
@@ -1318,7 +1434,7 @@ class Backend:
         now = time.monotonic()
         p.replace_at = now + self.interval
         kind, to, data, value, gas = p.kind, p.to, p.data, p.value, p.gas
-        if kind == 'submit' and p.btc_txid and self.ix.tx(p.btc_txid) is not None:
+        if kind == 'submit' and p.btc_txid and not p.requeued and self.ix.tx(p.btc_txid) is not None:
             # A third party's copy was mined first (SPEC 4.2): ours would only
             # revert. Free the nonce with a 0-value self-send (committed only
             # if the node accepts it).
@@ -1336,13 +1452,14 @@ class Backend:
             self.log('broken', '{} {} (nonce {}) still not mined, fees now above {}x the first send\'s'.format(
                 p.kind, p.btc_txid or '', p.nonce, FEE_ALARM_MULTIPLE))
         raw, txhash = self._sign(p.nonce, tip, max_fee, gas, to, value, data)
-        old = (p.tip, p.max_fee, p.kind, p.to, p.data, p.value, p.gas, p.outpoints)
+        old = (p.tip, p.max_fee, p.kind, p.to, p.data, p.value, p.gas, p.outpoints, p.requeued)
 
         def restore():
             p.hashes.pop()
             p.hash_txid.pop(txhash, None)
-            p.tip, p.max_fee, p.kind, p.to, p.data, p.value, p.gas, p.outpoints = old
+            p.tip, p.max_fee, p.kind, p.to, p.data, p.value, p.gas, p.outpoints, p.requeued = old
         with self._plock:
+            p.requeued = False   # re-sent once as it was mined; a later replacement may cancel
             p.hashes.append(txhash)
             p.hash_txid[txhash] = p.btc_txid if kind == 'submit' else None
             p.tip, p.max_fee, p.kind, p.to, p.data, p.value, p.gas = tip, max_fee, kind, to, data, value, gas
@@ -1385,6 +1502,9 @@ class Backend:
             if self.pending.get(p.nonce) is p:
                 del self.pending[p.nonce]
                 self._save_pending()
+        self._settle(p)
+
+    def _settle(self, p):
         if not p.done.is_set():
             if p.result is None:
                 p.result = fail('no longer tracked')
@@ -1397,6 +1517,8 @@ class Backend:
         except (TypeError, ValueError):
             status = 0
         which = p.hash_txid.get(receipt.get('transactionHash'), p.btc_txid)
+        with self._plock:
+            self._as_mined(p, receipt.get('transactionHash'))     # its receipt is that version's
         if status == 1:
             if p.to == self.contract:
                 self.ix.add_receipt(receipt)
@@ -1412,11 +1534,37 @@ class Backend:
                 self.log(level, 'submit of {} (nonce {}) reverted on chain; {}'.format(which, p.nonce, why))
         p.result, p.receipt = res, receipt
         self.balance_dirty = True
-        self.mined_floor = max(self.mined_floor, p.nonce + 1)
-        self._drop(p)
+        with self._plock:
+            self.mined_floor = max(self.mined_floor, p.nonce + 1)
+            self.recent.pop(p.nonce, None)
+            self.recent[p.nonce] = p
+            while len(self.recent) > RECENT_KEEP:
+                self.recent.popitem(last=False)
+            if self.pending.get(p.nonce) is p:
+                del self.pending[p.nonce]
+            self._save_pending()
+        self._settle(p)
         self.log('info' if status == 1 else 'unusual', '{} {} (nonce {}) mined{}'.format(
             p.kind, which or '', p.nonce, '' if status == 1 else ', reverted'))
         return res
+
+    def _as_mined(self, p, txhash):
+        """Sets a submit's fields to its version that was mined (txhash): the
+        latest one may be a re-signed tx or a cancel that wasn't. The caller
+        holds _plock."""
+        if p.kind not in ('submit', 'cancel') or txhash not in p.hash_txid:
+            return
+        t = p.hash_txid[txhash]
+        if t is None:                        # the cancel
+            p.kind, p.to, p.data, p.value, p.gas, p.outpoints = 'cancel', self.address, b'', 0, 21_000, []
+            p.bodies = {}
+            return
+        body = p.bodies.get(t)
+        if body is None:
+            return
+        p.kind, p.btc_txid, p.to, p.value = 'submit', t, self.contract, 0
+        p.data, p.outpoints, p.gas = bytes.fromhex(body['data']), list(body['outpoints']), body['gas']
+        p.bodies = {t: body}
 
     def _inputs_spent_elsewhere(self, p):
         """True if an input of a reverted submit is no longer unspent: in the
@@ -1661,6 +1809,8 @@ class Backend:
         method = request.get('method')
         if method not in RPC_FILTER:         # lightningd filters too; this is for direct callers
             return {'result': 'continue'}
+        if self.cfg.dev_no_outbound_filter:  # tests: the peer's hooks must refuse it
+            return {'result': 'continue'}
         p = named_params(method, request.get('params'))
         r = None
         if p is None:
@@ -1747,17 +1897,48 @@ class Backend:
 
     def openchannel2_psbt(self, payload, hook):
         """openchannel2_changed and openchannel2_sign: 'continue' must hand
-        the PSBT back unchanged; anything else makes lightningd fail the open."""
+        the PSBT back unchanged. A refusal aborts the open first: lightningd
+        (upstream dual_open_control.c) crashes on a 'reject' from these two
+        hooks while dualopend runs (it frees the hook's payload but leaves its
+        destructor on dualopend, which fires when the reject kills dualopend:
+        any peer could crash us with a P2WSH input). Once dualopend is gone
+        the answer is ignored. May call lightningd: run it off pyln's thread."""
         psbt = payload.get('psbt')
         why = self.open_refusal() if self.option_problems else None
         if why:
             why = 'channel opens are refused: ' + why
         else:
             why = psbt_problem(psbt) if isinstance(psbt, str) else 'no PSBT'
-        if why:
-            self.log('info', '{} for {}: refused: {}'.format(hook, payload.get('channel_id'), why))
-            return {'result': 'reject'}
-        return {'result': 'continue', 'psbt': psbt}
+        if not why:
+            return {'result': 'continue', 'psbt': psbt}
+        cid = payload.get('channel_id')
+        self.log('info', '{} for {}: refused: {}'.format(hook, cid, why))
+        if self._abort_open(cid) and isinstance(psbt, str):
+            return {'result': 'continue', 'psbt': psbt}
+        return {'result': 'reject'}
+
+    def _abort_open(self, channel_id):
+        """Ends a dual-funded open we accepted (its dualopend exits):
+        openchannel_abort, else a forced disconnect of its peer. True if
+        lightningd did either."""
+        if self.lnrpc is None or not isinstance(channel_id, str):
+            return False
+        rpc = self.lnrpc()
+        try:
+            rpc.call('openchannel_abort', {'channel_id': channel_id})
+            return True
+        except Exception as e:               # noqa: B902
+            self.log('unusual', 'openchannel_abort {} failed ({}); disconnecting the peer'.format(
+                channel_id, type(e).__name__))
+        try:
+            peers = [c.get('peer_id') for c in rpc.call('listpeerchannels', {})['channels']
+                     if c.get('channel_id') == channel_id]
+            if peers:
+                rpc.call('disconnect', {'id': peers[0], 'force': True})
+                return True
+        except Exception as e:               # noqa: B902
+            self.log('broken', 'cannot end the refused open {} ({})'.format(channel_id, type(e).__name__))
+        return False
 
     def htlc_accepted(self, onion, htlc, forward_to=None):
         """Fails a forward whose outgoing channel already has MAX_HTLCS
@@ -1901,6 +2082,9 @@ def main():
     plugin.add_option('evm-confirm', 'safe', 'confirmation tag: safe or latest')
     plugin.add_option('evm-poll', '45', 'seconds between index polls (1 on anvil)')
     plugin.add_option('evm-min-balance', '0.01', 'ETH below which new channels are refused')
+    plugin.add_flag_option(DEV_NO_OUTBOUND_FILTER, 'tests only, needs --developer: our own channel opens skip '
+                           'the rpc_command checks, so the peer\'s hooks refuse them')
+    developer = '--developer' in sys.argv[1:]      # lightningd passes it to plugins it runs with --developer
 
     def log(level, msg):
         plugin.log(msg, level=level)
@@ -1914,7 +2098,7 @@ def main():
         rpc_path = os.path.join(ldir, configuration['rpc-file'])
         secrets = []
         try:
-            cfg = Config.from_options(plugin.get_option, ldir, os.environ, log)
+            cfg = Config.from_options(plugin.get_option, ldir, os.environ, log, developer=developer)
             secrets = cfg.secrets
             b = Backend(cfg, log, lnrpc=lambda: LightningRpc(rpc_path))
             b.connect()
@@ -2032,17 +2216,18 @@ def main():
         return guard('openchannel2', lambda: backend().openchannel2(openchannel2),
                      {'result': 'reject', 'error_message': 'internal error'})
 
-    @plugin.hook('openchannel2_changed')
-    def on_openchannel2_changed(openchannel2_changed, plugin, **kwargs):
-        return guard('openchannel2_changed',
-                     lambda: backend().openchannel2_psbt(openchannel2_changed, 'openchannel2_changed'),
-                     {'result': 'reject'})
+    # Async: a refusal calls lightningd (openchannel_abort) before answering.
+    @plugin.async_hook('openchannel2_changed')
+    def on_openchannel2_changed(openchannel2_changed, plugin, request, **kwargs):
+        in_thread('openchannel2_changed',
+                  lambda: backend().openchannel2_psbt(openchannel2_changed, 'openchannel2_changed'),
+                  request, {'result': 'reject'})
 
-    @plugin.hook('openchannel2_sign')
-    def on_openchannel2_sign(openchannel2_sign, plugin, **kwargs):
-        return guard('openchannel2_sign',
-                     lambda: backend().openchannel2_psbt(openchannel2_sign, 'openchannel2_sign'),
-                     {'result': 'reject'})
+    @plugin.async_hook('openchannel2_sign')
+    def on_openchannel2_sign(openchannel2_sign, plugin, request, **kwargs):
+        in_thread('openchannel2_sign',
+                  lambda: backend().openchannel2_psbt(openchannel2_sign, 'openchannel2_sign'),
+                  request, {'result': 'reject'})
 
     @plugin.async_hook('htlc_accepted')
     def on_htlc_accepted(plugin, onion, htlc, request, forward_to=None, **kwargs):
