@@ -501,6 +501,50 @@ in an environment variable) to deploy.
   - All three channels closed mutually, and the coins exited and were
     withdrawn.
   - Credits were 1.70–2.08M/day per node, the same problem as below.
+- **Token channels (`smoke_token4.py`):** run with the ERC-20 branch's
+  build (`claude/evm-erc20-a81e83`, `UtxoChainToken`, not merged here).
+  - **Contracts:** a 6-decimal test token
+    `0x664dc332055B204cA046621CA643313386FbE04A` (1 unit per sat), and
+    UtxoChainToken `0x3Ef3741199e5abf57514e4B075194877ff680fAf`.
+  - **Nodes:** four in a line, A–B–C–D, with 2,000,000-unit channels. A fifth
+    node, E, runs on the ETH contract and is connected only to D.
+  - **Result:** passed in 24 min, with no BROKEN lines.
+    - The deposits (approve + deposit) are exact.
+    - Gossip reached A–D in 250–450 s. D verified A–B in the token contract.
+    - E received the same announcements and rejected them ("could not find
+      channel"), as open question 2 expects.
+    - The three-hop payments went both ways, and B and C each forwarded both.
+    - After the closes, exits and withdrawals, 15,000,000 minted = 14,900,000
+      back on the nodes + 100,000 in the contract, which is exactly the four
+      25,000-sat emergency reserves in the wallets.
+  - **A bug in the script's check:** the first run compared the contract with
+    CLN's wallet before CLN had marked the exits' inputs spent, which it does
+    only once they are under `safe`. The check now waits for that.
+- **nodeui on the real testnets:** 6 nodes: 2 Base Sepolia ETH, 2 tUSD and
+  Liquid testnet A and B. 42/42 checks passed through the UI's API:
+  - every flow on each network;
+  - cross-network opens and pays refused.
+
+  **Fixed afterwards:**
+  - **Cached `evm-status` reads (5.5):** the UI polls every 300 s off anvil
+    and has a Refresh button. Two nodes idle under the UI now use about 0.40M
+    credits/day each, the same as without the UI.
+  - **10,000-block `eth_getLogs` ranges:** Infura's cap on Base Sepolia. The
+    plugin also adopts a lower limit when the node states one, and jitters
+    catch-up. A fresh node caught up on the 3-day-old contract (~870k
+    blocks) in 159 s with 124 calls, against 510 s and ~600 calls before.
+  - **One job per network ID:** different networks run in parallel.
+  - **Rounded ETH amounts.**
+  - **The emergency-reserve hint.**
+
+  **Open: catch-up cost grows with the contract's age.** Base Sepolia makes
+  a block every 200 ms, so it is about 43 calls (about 11k credits) per day
+  of age: a fresh node on a 1-year-old contract would need about 4M credits,
+  more than a free day.
+
+  **Proposed fix:** start from an index snapshot from any source, proven
+  with a single `eth_call` of `logHash` at its checkpoint block. That hash
+  commits to the whole history, so the snapshot doesn't need to be trusted.
 - **The lag `L`:** `safe` trailed by 46–132 s, which is 2.5–4.5 virtual
   blocks. `finalized` trailed by about 19 min. The 5.6 margins (2.4 h, 24 h)
   are about 30× `L`.

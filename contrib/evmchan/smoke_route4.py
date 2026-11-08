@@ -122,9 +122,9 @@ def main():
              'only through C and B'.format(ab, d_ab[0]['amount_msat'] // 1000),
              len(d_ab) == 2 and all(ch['amount_msat'] == CHANNEL_SAT * 1000 for ch in d_ab))
         res = funded['AB']
-        step('D verifies the A-B funding output on chain (getutxout through its plugin)',
-             d.rpc.call('getutxout', {'txid': res['txid'], 'vout': res['outnum']}) ==
-             a.rpc.call('getutxout', {'txid': res['txid'], 'vout': res['outnum']}))
+        outpoint = {'txid': res['txid'], 'vout': res['outnum']}
+        seen_by_d, seen_by_a = d.rpc.call('getutxout', outpoint), a.rpc.call('getutxout', outpoint)
+        step('D verifies the A-B funding output on chain (getutxout through its plugin)', seen_by_d == seen_by_a)
 
         route = a.rpc.getroutes(a.info['id'], d.info['id'], PAY_MSAT, layers=[], maxfee_msat=100_000, final_cltv=144)
         path = [h['short_channel_id_dir'].split('/')[0] for h in route['routes'][0]['path']]

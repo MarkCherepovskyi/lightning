@@ -80,7 +80,7 @@ def credits(calls):
 
 
 class Node:
-    def __init__(self, name, work, lightningd, contract):
+    def __init__(self, name, work, lightningd, contract, plugin=None):
         self.name, self.port = name, free_port()
         self.dir = os.path.join(work, name)
         keyfile = os.path.join(self.dir, 'regtest', 'evm-key')
@@ -96,7 +96,7 @@ class Node:
         self.account = evm.Account(key)
         self.eth = self.account.address
         self.args = [lightningd, '--network=regtest', '--lightning-dir=' + self.dir,
-                     '--disable-plugin=bcli', '--plugin=' + os.path.join(HERE, 'evmbackend.py'),
+                     '--disable-plugin=bcli', '--plugin=' + (plugin or os.path.join(HERE, 'evmbackend.py')),
                      '--evm-rpc=' + RPC_TEMPLATE, '--evm-contract=' + contract,
                      '--evm-confirm=safe', '--evm-poll=60',
                      '--bind-addr=127.0.0.1:%d' % self.port, '--log-level=debug',
@@ -139,6 +139,11 @@ class Node:
         return sum(o['amount_msat'] // 1000 for o in self.rpc.listfunds()['outputs'] if o['status'] == 'confirmed')
 
 
+def withdrawable(status):
+    """What the contract owes the node: wei, or token units in token mode."""
+    return status.get('withdrawable_units', status.get('withdrawable_wei', 0))
+
+
 def exit_coins(nodes):
     """Each node's wallet to the exit address of its own ETH address, then
     the contract's withdraw() to that address. Waits until every channel's
@@ -167,7 +172,7 @@ def exit_coins(nodes):
         left = n.confirmed_sat()
         if left:
             log('{}: {} sat stay in the wallet (min-emergency-msat)'.format(n.name, left))
-    wait_for(lambda: all(n.status()['withdrawable_wei'] > 0 for n in sent), 600, 'exits credited')
+    wait_for(lambda: all(withdrawable(n.status()) > 0 for n in sent), 600, 'exits credited')
     for n in sent:
         n.rpc.call('evm-withdraw')
 

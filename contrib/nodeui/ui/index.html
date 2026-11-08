@@ -1,0 +1,921 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="nodeui-token" content="__NODEUI_TOKEN__">
+<title>Lightning Nodes</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
+<style>
+/* Layout: one screen, left column shows the networks (maps, nodes, EVM status, channels), right column acts on them.
+   Look: as contrib/assetchan's page: near-black ground, square corners, one blue accent. */
+:root {
+  --bg: #0C0C0F;
+  --panel: #111316;
+  --raised: #1D2127;
+  --line: #2A2F36;
+  --fg: #FFFFFF;
+  --muted: #B5BDC2;
+  --dim: #7A8086;
+  --accent: #1187C1;
+  --accent-hi: #00C3FF;
+  --on-accent: #0C0C0F;
+  --ok: #00B45A;
+  --warn: #DFB316;
+  --bad: #DD1F48;
+  --btc: #F7931A;
+  --lbtc: #22E1C9;
+  --evm: #9A94FF;
+  --a1: #7973F4;
+  --a2: #DFB316;
+  --a3: #DD1F48;
+  --a4: #3C82F9;
+  --display: "Chakra Petch", "Rajdhani", "Arial Narrow", sans-serif;
+  --body: Inter, "Helvetica Neue", Helvetica, Arial, sans-serif;
+  --mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+body {
+  margin: 0; background: var(--bg); color: var(--fg);
+  font: 14px/1.5 var(--body);
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+  padding-block: 0 48px;
+}
+h1, h2, h3 { font-family: var(--display); margin: 0; text-wrap: balance; }
+h2 { font-size: 13px; font-weight: 600; letter-spacing: .12em; text-transform: uppercase; color: var(--muted); }
+h3 { font-size: 16px; font-weight: 700; }
+button, input, select, textarea { font: inherit; color: inherit; }
+.num { font-variant-numeric: tabular-nums; }
+.mono { font-family: var(--mono); font-size: 12px; }
+:focus-visible { outline: 2px solid var(--accent-hi); outline-offset: 2px; }
+.sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+
+/* header */
+.bar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px 24px;
+  max-width: 1320px; margin: 0 auto; padding-block: 18px; border-bottom: 1px solid var(--line); }
+.bar h1 { font-size: 26px; font-weight: 700; letter-spacing: .01em; }
+.bar h1 small { font: 600 11px var(--display); letter-spacing: .14em; text-transform: uppercase; color: var(--accent-hi);
+  border: 1px solid var(--accent); padding: 2px 6px; margin-left: 10px; vertical-align: middle; }
+.chain { display: flex; align-items: center; gap: 10px; color: var(--muted); }
+.dot { width: 8px; height: 8px; background: var(--dim); flex: none; display: inline-block; }
+.dot.ok { background: var(--ok); } .dot.warn { background: var(--warn); } .dot.bad { background: var(--bad); }
+
+/* network switcher */
+.nets { display: flex; flex-wrap: wrap; gap: 8px; max-width: 1320px; margin: 16px auto 0; align-items: center; }
+.nets .lbl { color: var(--dim); font: 600 11px var(--display); letter-spacing: .12em; text-transform: uppercase; margin-right: 4px; }
+.nets button { background: var(--panel); border: 1px solid var(--line); padding: 6px 12px; cursor: pointer; display: inline-flex; gap: 8px; align-items: center;
+  font: 500 12px var(--mono); color: var(--muted); }
+.nets button:hover { border-color: var(--dim); color: var(--fg); }
+.nets button[aria-pressed="true"] { border-color: var(--accent-hi); color: var(--fg); background: var(--raised); }
+.nets button .cnt { color: var(--dim); }
+
+/* badges */
+.badge { display: inline-block; font: 500 11px var(--mono); padding: 1px 6px; border: 1px solid var(--k, var(--dim)); color: var(--k, var(--muted));
+  white-space: nowrap; max-width: 100%; overflow: hidden; text-overflow: ellipsis; vertical-align: middle; }
+.k-bitcoin { --k: var(--btc); } .k-liquid { --k: var(--lbtc); } .k-evm { --k: var(--evm); }
+.kdot { width: 8px; height: 8px; display: inline-block; background: var(--k, var(--dim)); }
+
+/* grid */
+main { display: grid; grid-template-columns: minmax(0, 1fr) 390px; gap: 24px; max-width: 1320px; margin: 16px auto 0; align-items: start; }
+.col { display: flex; flex-direction: column; gap: 24px; min-width: 0; }
+.side { position: sticky; top: 16px; }
+@media (max-width: 980px) { main { grid-template-columns: minmax(0, 1fr); } .side { position: static; order: -1; } }
+
+.panel { background: var(--panel); border: 1px solid var(--line); min-width: 0; }
+.panel[hidden] { display: none; }
+.panel > header { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 8px 12px; padding: 12px 16px; border-bottom: 1px solid var(--line); }
+.panel > .body { padding: 16px; }
+.legend { display: flex; flex-wrap: wrap; gap: 6px 16px; color: var(--muted); font-size: 12px; }
+.legend i { display: inline-block; width: 14px; height: 3px; margin-right: 6px; vertical-align: middle; }
+.legend i.dash { background: repeating-linear-gradient(90deg, var(--dim) 0 4px, transparent 4px 7px); }
+
+/* banners */
+#alerts { display: flex; flex-direction: column; gap: 8px; }
+#alerts:empty { display: none; }
+.banner { border: 1px solid var(--bad); background: rgba(221, 31, 72, .12); padding: 10px 14px; display: flex; gap: 10px; align-items: baseline; }
+.banner b { font-family: var(--display); letter-spacing: .04em; white-space: nowrap; }
+.banner.warn { border-color: var(--warn); background: rgba(223, 179, 22, .10); }
+.banner ul { margin: 0; padding-left: 18px; }
+
+/* maps */
+.maps { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); }
+.map { padding: 12px 16px; border-right: 1px solid var(--line); border-bottom: 1px solid var(--line); margin: 0 -1px -1px 0; min-width: 0; }
+.map svg { display: block; width: 100%; height: auto; max-height: 240px; }
+.map svg text { font-family: var(--body); fill: var(--fg); }
+.map .nm { font: 600 13px var(--display); letter-spacing: .04em; }
+.map .fx { font: 10px var(--mono); fill: var(--dim); }
+.map .cap { font: 11px var(--mono); fill: var(--muted); paint-order: stroke; stroke: var(--panel); stroke-width: 5px; }
+.map .empty { padding: 20px 0; }
+
+/* nodes */
+.nodes { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); }
+.node { padding: 14px 16px; display: flex; flex-direction: column; gap: 8px; min-width: 0; border-right: 1px solid var(--line); border-bottom: 1px solid var(--line); margin: 0 -1px -1px 0; }
+.node .top { display: flex; align-items: center; gap: 8px; }
+.node .name { font: 700 18px var(--display); }
+.node .id { color: var(--dim); margin-left: auto; cursor: pointer; background: none; border: 0; padding: 0; }
+.node .id:hover { color: var(--accent-hi); }
+.bal { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: baseline; gap: 2px 8px; }
+.bal > span:first-child { color: var(--muted); font-size: 12px; }
+.bal b { font: 500 13px var(--mono); text-align: right; }
+.peers, .sub { color: var(--dim); font-size: 12px; overflow-wrap: anywhere; }
+.down { color: var(--bad); font-size: 12px; overflow-wrap: anywhere; }
+
+/* evm status */
+.evms { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); }
+.evm { padding: 14px 16px; border-right: 1px solid var(--line); border-bottom: 1px solid var(--line); margin: 0 -1px -1px 0; display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+.evm dl { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 4px 14px; margin: 0; font-size: 13px; }
+.evm dt { color: var(--muted); font-size: 12px; }
+.evm dd { margin: 0; font: 12px var(--mono); overflow-wrap: anywhere; }
+.evm dd.warn { color: var(--warn); } .evm dd.bad { color: var(--bad); }
+.evm .banner { font-size: 12px; }
+
+/* chips + pills */
+.chip { display: inline-flex; align-items: center; gap: 6px; font: 500 12px var(--mono); }
+.chip::before { content: ""; width: 8px; height: 8px; background: var(--c, var(--muted)); }
+.pill { display: inline-block; padding: 1px 8px; font: 600 11px var(--display); letter-spacing: .1em; text-transform: uppercase; border: 1px solid currentColor; }
+.pill.open { color: var(--ok); } .pill.opening, .pill.closing, .pill.running, .pill.onchain { color: var(--warn); } .pill.closed { color: var(--dim); }
+.pill.failed { color: var(--bad); } .pill.done { color: var(--ok); }
+
+/* tables */
+.tablewrap { overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; min-width: 720px; }
+th { text-align: left; font: 600 11px var(--display); letter-spacing: .12em; text-transform: uppercase; color: var(--dim); padding: 10px 16px; border-bottom: 1px solid var(--line); }
+td { padding: 12px 16px; border-bottom: 1px solid var(--line); vertical-align: middle; }
+tr:last-child td { border-bottom: 0; }
+tr.dim td { opacity: .55; }
+.pair { font: 600 15px var(--display); white-space: nowrap; }
+.pair span { color: var(--dim); font-weight: 400; padding: 0 6px; }
+.split { display: flex; flex-direction: column; gap: 4px; min-width: 170px; }
+.split .barline { display: flex; height: 6px; background: var(--raised); }
+.split .barline i { background: var(--c); display: block; }
+.split .nums { display: flex; justify-content: space-between; font: 12px var(--mono); color: var(--muted); }
+.confirm { display: block; color: var(--warn); font: 11px var(--mono); margin-top: 3px; }
+.raw { display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; color: var(--dim); font: 11px var(--mono); margin-top: 3px; min-width: 190px; max-width: 280px; overflow-wrap: anywhere; }
+.empty { padding: 28px 16px; color: var(--muted); text-align: center; }
+
+/* buttons + forms */
+.btn { background: var(--accent); color: var(--on-accent); border: 0; padding: 10px 16px; font: 700 15px var(--display); letter-spacing: .02em; cursor: pointer; }
+.btn:hover:not(:disabled) { background: var(--accent-hi); }
+.btn:disabled { background: var(--raised); color: var(--dim); cursor: not-allowed; }
+.btn.ghost { background: none; color: var(--accent-hi); border: 1px solid var(--accent); padding: 4px 12px; font-size: 13px; }
+.btn.ghost:hover:not(:disabled) { background: var(--accent); color: var(--on-accent); }
+.link { background: none; border: 0; color: var(--muted); cursor: pointer; padding: 0; font-size: 12px; }
+.link:hover { color: var(--accent-hi); }
+
+.tabs { display: flex; border-bottom: 1px solid var(--line); overflow-x: auto; }
+.tabs button { flex: 1; background: none; border: 0; border-bottom: 2px solid transparent; padding: 12px 8px; cursor: pointer; color: var(--muted);
+  font: 600 12px var(--display); letter-spacing: .08em; text-transform: uppercase; white-space: nowrap; }
+.tabs button[aria-selected="true"] { color: var(--fg); border-bottom-color: var(--accent-hi); }
+.tabs button:hover { color: var(--fg); }
+.tabs button[hidden] { display: none; }
+[role=tabpanel][hidden] { display: none; }
+form { display: flex; flex-direction: column; gap: 14px; padding: 16px; }
+form + form { border-top: 1px solid var(--line); }
+form h3 { font-size: 14px; letter-spacing: .04em; color: var(--muted); }
+.row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+label { display: flex; flex-direction: column; gap: 4px; color: var(--muted); font-size: 12px; min-width: 0; }
+fieldset { border: 0; padding: 0; margin: 0; display: flex; gap: 16px; }
+legend { color: var(--muted); font-size: 12px; padding: 0; margin-bottom: 4px; float: left; width: 100%; }
+input[type=text], input[type=number], select, textarea { background: var(--bg); border: 1px solid var(--line); padding: 9px 10px; color: var(--fg); width: 100%; min-width: 0; border-radius: 0; font-size: 14px; }
+textarea { font: 12px var(--mono); resize: vertical; min-height: 70px; }
+input:hover, select:hover, textarea:hover { border-color: var(--dim); }
+input:focus, select:focus, textarea:focus { border-color: var(--accent-hi); outline: 0; }
+input:disabled { opacity: .5; }
+label.check { flex-direction: row; align-items: center; gap: 8px; font-size: 13px; }
+input[type=checkbox], input[type=radio] { accent-color: var(--accent); width: 16px; height: 16px; margin: 0; }
+.hint { color: var(--dim); font-size: 12px; margin: 0; }
+.warnbox { border: 1px solid var(--warn); color: var(--warn); padding: 8px 10px; font-size: 12px; margin: 0; }
+.none { padding: 20px 16px; color: var(--muted); }
+
+/* activity */
+.job .title { padding: 12px 16px 0; display: flex; gap: 10px; align-items: start; justify-content: space-between; }
+.job .title p { margin: 0; font-weight: 500; overflow-wrap: anywhere; }
+.job .meta { padding: 4px 16px 0; color: var(--dim); font-size: 12px; display: flex; flex-wrap: wrap; gap: 6px 10px; align-items: center; }
+.job .result { padding: 8px 16px 0; display: flex; gap: 8px; flex-wrap: wrap; }
+pre.log { margin: 12px 0 0; padding: 12px 16px; background: var(--bg); border-top: 1px solid var(--line); font: 12px/1.6 var(--mono); color: var(--muted);
+  white-space: pre-wrap; overflow-wrap: anywhere; max-height: 260px; overflow-y: auto; }
+.history { list-style: none; margin: 0; padding: 8px 16px 12px; border-top: 1px solid var(--line); display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--muted); }
+.history:empty { display: none; }
+.history li { display: flex; gap: 8px; align-items: baseline; }
+.history li span:last-child { overflow-wrap: anywhere; }
+.history details { width: 100%; }
+.history summary { display: flex; gap: 8px; align-items: baseline; cursor: pointer; list-style: none; }
+.history summary::-webkit-details-marker { display: none; }
+.history summary::before { content: "▸"; color: var(--dim); }
+.history details[open] summary::before { content: "▾"; }
+.history pre.log { margin: 6px 0 0; max-height: 180px; }
+.job + .job { border-top: 1px solid var(--line); }
+.jobcard { padding-bottom: 4px; }
+.jobcard + .jobcard { border-top: 1px solid var(--line); }
+.progress { color: var(--warn); font-size: 12px; overflow-wrap: anywhere; }
+.pulse { animation: pulse 1.4s ease-in-out infinite; }
+@keyframes pulse { 50% { opacity: .45; } }
+@media (prefers-reduced-motion: reduce) { .pulse { animation: none; } }
+#toast { position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%); background: var(--raised); border: 1px solid var(--line); padding: 10px 16px; max-width: 90vw; }
+#toast.bad { border-color: var(--bad); }
+</style>
+</head>
+<body>
+<div class="bar">
+  <h1>Lightning Nodes <small>bitcoin · liquid · evm</small></h1>
+  <div class="chain" id="chain"><span class="dot"></span><span>Connecting</span></div>
+</div>
+
+<nav class="nets" aria-label="Network" id="nets"></nav>
+
+<main>
+  <div class="col">
+    <div id="alerts"></div>
+
+    <section class="panel" aria-labelledby="h-map">
+      <header>
+        <h2 id="h-map">Network maps</h2>
+        <div class="legend" id="legend"></div>
+      </header>
+      <div class="maps" id="maps"></div>
+    </section>
+
+    <section class="panel" aria-labelledby="h-nodes">
+      <header><h2 id="h-nodes">Nodes</h2><span class="hint" id="nodes-hint"></span></header>
+      <div class="nodes" id="nodes"></div>
+    </section>
+
+    <section class="panel" aria-labelledby="h-evm" id="evm-panel" hidden>
+      <header><h2 id="h-evm">EVM status</h2><span class="hint">Credits priced as Infura's; the free tier is 3M a day.</span></header>
+      <div class="evms" id="evms"></div>
+    </section>
+
+    <section class="panel" aria-labelledby="h-chan">
+      <header><h2 id="h-chan">Channels</h2><button class="link" id="toggleClosed" type="button"></button></header>
+      <div class="tablewrap"><table>
+        <thead><tr><th>Channel</th><th>Network</th><th>State</th><th>Balance (left | right)</th><th><span class="sr">Actions</span></th></tr></thead>
+        <tbody id="channels"></tbody>
+      </table></div>
+    </section>
+
+    <section class="panel" aria-labelledby="h-sweeps" id="sweeps-panel" hidden>
+      <header><h2 id="h-sweeps">Asset sweeps</h2><span class="hint">assetchan-sweeps: asset outputs after a unilateral close</span></header>
+      <div class="tablewrap"><table>
+        <thead><tr><th>Node</th><th>Outpoint</th><th>Asset</th><th>From block</th><th>Deadline</th><th>Sweep tx</th></tr></thead>
+        <tbody id="sweeps"></tbody>
+      </table></div>
+    </section>
+  </div>
+
+  <aside class="col side">
+    <section class="panel" aria-label="Actions">
+      <div class="tabs" role="tablist" id="tabs" aria-label="Actions">
+        <button role="tab" type="button" aria-selected="true" aria-controls="p-open" id="t-open" data-tab="open">Open</button>
+        <button role="tab" type="button" aria-selected="false" aria-controls="p-pay" id="t-pay" data-tab="pay" tabindex="-1">Pay</button>
+        <button role="tab" type="button" aria-selected="false" aria-controls="p-invoice" id="t-invoice" data-tab="invoice" tabindex="-1">Invoice</button>
+        <button role="tab" type="button" aria-selected="false" aria-controls="p-close" id="t-close" data-tab="close" tabindex="-1">Close</button>
+        <button role="tab" type="button" aria-selected="false" aria-controls="p-chain" id="t-chain" data-tab="chain" tabindex="-1">On-chain</button>
+        <button role="tab" type="button" aria-selected="false" aria-controls="p-evm" id="t-evm" data-tab="evm" tabindex="-1">EVM</button>
+        <button role="tab" type="button" aria-selected="false" aria-controls="p-mine" id="t-mine" data-tab="mine" tabindex="-1">Mine</button>
+      </div>
+
+      <div role="tabpanel" id="p-open" aria-labelledby="t-open">
+        <form data-action="open">
+          <div class="row">
+            <label>From<select name="frm" id="open-frm"></select></label>
+            <label>To<select name="to" id="open-to"></select></label>
+          </div>
+          <label id="open-asset-l">Asset<select name="asset" id="open-asset"></select></label>
+          <label><span id="open-unit">Amount (sat)</span><input name="amount" type="number" min="1" step="1" value="100000" required></label>
+          <label class="check"><input name="announce" type="checkbox"> Announce to the network</label>
+          <p class="hint" id="open-hint"></p>
+          <button class="btn" type="submit">Open channel</button>
+        </form>
+      </div>
+
+      <div role="tabpanel" id="p-pay" aria-labelledby="t-pay" hidden>
+        <form data-action="pay">
+          <label>From<select name="frm" id="pay-frm"></select></label>
+          <fieldset><legend>Pay</legend>
+            <label class="check"><input type="radio" name="mode" value="node" checked> A node on this page</label>
+            <label class="check"><input type="radio" name="mode" value="invoice"> An invoice</label>
+          </fieldset>
+          <label id="pay-to-l">To<select name="to" id="pay-to"></select></label>
+          <label id="pay-bolt11-l" hidden>Invoice (bolt11)<textarea name="bolt11" id="pay-bolt11" spellcheck="false" autocomplete="off" placeholder="lnbcrt…"></textarea></label>
+          <label id="pay-asset-l">Asset<select name="asset" id="pay-asset"></select></label>
+          <label id="pay-amount-l"><span id="pay-unit">Amount (sat)</span><input name="amount" type="number" min="1" step="1" value="1000"></label>
+          <p class="hint" id="pay-hint">Finds a path over open channels on the same network. Several hops are fine.</p>
+          <button class="btn" type="submit">Send payment</button>
+        </form>
+      </div>
+
+      <div role="tabpanel" id="p-invoice" aria-labelledby="t-invoice" hidden>
+        <form data-action="invoice">
+          <label>Node<select name="node" id="inv-node"></select></label>
+          <label id="inv-asset-l">Asset<select name="asset" id="inv-asset"></select></label>
+          <label><span id="inv-unit">Amount (sat)</span><input name="amount" type="number" min="1" step="1" value="1000" required></label>
+          <label>Description<input name="description" type="text" maxlength="100" value="nodeui invoice"></label>
+          <p class="hint">The invoice shows in Activity, with a button to copy it.</p>
+          <button class="btn" type="submit">Create invoice</button>
+        </form>
+      </div>
+
+      <div role="tabpanel" id="p-close" aria-labelledby="t-close" hidden>
+        <form data-action="close">
+          <label>Channel<select name="chan" id="close-chan"></select></label>
+          <label class="check"><input name="force" type="checkbox" id="close-force"> Peer is offline (force close)</label>
+          <p class="warnbox" id="close-warn" hidden>Force close makes the node fail the channel and broadcast its commitment; each side then sweeps its outputs as the timelocks pass. Where the page can mine, it mines those blocks.</p>
+          <button class="btn" type="submit">Close channel</button>
+        </form>
+      </div>
+
+      <div role="tabpanel" id="p-chain" aria-labelledby="t-chain" hidden>
+        <form data-action="send">
+          <h3>Send</h3>
+          <label>From node<select name="node" id="send-node"></select></label>
+          <label>Address<input name="address" type="text" autocomplete="off" spellcheck="false" placeholder="bcrt1…" id="send-address" required></label>
+          <div class="row">
+            <label id="send-asset-l">Asset<select name="asset" id="send-asset"></select></label>
+            <label><span id="send-unit">Amount (sat)</span><input name="amount" type="number" min="1" step="1" value="10000" id="send-amount"></label>
+          </div>
+          <label class="check" id="send-all-l"><input name="all" type="checkbox" id="send-all"> Everything in the wallet</label>
+          <p class="hint" id="send-hint"></p>
+          <button class="btn" type="submit">Send on-chain</button>
+        </form>
+        <form data-action="newaddr">
+          <h3>New address</h3>
+          <div class="row">
+            <label>Node<select name="node" id="addr-node"></select></label>
+            <label>Type<select name="type" id="addr-type"></select></label>
+          </div>
+          <button class="btn" type="submit">New address</button>
+        </form>
+        <form data-action="fund" id="f-fund">
+          <h3>Fund a node</h3>
+          <div class="row">
+            <label>Node<select name="node" id="fund-node"></select></label>
+            <label>Amount (sat)<input name="amount" type="number" min="1" step="1" value="1000000" required></label>
+          </div>
+          <p class="hint" id="fund-hint">Liquid: L-BTC from the elementsd wallet. Bitcoin regtest: from bitcoind's wallet.</p>
+          <button class="btn" type="submit">Fund node</button>
+        </form>
+      </div>
+
+      <div role="tabpanel" id="p-evm" aria-labelledby="t-evm" hidden>
+        <form data-action="deposit">
+          <h3>Deposit</h3>
+          <div class="row">
+            <label>Node<select name="node" id="dep-node"></select></label>
+            <label>Amount (sat)<input name="amount" type="number" min="1" step="1" value="1000000" required></label>
+          </div>
+          <p class="hint" id="dep-hint">From the node's ETH key to a fresh address of its wallet.</p>
+          <button class="btn" type="submit">Deposit</button>
+        </form>
+        <form data-action="exit">
+          <h3>Exit</h3>
+          <div class="row">
+            <label>Node<select name="node" id="exit-node"></select></label>
+            <label>Amount (sat)<input name="amount" type="number" min="1" step="1" value="100000" id="exit-amount"></label>
+          </div>
+          <label class="check"><input name="all" type="checkbox" id="exit-all"> Everything in the wallet</label>
+          <p class="hint">A <span class="mono">withdraw</span> to <span class="mono">evm-exitaddr</span> of the node's own ETH address: the contract credits it as withdrawable.</p>
+          <button class="btn" type="submit">Exit to ETH address</button>
+        </form>
+        <form data-action="withdraw">
+          <h3>Withdraw</h3>
+          <label>Node<select name="node" id="wd-node"></select></label>
+          <p class="hint" id="wd-hint">evm-withdraw: pays the node's ETH address what the contract holds for it.</p>
+          <button class="btn" type="submit">Withdraw</button>
+        </form>
+      </div>
+
+      <div role="tabpanel" id="p-mine" aria-labelledby="t-mine" hidden>
+        <form data-action="mine">
+          <div class="row">
+            <label>Network<select name="net" id="mine-net"></select></label>
+            <label>Blocks<input name="blocks" type="number" min="1" max="500" step="1" value="6" required></label>
+          </div>
+          <p class="hint" id="mine-hint"></p>
+          <button class="btn" type="submit">Mine</button>
+        </form>
+      </div>
+    </section>
+
+    <section class="panel job" aria-labelledby="h-job">
+      <header><h2 id="h-job">Activity</h2><span id="job-state" aria-live="polite"></span></header>
+      <div id="job"></div>
+      <ul class="history" id="history" aria-label="Earlier actions"></ul>
+    </section>
+  </aside>
+</main>
+<div id="toast" role="status" hidden></div>
+
+<script>
+const $ = s => document.querySelector(s);
+const $$ = s => [...document.querySelectorAll(s)];
+const demo = new URLSearchParams(location.search).has('demo');
+const TOKEN = document.querySelector('meta[name=nodeui-token]').content;
+const ASSET_COLORS = ['--a1', '--a2', '--a3', '--a4'];
+const KIND = {bitcoin: 'Bitcoin', liquid: 'Liquid', evm: 'EVM'};
+let S = null, showClosed = false, sel = 'all';
+try { sel = localStorage.getItem('nodeui-net') || 'all'; } catch (e) {}
+
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]));
+const n = x => Number(x).toLocaleString('en-US');
+const shortAddr = a => a && a.length > 12 ? a.slice(0, 6) + '…' + a.slice(-4) : (a || '');
+const ago = s => s == null ? '–' : s >= 3600 ? `${(s / 3600).toFixed(1)} h` : s >= 60 ? `${Math.round(s / 60)} min` : `${Math.round(s)} s`;
+const assetLabel = a => !a || a === 'lbtc' ? 'L-BTC' : (S.assets[a] || a.slice(0, 8));
+function color(label, kind) {
+  if (kind === 'bitcoin') return 'var(--btc)';
+  if (kind === 'evm') return 'var(--evm)';
+  if (!label || label === 'L-BTC') return 'var(--lbtc)';
+  const i = Object.values(S.assets).indexOf(label);
+  return 'var(' + ASSET_COLORS[(i < 0 ? 0 : i) % ASSET_COLORS.length] + ')';
+}
+const netOf = id => S.networks.find(x => x.id === id);
+function badge(net, kind, title) {
+  if (!net) return '<span class="badge">unknown</span>';
+  const base = net.split('/')[0], info = netOf(base);
+  const short = info ? info.short + (net.includes('/') ? '/' + net.split('/').slice(1).join('/') : '') : net;
+  return `<span class="badge k-${esc(kind || (info && info.kind))}" title="${esc(title || (info ? info.title + ' · ' + net : net))}">${esc(short)}</span>`;
+}
+/* Only touch the DOM when the markup changed, so a click never lands on a node that was just replaced. */
+function put(sel, html) {
+  const el = typeof sel === 'string' ? $(sel) : sel;
+  if (el.dataset.h !== html) { el.innerHTML = html; el.dataset.h = html; }
+}
+let toastTimer;
+function toast(msg, bad) {
+  const t = $('#toast'); t.textContent = msg; t.className = bad ? 'bad' : ''; t.hidden = false;
+  clearTimeout(toastTimer); toastTimer = setTimeout(() => t.hidden = true, 6000);
+}
+function copy(text, what) {
+  navigator.clipboard.writeText(text).then(() => toast(what + ' copied.'), () => toast(text));
+}
+
+/* ------------------------------------------------------------ data */
+async function refresh() {
+  try {
+    const r = await fetch(demo ? 'demo.json' : 'api/state', {cache: 'no-store', headers: demo ? {} : {'X-NodeUI-Token': TOKEN}});
+    if (r.status === 503) { $('#chain').innerHTML = '<span class="dot warn"></span><span>Reading the nodes…</span>'; return; }
+    if (!r.ok) throw new Error(r.status);
+    S = await r.json();
+    render();
+  } catch (e) {
+    $('#chain').innerHTML = '<span class="dot bad"></span><span>Server not reachable</span>';
+  }
+}
+
+async function post(path, body) {
+  const r = await fetch(path, {method: 'POST', headers: {'Content-Type': 'application/json', 'X-NodeUI-Token': TOKEN}, body: JSON.stringify(body)});
+  const j = await r.json();
+  if (!r.ok) throw new Error(j.error || r.status);
+  return j;
+}
+
+async function act(body) {
+  if (demo) { toast('Demo data: nothing was sent.'); return; }
+  try {
+    const r = await fetch('api/job', {method: 'POST', headers: {'Content-Type': 'application/json', 'X-NodeUI-Token': TOKEN}, body: JSON.stringify(body)});
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.error || r.status);
+    if (j.status === 'waiting') toast('Queued: it starts when the action before it on this network ends.');
+    refresh();
+  } catch (e) { toast(e.message, true); }
+}
+
+/* ------------------------------------------------------------ filters */
+const inNet = net => sel === 'all' || net === sel;
+const visNodes = () => S.nodes.filter(x => inNet(x.net));
+const upNodes = () => visNodes().filter(x => x.ok && x.detected && x.net && !x.net.includes('?'));
+const visChannels = () => S.channels.filter(c => inNet(c.node_net));
+const nodeBy = name => S.nodes.find(x => x.name === name);
+
+/* ------------------------------------------------------------ render */
+function render() {
+  if (sel !== 'all' && !netOf(sel)) sel = 'all';
+  renderChain(); renderNets(); renderAlerts(); renderMaps(); renderNodes(); renderEvm(); renderChannels(); renderSweeps();
+  renderForms(); renderJobs();
+}
+
+function renderChain() {
+  const down = S.nodes.filter(x => !x.ok).length;
+  const sync = S.networks.some(x => x.syncing);
+  const dot = down ? 'bad' : sync ? 'warn' : 'ok';
+  const txt = `${S.nodes.length} node${S.nodes.length === 1 ? '' : 's'} on ${S.networks.length} network${S.networks.length === 1 ? '' : 's'}`
+    + (down ? `, ${down} down` : '') + (sync ? ', syncing' : '');
+  put('#chain', `<span class="dot ${dot}"></span><span>${esc(txt)}</span>`);
+}
+
+function renderNets() {
+  const items = [['all', 'All', S.nodes.length, '', 'Every network']].concat(
+    S.networks.map(x => [x.id, x.short, x.nodes.length, x.kind, x.title + ' · ' + x.id]));
+  put('#nets', '<span class="lbl" aria-hidden="true">Network</span>' + items.map(([id, label, count, kind, title]) =>
+    `<button type="button" data-net="${esc(id)}" aria-pressed="${id === sel}" title="${esc(title)}" class="k-${esc(kind)}">`
+    + (kind ? '<span class="kdot" aria-hidden="true"></span>' : '') + `${esc(label)} <span class="cnt">${count}</span></button>`).join(''));
+}
+
+function renderAlerts() {
+  const out = [];
+  visNodes().forEach(nd => {
+    if (!nd.ok) out.push(`<div class="banner warn"><b>${esc(nd.name)} is down</b><span>${esc(nd.error || 'not reachable')}</span></div>`);
+    const e = nd.evm;
+    if (!nd.ok || !e) return;
+    const items = [];
+    Object.entries(e.alarms || {}).forEach(([k, v]) => items.push(`Alarm ${esc(k)}: ${esc(v)}`));
+    (e.option_problems || []).forEach(p => items.push('Option below SPEC 5.6: ' + esc(p)));
+    if (e.opens_refused) items.push('Opens refused: ' + esc(e.opens_refused));
+    if (e.sync_error) items.push('Index sync error: ' + esc(e.sync_error));
+    if (items.length) out.push(`<div class="banner"><b>${esc(nd.name)}</b><ul>${items.map(i => `<li>${i}</li>`).join('')}</ul></div>`);
+  });
+  put('#alerts', out.join(''));
+}
+
+function renderMaps() {
+  const nets = S.networks.filter(x => inNet(x.id));
+  put('#maps', nets.map(net => {
+    const m = S.maps[net.id] || {nodes: [], edges: [], peers: []};
+    return `<div class="map"><div>${badge(net.id)}</div>${mapSvg(m, net)}</div>`;
+  }).join('') || '<div class="empty">No networks.</div>');
+  const labels = new Set();
+  nets.forEach(net => (S.maps[net.id] || {edges: []}).edges.forEach(e => labels.add(net.kind + '|' + (e.label || ''))));
+  const leg = [...labels].map(k => { const [kind, label] = k.split('|');
+    return `<span><i style="background:${color(label, kind)}"></i>${esc(label || KIND[kind])}</span>`; });
+  put('#legend', leg.concat(['<span><i class="dash"></i>Connected, no channel</span>', '<span><i style="background:var(--dim);height:1px"></i>Gossip only</span>']).join(''));
+}
+
+function mapSvg(m, net) {
+  if (!m.nodes.length) return '<div class="empty">No nodes.</div>';
+  const W = 640, H = 240, cx = W / 2, cy = H / 2, rx = 230, ry = 80, N = m.nodes.length, pos = {};
+  m.nodes.forEach((nd, i) => { const t = Math.PI + i * 2 * Math.PI / N; pos[nd.key] = [cx + rx * Math.cos(t), cy + ry * Math.sin(t)]; });
+  const pairs = {};
+  m.edges.forEach(e => { if (pos[e.a] && pos[e.b]) { const k = [e.a, e.b].sort().join(); (pairs[k] = pairs[k] || []).push(e); } });
+  let svg = '';
+  m.peers.forEach(p => {
+    if (pairs[[p.a, p.b].sort().join()] || !pos[p.a] || !pos[p.b]) return;
+    const [x1, y1] = pos[p.a], [x2, y2] = pos[p.b];
+    svg += `<line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" stroke="var(--dim)" stroke-width="1.5" stroke-dasharray="4 5"/>`;
+  });
+  Object.values(pairs).forEach(list => list.forEach((e, i) => {
+    let [x1, y1] = pos[e.a], [x2, y2] = pos[e.b];
+    const len = Math.hypot(x2 - x1, y2 - y1) || 1, off = (i - (list.length - 1) / 2) * 16;
+    const ox = -(y2 - y1) / len * off, oy = (x2 - x1) / len * off;
+    x1 += ox; x2 += ox; y1 += oy; y2 += oy;
+    const c = color(e.label, net.kind);
+    if (!e.local) { svg += `<line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" stroke="${c}" stroke-width="1" opacity=".5"/>`; return; }
+    const dash = e.state === 'open' ? '' : ' stroke-dasharray="6 4" opacity=".7"';
+    svg += `<line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" stroke="${c}" stroke-width="3"${dash}><title>${esc((e.label || KIND[net.kind]) + ' · ' + n(e.cap) + ' · ' + e.state)}</title></line>`;
+    svg += `<text class="cap" x="${(x1 + x2) / 2}" y="${(y1 + y2) / 2 + 4}" text-anchor="middle">${n(e.cap)}</text>`;
+  }));
+  m.nodes.forEach(nd => {
+    const [x, y] = pos[nd.key];
+    if (nd.ours) {
+      const live = (nodeBy(nd.name) || {}).ok;
+      svg += `<g><title>${esc(nd.name + ' ' + nd.key)}</title><rect x="${x - 40}" y="${y - 16}" width="80" height="32" fill="var(--raised)" stroke="${live ? 'var(--accent)' : 'var(--bad)'}" stroke-width="1.5"/>
+        <text class="nm" x="${x}" y="${y + 5}" text-anchor="middle">${esc(nd.name)}</text></g>`;
+    } else {
+      svg += `<g><title>${esc(nd.key)}</title><circle cx="${x}" cy="${y}" r="6" fill="var(--raised)" stroke="var(--dim)"/>
+        <text class="fx" x="${x}" y="${y + 20}" text-anchor="middle">${esc(nd.name)}</text></g>`;
+    }
+  });
+  return `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="${esc('Map of ' + net.id + ': ' + m.nodes.length + ' nodes, ' + m.edges.length + ' channels')}">${svg}</svg>`;
+}
+
+function renderNodes() {
+  const list = visNodes();
+  put('#nodes', list.map(nd => {
+    const top = `<div class="top"><span class="dot ${nd.ok ? (nd.syncing ? 'warn' : 'ok') : 'bad'}" aria-hidden="true"></span><span class="name">${esc(nd.name)}</span>
+        <button class="id mono" type="button" data-copy="${esc(nd.id)}" title="Copy node id" aria-label="Copy node id of ${esc(nd.name)}">${nd.id ? esc(nd.id.slice(0, 10)) + '…' : ''}</button></div>
+      <div>${badge(nd.net, nd.kind)}</div>`;
+    if (!nd.ok) return `<div class="node">${top}<div class="down">Down: ${esc(nd.error || 'not reachable')}</div></div>`;
+    let rows = `<div class="bal"><span>Wallet (${esc(nd.wallet.unit)})</span><b>${n(nd.wallet.confirmed)}${nd.wallet.unconfirmed ? ` <span class="sub">+${n(nd.wallet.unconfirmed)} unconfirmed</span>` : ''}</b></div>`;
+    if (nd.wallet.reserve_hint) rows += `<div class="sub" title="listconfigs min-emergency-msat">${esc(nd.wallet.reserve_hint)}.</div>`;
+    (nd.deposits || []).forEach(d => {
+      rows += `<div class="progress" title="${esc(d.txid)}">Deposit of ${n(d.sat)} sat: ${d.in_wallet ? 'in the wallet, unconfirmed'
+        : `mined on the EVM chain; CLN at block ${n(nd.blockheight)} of ${n(d.height)}${d.height > nd.blockheight ? ` (${n(d.height - nd.blockheight)} to go)` : ''}`}</div>`;
+    });
+    if (nd.kind === 'liquid') {
+      rows += Object.entries(nd.elements || {}).map(([k, v]) => `<div class="bal"><span><span class="chip" style="--c:${color(assetLabel(k), 'liquid')}">elementsd ${esc(assetLabel(k))}</span></span><b>${n(v)}</b></div>`).join('');
+      if (nd.elements_error) rows += `<div class="down">elementsd: ${esc(nd.elements_error)}</div>`;
+      rows += `<div class="sub">Asset channels in: ${nd.allowed_assets.length ? nd.allowed_assets.map(a => esc(assetLabel(a))).join(', ') : 'none (L-BTC only)'}</div>`;
+    }
+    if (nd.kind === 'evm' && nd.evm) {
+      const e = nd.evm;
+      rows += `<div class="bal"><span>Gas</span><b title="${esc(e.gas_title || '')}"${e.low_gas ? ' style="color:var(--warn)"' : ''}>${esc(e.gas_text || '–')}</b></div>`;
+      if (e.token) rows += `<div class="bal"><span>${esc(e.token_label || 'Token')}</span><b>${esc(e.token_balance_text || '–')}</b></div>`;
+      rows += `<div class="bal"><span>Withdrawable</span><b title="${esc(e.withdrawable_title || '')}">${esc(e.withdrawable_text || '–')}</b></div>`;
+    }
+    const peers = nd.peers.filter(p => p.connected).map(p => p.name).join(', ') || 'none';
+    return `<div class="node">${top}${rows}
+      <div class="peers">Block ${n(nd.blockheight)}${nd.mining ? ' · page mines here' : ''} · connected to ${esc(peers)}</div></div>`;
+  }).join('') || '<div class="empty">No nodes on this network.</div>');
+  $('#nodes-hint').textContent = sel === 'all' ? '' : (netOf(sel) || {}).title || '';
+}
+
+function renderEvm() {
+  const list = visNodes().filter(x => x.kind === 'evm' && x.ok);
+  $('#evm-panel').hidden = !list.length;
+  put('#evms', list.map(nd => {
+    const e = nd.evm;
+    if (!e) return `<div class="evm"><h3>${esc(nd.name)}</h3><div class="down">${esc(nd.evm_error || 'evm-status not read yet')}</div></div>`;
+    const asset = e.token ? `${esc(e.token_label || '')} <span title="${esc(e.token)}">${esc(shortAddr(e.token))}</span> · ${n(e.units_per_sat)} units/sat` : 'ETH (1 sat = 1e10 wei)';
+    const credits = e.credits_per_day == null ? '–' : `${n(e.credits_per_day)}/day · ${e.credits_pct}% of 3M${e.anvil ? ' (anvil: free)' : ''} · ${n(e.rpc_calls_total)} calls in ${e.credits_hours} h`;
+    const pend = (e.pending_sends || []).map(p => `${esc(p.kind)} ${esc(shortAddr(p.txid || ''))} nonce ${esc(p.nonce)} · ${ago(p.age_s)}${p.replacements ? ' · ' + esc(p.replacements) + ' bumps' : ''}`).join('<br>') || 'none';
+    const dd = (k, v, cls) => `<dt>${k}</dt><dd${cls ? ` class="${cls}"` : ''}>${v}</dd>`;
+    const wait = e.refresh_wait_s || 0;
+    const read = e.anvil ? 'every ' + ago(e.poll_every_s) : `read ${ago(e.read_age_s)} ago${e.cached ? ' (cached balances)' : ''}, every ${ago(e.poll_every_s)}`;
+    return `<div class="evm">
+      <div class="top" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap"><h3>${esc(nd.name)}</h3>${badge(nd.net, 'evm')}
+        <span class="hint" style="margin-left:auto">${esc(read)}</span><button class="btn ghost" type="button" data-refresh="${esc(nd.name)}" ${wait ? `disabled title="Again in ${wait} s"` : 'title="One fresh evm-status read (an eth_getBalance and an eth_call)"'}>Refresh</button></div>
+      <dl>
+        ${dd('Contract', `<span title="${esc(e.contract)}">${esc(shortAddr(e.contract))}</span> · chain ${esc(e.chain_id)}`)}
+        ${dd('Asset', asset)}
+        ${dd('ETH address', `<button class="link mono" type="button" data-copy="${esc(e.eth_address)}" title="Copy">${esc(e.eth_address)}</button>`)}
+        ${dd('Gas balance', `<span title="${esc(e.gas_title || '')}">${esc(e.gas_text || '–')}</span>` + (e.low_gas ? ` · below evm-min-balance ${esc(e.min_balance_text)}` : ''), e.low_gas ? 'warn' : '')}
+        ${e.token ? dd('Token balance', esc(e.token_balance_text || '–')) : ''}
+        ${dd('Withdrawable', `<span title="${esc(e.withdrawable_title || '')}">${esc(e.withdrawable_text || '–')}</span>`)}
+        ${dd('Tip / height', `${n(e.tip ?? 0)} / ${n(e.current_height ?? 0)} · lag ${esc(e.lag ?? '–')}`)}
+        ${dd(`${esc(e.confirm || 'safe')} age`, `${ago(e.tag_age_s)}${e.tag_unchanged_s != null ? ' · unchanged ' + ago(e.tag_unchanged_s) : ''}`)}
+        ${dd('Pending sends', pend)}
+        ${dd('Credit use', credits, e.credits_pct > 80 ? 'warn' : '')}
+        ${(e.errors || []).length ? dd('Errors', e.errors.map(esc).join('<br>'), 'bad') : ''}
+      </dl>
+      ${e.opens_refused ? `<div class="banner"><b>Opens refused</b><span>${esc(e.opens_refused)}</span></div>` : ''}
+    </div>`;
+  }).join(''));
+}
+
+const STATES = {open: 'Open', opening: 'Opening', closing: 'Closing', onchain: 'On chain', closed: 'Closed'};
+function renderChannels() {
+  const all = visChannels();
+  const closed = all.filter(c => c.state === 'closed').length;
+  const rows = all.filter(c => showClosed || c.state !== 'closed');
+  const tb = $('#toggleClosed');
+  tb.hidden = !closed; tb.textContent = showClosed ? 'Hide closed' : `Show closed (${closed})`;
+  if (!rows.length) {
+    put('#channels', `<tr><td colspan="5" class="empty">No channels yet. Open one from the panel on the right.</td></tr>`);
+    return;
+  }
+  put('#channels', rows.map(c => {
+    const total = c.a_units + c.b_units, pct = total ? c.a_units / total * 100 : 0;
+    const closable = !['closed', 'onchain'].includes(c.state) && (nodeBy(c.a) || {}).ok;
+    return `<tr class="${c.state === 'closed' ? 'dim' : ''}">
+      <td><span class="pair">${esc(c.a)}<span aria-hidden="true">⇄</span><span class="sr"> and </span>${esc(c.b)}</span>${c.scid ? `<div class="mono" style="color:var(--dim)">${esc(c.scid)}</div>` : ''}</td>
+      <td>${badge(c.net, c.kind)}</td>
+      <td><span class="pill ${esc(c.state)}">${STATES[c.state] || esc(c.state)}</span>${c.confirm ? `<span class="confirm">${c.confirm.depth ? `confirming ${Math.min(c.confirm.depth, c.confirm.need)}/${c.confirm.need}` : 'funding tx not in a block yet'}</span>` : ''}<span class="raw" title="${esc(c.status)}">${esc(c.raw_state)}${c.status ? ' · ' + esc(c.status) : ''}</span></td>
+      <td><div class="split" style="--c:${color(c.asset_label, c.kind)}"><div class="barline"><i style="width:${pct}%"></i></div>
+        <div class="nums num"><span>${n(c.a_units)}</span><span>${n(c.b_units)} ${esc(c.unit)}</span></div></div></td>
+      <td>${closable ? `<button class="btn ghost" type="button" data-close="${esc(c.id)}" aria-label="Close channel ${esc(c.a)} to ${esc(c.b)}">Close…</button>` : ''}</td>
+    </tr>`;
+  }).join(''));
+}
+
+function renderSweeps() {
+  const rows = [];
+  visNodes().forEach(nd => (nd.sweeps || []).forEach(w => rows.push([nd, w])));
+  $('#sweeps-panel').hidden = !rows.length;
+  put('#sweeps', rows.map(([nd, w]) => `<tr><td>${esc(nd.name)}</td><td class="mono">${esc(shortAddr(w.outpoint))}</td>
+    <td>${esc(w.asset_label)}</td><td class="num">${n(w.minblock)}</td><td class="num">${n(w.deadline)}</td>
+    <td class="mono">${w.txid ? esc(shortAddr(w.txid)) + (w.fee ? ` · fee ${n(w.fee)}` : '') : 'not yet'}</td></tr>`).join(''));
+}
+
+/* Fill a select, keeping what the user picked. */
+function fill(el, opts, empty) {
+  if (typeof el === 'string') el = $(el);
+  const cur = el.value;
+  const html = opts.length ? opts.map(([v, t]) => `<option value="${esc(v)}">${esc(t)}</option>`).join('')
+    : `<option value="">${esc(empty || 'nothing to pick')}</option>`;
+  if (el.dataset.html !== html) { el.innerHTML = html; el.dataset.html = html; }
+  if (opts.some(o => o[0] === cur)) el.value = cur;
+  el.disabled = !opts.length;
+}
+const nodeOpt = nd => [nd.name, `${nd.name} · ${nd.net_short}`];
+/* Assets both nodes take: L-BTC, and assetchan-asset of each. */
+function assetOpts(...nodes) {
+  if (!nodes.every(x => x && x.kind === 'liquid')) return [];
+  const common = nodes.reduce((acc, x) => acc.filter(a => (x.allowed_assets || []).includes(a)), nodes[0].allowed_assets || []);
+  return common.map(a => [a, assetLabel(a) + ' (units)']).concat([['lbtc', 'L-BTC (sat)']]);
+}
+function setAsset(prefix, nodes) {
+  const opts = assetOpts(...nodes);
+  $(`#${prefix}-asset-l`).hidden = !opts.length;
+  if (opts.length) fill(`#${prefix}-asset`, opts);
+  const unitEl = $(`#${prefix}-unit`);
+  if (unitEl) unitEl.textContent = opts.length && $(`#${prefix}-asset`).value !== 'lbtc' ? 'Amount (units)' : 'Amount (sat)';
+}
+const peersOf = (nd, list) => nd ? list.filter(x => x.net === nd.net && x.name !== nd.name) : [];
+
+function renderForms() {
+  const up = upNodes();
+  const hasEvm = up.some(x => x.kind === 'evm');
+  const mineNets = S.networks.filter(x => x.mining && inNet(x.id));
+  $('#t-evm').hidden = !hasEvm; $('#t-mine').hidden = !mineNets.length;
+  const curTab = $('#tabs [aria-selected=true]');
+  if (curTab && curTab.hidden) showTab('open');
+
+  // Open: the peer list only has nodes with the same network ID.
+  fill('#open-frm', up.map(nodeOpt), 'no node is up');
+  const of = nodeBy($('#open-frm').value);
+  fill('#open-to', peersOf(of, up).map(nodeOpt), 'no other node on this network');
+  const ot = nodeBy($('#open-to').value);
+  setAsset('open', of && ot ? [of, ot] : []);
+  const oa = $('#open-asset').value;
+  let oh = '';
+  if (of) {
+    if (of.kind === 'liquid') oh = !$('#open-asset-l').hidden && oa !== 'lbtc'
+      ? `Asset channel, funded by the elementsd wallet, with ${n(of.fee_reserve || 0)} sat L-BTC locked next to it for fees.`
+      : "L-BTC channel, funded by the node's own wallet.";
+    else if (of.kind === 'evm') oh = `Funded from the node's wallet (deposit first). Channel in ${of.evm && of.evm.token ? (of.evm.token_label || 'the token') : 'ETH'}, amounts in sat.`;
+    else oh = "Funded from the node's own wallet.";
+    oh += ` Usable after ${of.confirms || 1} block${of.confirms === 1 ? '' : 's'}.`;
+  }
+  $('#open-hint').textContent = oh;
+
+  // Pay
+  fill('#pay-frm', up.map(nodeOpt), 'no node is up');
+  const pf = nodeBy($('#pay-frm').value);
+  const byInvoice = document.querySelector('[data-action=pay] [name=mode]:checked').value === 'invoice';
+  fill('#pay-to', peersOf(pf, up).map(nodeOpt), 'no other node on this network');
+  $('#pay-to-l').hidden = byInvoice; $('#pay-amount-l').hidden = byInvoice; $('#pay-bolt11-l').hidden = !byInvoice;
+  const pt = nodeBy($('#pay-to').value);
+  setAsset('pay', byInvoice ? (pf ? [pf] : []) : (pf && pt ? [pf, pt] : []));
+  if (pf) $('#pay-bolt11').placeholder = {bitcoin: {regtest: 'lnbcrt…', bitcoin: 'lnbc…', signet: 'lntbs…'}[pf.network] || 'lntb…',
+    evm: 'lnbcrt…', liquid: {'liquid-regtest': 'lnert…', 'liquid-testnet': 'lntex…', liquid: 'lnex…'}[pf.network]}[pf.kind] || 'ln…';
+
+  // Invoice
+  fill('#inv-node', up.map(nodeOpt), 'no node is up');
+  const inode = nodeBy($('#inv-node').value);
+  setAsset('inv', inode ? [inode] : []);
+
+  // Close
+  fill('#close-chan', visChannels().filter(c => !['closed', 'onchain'].includes(c.state) && (nodeBy(c.a) || {}).ok)
+    .map(c => [c.id, `${c.a} ⇄ ${c.b} · ${c.state} · ${c.asset_label} · ${n(c.a_units)} | ${n(c.b_units)}`]), 'no open channel');
+
+  // On-chain
+  fill('#send-node', up.map(nodeOpt), 'no node is up');
+  const sn = nodeBy($('#send-node').value);
+  const sendAssets = sn && sn.kind === 'liquid' ? [['bitcoin', 'L-BTC (sat)']].concat(
+    [...new Set((sn.allowed_assets || []).concat(Object.keys(sn.assets || {})))].map(a => [a, assetLabel(a) + ' (units)'])) : [];
+  $('#send-asset-l').hidden = !sendAssets.length;
+  if (sendAssets.length) fill('#send-asset', sendAssets);
+  $('#send-unit').textContent = sendAssets.length && $('#send-asset').value !== 'bitcoin' ? 'Amount (units)' : 'Amount (sat)';
+  $('#send-all-l').hidden = !sn || sn.kind === 'liquid';
+  if (sn && sn.kind === 'liquid') $('#send-all').checked = false;
+  $('#send-amount').disabled = $('#send-all').checked;
+  $('#send-hint').textContent = !sn ? '' : sn.kind === 'liquid' ? "From the node's elementsd wallet." : "From the node's own wallet (withdraw).";
+  if (sn) $('#send-address').placeholder = sn.kind === 'liquid' ? {'liquid-regtest': 'el1… or ert1…', 'liquid-testnet': 'tlq1… or tex1…', liquid: 'lq1… or ex1…'}[sn.network] || ''
+    : ({regtest: 'bcrt1…', bitcoin: 'bc1…'}[sn.network] || 'tb1…');
+  fill('#addr-node', up.map(nodeOpt), 'no node is up');
+  const an = nodeBy($('#addr-node').value);
+  fill('#addr-type', [['bech32', 'bech32'], ['p2tr', 'p2tr']].concat(an && an.kind === 'liquid' ? [['elements', "elementsd wallet"]] : []));
+  const fundable = up.filter(x => x.kind === 'liquid' || (x.kind === 'bitcoin' && x.mining));
+  $('#f-fund').hidden = !fundable.length;
+  fill('#fund-node', fundable.map(nodeOpt), 'no node to fund');
+
+  // EVM
+  const evms = up.filter(x => x.kind === 'evm').map(nodeOpt);
+  ['#dep-node', '#exit-node', '#wd-node'].forEach(s => fill(s, evms, 'no EVM node is up'));
+  $('#exit-amount').disabled = $('#exit-all').checked;
+  const wn = nodeBy($('#wd-node').value);
+  $('#wd-hint').textContent = 'evm-withdraw: pays the node\'s ETH address what the contract holds for it'
+    + (wn && wn.evm ? ` (now ${wn.evm.withdrawable_text}).` : '.');
+  const dn = nodeBy($('#dep-node').value);
+  $('#dep-hint').textContent = "From the node's ETH key to a fresh address of its wallet"
+    + (dn && dn.evm && dn.evm.token ? `, in ${dn.evm.token_label || 'the token'} (${n(dn.evm.units_per_sat)} units per sat).` : ' (1 sat = 1e10 wei).');
+
+  // Mine
+  fill('#mine-net', mineNets.map(x => [x.id, x.short]), 'nobody mines here');
+  const mn = netOf($('#mine-net').value);
+  $('#mine-hint').textContent = mn ? (mn.kind === 'evm' ? `anvil: each block moves time on by INTERVAL, one ${mn.mine_what.replace('virtual blocks', 'virtual block')}.`
+    : mn.kind === 'liquid' ? 'elementsd generatetoaddress.' : 'bitcoind generatetoaddress.') : '';
+
+  /* A form whose node or channel list is empty can't be sent. (A busy network queues the action.) */
+  $$('form[data-action]').forEach(f => {
+    const empty = [...f.querySelectorAll('select')].some(x => x.disabled && !x.closest('[hidden]'));
+    f.querySelector('.btn[type=submit]').disabled = empty;
+  });
+}
+
+const fmtTime = s => s >= 60 ? `${Math.floor(s / 60)} min ${Math.round(s % 60)} s` : `${Math.round(s)} s`;
+const PILL = {running: ['running', 'Running'], waiting: ['opening', 'Waiting'], done: ['done', 'Done'], error: ['failed', 'Failed'], cancelled: ['closed', 'Cancelled']};
+const pill = st => { const [cls, txt] = PILL[st] || ['', st]; return `<span class="pill ${cls}${st === 'running' ? ' pulse' : ''}">${esc(txt)}</span>`; };
+const openLogs = new Map();       /* finished job id -> the user opened (true) or closed (false) its log */
+function jobResult(j) {
+  return Object.entries(j.result || {}).filter(([k]) => k === 'bolt11' || k === 'address')
+    .map(([k, v]) => `<button class="btn ghost" type="button" data-copy="${esc(v)}" data-what="${k === 'bolt11' ? 'Invoice' : 'Address'}">Copy ${k === 'bolt11' ? 'invoice' : 'address'}</button>`).join('');
+}
+function jobCard(j) {
+  const now = Date.now() / 1000, net = netOf(j.net), res = jobResult(j);
+  const time = j.status === 'waiting' ? `Waiting ${fmtTime(Math.max(0, now - j.queued))} for ${(j.waiting_for || []).join('; ') || 'its turn'}`
+    : `Running for ${fmtTime(Math.max(0, now - j.started))}${net && !net.mining ? '. Nobody mines here: blocks come at the network\'s pace.' : ''}`;
+  return `<div class="jobcard"><div class="title"><p>${esc(j.title)}</p><span style="display:flex;gap:8px;align-items:center;flex:none">${pill(j.status)}
+      <button class="btn ghost" type="button" data-cancel="${j.id}" ${j.cancelling ? 'disabled' : ''} aria-label="Cancel: ${esc(j.title)}">${j.cancelling ? 'Cancelling…' : 'Cancel'}</button></span></div>
+    <div class="meta">${j.net ? badge(j.net) : ''}<span>${esc(time)}</span></div>
+    ${res ? `<div class="result">${res}</div>` : ''}
+    ${j.status === 'running' ? `<pre class="log" data-job="${j.id}">${esc(j.log.join('\n') || 'Starting…')}</pre>` : ''}</div>`;
+}
+function renderJobs() {
+  const active = S.jobs || [], hist = S.history || [];
+  const running = active.filter(j => j.status === 'running').length, waiting = active.length - running;
+  put('#job-state', active.length ? `<span class="pill running pulse">${running} running${waiting ? ` · ${waiting} waiting` : ''}</span>` : '');
+  put('#job', active.length ? active.map(jobCard).join('')
+    : hist.length ? '' : '<div class="empty">Actions you start appear here with their log. Actions on different networks run side by side.</div>');
+  $$('#job pre.log').forEach(l => l.scrollTop = l.scrollHeight);
+  /* Finished: the newest one's log is open unless the user closed it; the rest closed unless opened. */
+  put('#history', hist.map((h, i) => {
+    const open = openLogs.has(h.id) ? openLogs.get(h.id) : (i === 0 && !active.length);
+    const res = jobResult(h);
+    return `<li><details data-hist="${h.id}"${open ? ' open' : ''}><summary>${pill(h.status)}<span>${esc(h.title)}</span></summary>
+      <div class="meta" style="padding:4px 0 0">${h.net ? badge(h.net) : ''}<span>${h.started ? 'Took ' + fmtTime(Math.max(0, h.ended - h.started)) : 'Never started'}</span></div>
+      ${res ? `<div class="result" style="padding:6px 0 0">${res}</div>` : ''}
+      <pre class="log">${esc(h.log.join('\n') || '–')}</pre></details></li>`;
+  }).join(''));
+}
+
+/* ------------------------------------------------------------ events */
+function showTab(name, focus) {
+  $$('#tabs [role=tab]').forEach(b => {
+    const on = b.dataset.tab === name;
+    b.setAttribute('aria-selected', on); b.tabIndex = on ? 0 : -1;
+    $('#' + b.getAttribute('aria-controls')).hidden = !on;
+    if (on && focus) b.focus();
+  });
+}
+$('#tabs').addEventListener('click', e => { const b = e.target.closest('[role=tab]'); if (b) showTab(b.dataset.tab); });
+$('#tabs').addEventListener('keydown', e => {
+  const tabs = $$('#tabs [role=tab]').filter(b => !b.hidden);
+  const i = tabs.indexOf(document.activeElement);
+  if (i < 0) return;
+  const to = {ArrowRight: i + 1, ArrowLeft: i - 1, Home: 0, End: tabs.length - 1}[e.key];
+  if (to === undefined) return;
+  e.preventDefault();
+  showTab(tabs[(to + tabs.length) % tabs.length].dataset.tab, true);
+});
+$('#nets').addEventListener('click', e => {
+  const b = e.target.closest('[data-net]'); if (!b) return;
+  sel = b.dataset.net; try { localStorage.setItem('nodeui-net', sel); } catch (err) {}
+  render();
+});
+$('#history').addEventListener('click', e => {      /* the user's own open/close only (not a re-render's) */
+  const sm = e.target.closest('summary'), d = sm && sm.closest('details[data-hist]');
+  if (d) openLogs.set(Number(d.dataset.hist), !d.open);
+});
+document.addEventListener('click', async e => {
+  const c = e.target.closest('[data-cancel]'), rf = e.target.closest('[data-refresh]');
+  if (!c && !rf) return;
+  if (demo) { toast('Demo data: nothing was sent.'); return; }
+  try {
+    if (c) {
+      const j = await post('api/cancel', {id: Number(c.dataset.cancel)});
+      toast(j.cancelled ? 'Cancelling (a running action stops at its next wait).' : 'That action has already ended.');
+    } else {
+      rf.disabled = true;
+      const j = await post('api/refresh', {node: rf.dataset.refresh});
+      toast(j.refreshed ? `Reading ${rf.dataset.refresh} afresh.` : `Again in ${j.wait} s.`);
+    }
+    refresh();
+  } catch (err) { toast(err.message, true); }
+});
+$('#toggleClosed').addEventListener('click', () => { showClosed = !showClosed; renderChannels(); });
+$('#close-force').addEventListener('change', e => $('#close-warn').hidden = !e.target.checked);
+document.addEventListener('change', e => { if (S && e.target.closest('form')) renderForms(); });
+document.addEventListener('click', e => {
+  const c = e.target.closest('[data-close]');
+  if (c) { showTab('close'); $('#close-chan').value = c.dataset.close; $('#close-chan').focus(); }
+  const cp = e.target.closest('[data-copy]');
+  if (cp && cp.dataset.copy) copy(cp.dataset.copy, cp.dataset.what || 'Node id');
+});
+
+$$('form[data-action]').forEach(f => f.addEventListener('submit', e => {
+  e.preventDefault();
+  if (!S) return;
+  const v = Object.fromEntries(new FormData(f));
+  const action = f.dataset.action, body = {action};
+  if (action === 'open') Object.assign(body, {frm: v.frm, to: v.to, amount: v.amount, announce: !!v.announce, asset: v.asset || 'lbtc'});
+  else if (action === 'pay') {
+    Object.assign(body, {frm: v.frm, asset: v.asset || 'lbtc'});
+    if (v.mode === 'invoice') { if (!v.bolt11) { toast('Paste an invoice.', true); return; } body.bolt11 = v.bolt11; }
+    else Object.assign(body, {to: v.to, amount: v.amount});
+  } else if (action === 'close') {
+    const c = S.channels.find(x => x.id === v.chan);
+    if (!c) { toast('Pick a channel to close.', true); return; }
+    const force = !!v.force;
+    if (force && !confirm(`Force close ${c.a} ⇄ ${c.b}? The funds stay locked until the timelocks pass.`)) return;
+    Object.assign(body, {node: c.a, chan: c.id, force});
+  } else if (action === 'send') {
+    Object.assign(body, {node: v.node, address: v.address, asset: v.asset, amount: v.all ? 'all' : v.amount});
+    const nd = nodeBy(v.node);
+    if (!confirm(`Send ${v.all ? 'everything' : n(v.amount) + ' ' + $('#send-unit').textContent.replace(/Amount \((.*)\)/, '$1')} from ${v.node} to ${v.address}?`)) return;
+    if (nd && nd.kind !== 'liquid') delete body.asset;
+  } else if (action === 'exit') {
+    if (!confirm(`Exit ${v.all ? "everything in " + v.node + "'s wallet" : n(v.amount) + ' sat from ' + v.node} to its ETH address? It can't be undone.`)) return;
+    Object.assign(body, {node: v.node, amount: v.all ? 'all' : v.amount});
+  }
+  else if (action === 'withdraw') body.node = v.node;
+  else Object.assign(body, v);
+  act(body);
+}));
+
+refresh();
+setInterval(refresh, demo ? 60000 : 3000);
+</script>
+</body>
+</html>

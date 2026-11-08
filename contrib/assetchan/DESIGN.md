@@ -289,11 +289,12 @@ Reuse map (`git show liquid-merged:<path>`): `common/liquid_asset.[ch]`,
   also mines); `contrib/assetchan/TESTNET.md` records the run of all the cases above
   (open, payments, cooperative close, force closes with every sweep kind, an HTLC
   claimed on chain with its preimage, a penalty) with the testnet txids.
-- By hand: `contrib/assetchan/ui.py` serves a web page (http://127.0.0.1:8765) for those
-  nodes, or any `--node name=lightning-dir` running the plugin: the nodes, peers,
-  wallets and channels, with forms to open (asset or L-BTC), pay, close, force close,
-  send on-chain and fund a node, all through the nodes' RPCs (`assetchan-*` for the
-  asset side); it mines on regtest when given `--elements-rpc`.
+- By hand: `contrib/nodeui/ui.py` serves a web page (http://127.0.0.1:8765) for those
+  nodes (`--network liquid-regtest --elements-rpc ...` as before), or any
+  `--node name=lightning-dir`, also Bitcoin and EVM nodes: the nodes, peers, wallets,
+  channels and asset sweeps, with forms to open (asset or L-BTC), pay, close, force
+  close, send on-chain and fund a node, all through the nodes' RPCs (`assetchan-*`
+  for the asset side); it mines on liquid-regtest. See `contrib/nodeui/README.md`.
 
 ## 7. Verify first (day 1 spikes), risks
 

@@ -1,0 +1,979 @@
+{
+ "networks": [
+  {
+   "id": "btc:regtest",
+   "short": "btc:regtest",
+   "kind": "bitcoin",
+   "network": "regtest",
+   "title": "Bitcoin regtest, chain 0f9188f1\u2026466e2206",
+   "mining": true,
+   "mine_what": "blocks",
+   "nodes": [
+    "alice",
+    "bob"
+   ],
+   "block": 112,
+   "syncing": false
+  },
+  {
+   "id": "liquid:regtest",
+   "short": "liquid:regtest",
+   "kind": "liquid",
+   "network": "liquid-regtest",
+   "title": "Liquid (liquid-regtest)",
+   "mining": true,
+   "mine_what": "blocks",
+   "nodes": [
+    "carol",
+    "dave"
+   ],
+   "block": 2690766,
+   "syncing": false
+  },
+  {
+   "id": "evm:31337:0x5FbDB2315678afecb367f032d93F642f64180aa3",
+   "short": "evm:31337:0x5FbD\u20260aa3",
+   "kind": "evm",
+   "network": "regtest",
+   "title": "EVM chain 31337, contract 0x5FbDB2315678afecb367f032d93F642f64180aa3, ETH",
+   "mining": true,
+   "mine_what": "virtual blocks (INTERVAL 2 s each)",
+   "nodes": [
+    "erin",
+    "frank"
+   ],
+   "block": 131,
+   "syncing": false
+  },
+  {
+   "id": "evm:84532:0xB82000000000000000000000000000000000940E",
+   "short": "evm:84532:0xB820\u2026940E",
+   "kind": "evm",
+   "network": "regtest",
+   "title": "EVM chain 84532, contract 0xB82000000000000000000000000000000000940E, token 0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238",
+   "mining": false,
+   "mine_what": "virtual blocks (INTERVAL 60 s each)",
+   "nodes": [
+    "gina",
+    "hank"
+   ],
+   "block": 4410211,
+   "syncing": false
+  }
+ ],
+ "nodes": [
+  {
+   "name": "alice",
+   "kind": "bitcoin",
+   "network": "regtest",
+   "net": "btc:regtest",
+   "net_short": "btc:regtest",
+   "detected": true,
+   "ok": true,
+   "id": "020101010101010101010101010101010101010101010101010101010101010101",
+   "alias": "alice",
+   "blockheight": 112,
+   "syncing": false,
+   "wallet": {
+    "confirmed": 5000000,
+    "unconfirmed": 0,
+    "unit": "sat"
+   },
+   "confirms": 1,
+   "mining": true,
+   "peers": [
+    {
+     "id": "020202020202020202020202020202020202020202020202020202020202020202",
+     "name": "bob",
+     "connected": true
+    }
+   ]
+  },
+  {
+   "name": "bob",
+   "kind": "bitcoin",
+   "network": "regtest",
+   "net": "btc:regtest",
+   "net_short": "btc:regtest",
+   "detected": true,
+   "ok": true,
+   "id": "020202020202020202020202020202020202020202020202020202020202020202",
+   "alias": "bob",
+   "blockheight": 112,
+   "syncing": false,
+   "wallet": {
+    "confirmed": 5000000,
+    "unconfirmed": 0,
+    "unit": "sat"
+   },
+   "confirms": 1,
+   "mining": true,
+   "peers": [
+    {
+     "id": "020101010101010101010101010101010101010101010101010101010101010101",
+     "name": "alice",
+     "connected": true
+    }
+   ]
+  },
+  {
+   "name": "carol",
+   "kind": "liquid",
+   "network": "liquid-regtest",
+   "net": "liquid:regtest",
+   "net_short": "liquid:regtest",
+   "detected": true,
+   "ok": true,
+   "id": "020303030303030303030303030303030303030303030303030303030303030303",
+   "alias": "carol",
+   "blockheight": 2690766,
+   "syncing": false,
+   "wallet": {
+    "confirmed": 5000000,
+    "unconfirmed": 0,
+    "unit": "L-BTC sat"
+   },
+   "confirms": 1,
+   "mining": true,
+   "peers": [
+    {
+     "id": "020404040404040404040404040404040404040404040404040404040404040404",
+     "name": "dave",
+     "connected": true
+    }
+   ],
+   "elements": {
+    "L-BTC": 89085,
+    "ddc8da3f868bd193d25e3bbdd3e3c075d6629fa45dee1c3d829682d82094ba50": 99000000000
+   },
+   "assets": {
+    "ddc8da3f868bd193d25e3bbdd3e3c075d6629fa45dee1c3d829682d82094ba50": 99000000000
+   },
+   "allowed_assets": [
+    "ddc8da3f868bd193d25e3bbdd3e3c075d6629fa45dee1c3d829682d82094ba50"
+   ],
+   "fee_reserve": 2000,
+   "sweeps": [
+    {
+     "outpoint": "9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e:2",
+     "channel_id": "7777777777777777777777777777777777777777777777777777777777777777",
+     "asset": "ddc8da3f868bd193d25e3bbdd3e3c075d6629fa45dee1c3d829682d82094ba50",
+     "minblock": 2690400,
+     "deadline": 2690412,
+     "txid": null,
+     "fee": null,
+     "asset_label": "TEST"
+    }
+   ]
+  },
+  {
+   "name": "dave",
+   "kind": "liquid",
+   "network": "liquid-regtest",
+   "net": "liquid:regtest",
+   "net_short": "liquid:regtest",
+   "detected": true,
+   "ok": true,
+   "id": "020404040404040404040404040404040404040404040404040404040404040404",
+   "alias": "dave",
+   "blockheight": 2690766,
+   "syncing": false,
+   "wallet": {
+    "confirmed": 5000000,
+    "unconfirmed": 0,
+    "unit": "L-BTC sat"
+   },
+   "confirms": 1,
+   "mining": true,
+   "peers": [
+    {
+     "id": "020303030303030303030303030303030303030303030303030303030303030303",
+     "name": "carol",
+     "connected": true
+    }
+   ],
+   "elements": {
+    "L-BTC": 89085,
+    "ddc8da3f868bd193d25e3bbdd3e3c075d6629fa45dee1c3d829682d82094ba50": 99000000000
+   },
+   "assets": {
+    "ddc8da3f868bd193d25e3bbdd3e3c075d6629fa45dee1c3d829682d82094ba50": 99000000000
+   },
+   "allowed_assets": [
+    "ddc8da3f868bd193d25e3bbdd3e3c075d6629fa45dee1c3d829682d82094ba50"
+   ],
+   "fee_reserve": 2000,
+   "sweeps": []
+  },
+  {
+   "name": "erin",
+   "kind": "evm",
+   "network": "regtest",
+   "net": "evm:31337:0x5FbDB2315678afecb367f032d93F642f64180aa3",
+   "net_short": "evm:31337:0x5FbD\u20260aa3",
+   "detected": true,
+   "ok": true,
+   "id": "020505050505050505050505050505050505050505050505050505050505050505",
+   "alias": "erin",
+   "blockheight": 131,
+   "syncing": false,
+   "wallet": {
+    "confirmed": 5000000,
+    "unconfirmed": 0,
+    "unit": "sat"
+   },
+   "confirms": 1,
+   "mining": true,
+   "peers": [
+    {
+     "id": "020606060606060606060606060606060606060606060606060606060606060606",
+     "name": "frank",
+     "connected": true
+    }
+   ],
+   "evm": {
+    "contract": "0x5FbDB2315678afecb367f032d93F642f64180aa3",
+    "chain_id": 31337,
+    "interval": 2,
+    "confirm": "safe",
+    "eth_address": "0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
+    "token": null,
+    "units_per_sat": null,
+    "gas_wei": 15997549833998572,
+    "gas_text": "\u22480.015998 ETH \u00b7 ~1,599,754 sat",
+    "gas_title": "0.015997549833998572 ETH = 15,997,549,833,998,572 wei",
+    "min_balance_wei": 10000000000000000,
+    "min_balance_text": "0.01 ETH \u00b7 1,000,000 sat",
+    "low_gas": false,
+    "token_balance_units": null,
+    "token_balance_text": null,
+    "withdrawable": 1000010000000000,
+    "withdrawable_sat": 100001,
+    "withdrawable_text": "\u22480.001 ETH \u00b7 100,001 sat",
+    "withdrawable_title": "0.00100001 ETH = 1,000,010,000,000,000 wei",
+    "cached": false,
+    "balance_age_s": null,
+    "withdrawable_age_s": null,
+    "tip": 120,
+    "current_height": 121,
+    "lag": 1,
+    "tag_age_s": 3.2,
+    "tag_unchanged_s": 1.0,
+    "checkpoint": {
+     "evm_block": 128,
+     "count": 40
+    },
+    "pending_sends": [],
+    "alarms": {},
+    "sync_error": null,
+    "options_checked": true,
+    "option_problems": [],
+    "opens_refused": null,
+    "errors": [],
+    "anvil": true,
+    "rpc_calls_total": 112,
+    "credits": 10560,
+    "credits_per_day": 1,
+    "credits_pct": 0.0,
+    "credits_hours": 0.5,
+    "read_age_s": 0,
+    "refresh_wait_s": 0,
+    "poll_every_s": 3
+   },
+   "deposits": []
+  },
+  {
+   "name": "frank",
+   "kind": "evm",
+   "network": "regtest",
+   "net": "evm:31337:0x5FbDB2315678afecb367f032d93F642f64180aa3",
+   "net_short": "evm:31337:0x5FbD\u20260aa3",
+   "detected": true,
+   "ok": true,
+   "id": "020606060606060606060606060606060606060606060606060606060606060606",
+   "alias": "frank",
+   "blockheight": 131,
+   "syncing": false,
+   "wallet": {
+    "confirmed": 25000,
+    "unconfirmed": 0,
+    "unit": "sat",
+    "reserve": 25000,
+    "reserve_hint": "CLN keeps 25,000 sat (min-emergency-msat) as an emergency reserve while it still knows anchor channels, until about 100 blocks after a close"
+   },
+   "confirms": 1,
+   "mining": true,
+   "peers": [
+    {
+     "id": "020505050505050505050505050505050505050505050505050505050505050505",
+     "name": "erin",
+     "connected": true
+    }
+   ],
+   "evm": {
+    "contract": "0x5FbDB2315678afecb367f032d93F642f64180aa3",
+    "chain_id": 31337,
+    "interval": 2,
+    "confirm": "safe",
+    "eth_address": "0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC",
+    "token": null,
+    "units_per_sat": null,
+    "gas_wei": 1000000000000000000,
+    "gas_text": "1 ETH \u00b7 100,000,000 sat",
+    "gas_title": "1 ETH = 1,000,000,000,000,000,000 wei",
+    "min_balance_wei": 10000000000000000,
+    "min_balance_text": "0.01 ETH \u00b7 1,000,000 sat",
+    "low_gas": false,
+    "token_balance_units": null,
+    "token_balance_text": null,
+    "withdrawable": 0,
+    "withdrawable_sat": 0,
+    "withdrawable_text": "0 ETH \u00b7 0 sat",
+    "withdrawable_title": "0 ETH = 0 wei",
+    "cached": false,
+    "balance_age_s": null,
+    "withdrawable_age_s": null,
+    "tip": 120,
+    "current_height": 121,
+    "lag": 1,
+    "tag_age_s": 3.2,
+    "tag_unchanged_s": 1.0,
+    "checkpoint": {
+     "evm_block": 128,
+     "count": 40
+    },
+    "pending_sends": [],
+    "alarms": {},
+    "sync_error": null,
+    "options_checked": true,
+    "option_problems": [],
+    "opens_refused": null,
+    "errors": [],
+    "anvil": true,
+    "rpc_calls_total": 112,
+    "credits": 10560,
+    "credits_per_day": 1,
+    "credits_pct": 0.0,
+    "credits_hours": 0.5,
+    "read_age_s": 0,
+    "refresh_wait_s": 0,
+    "poll_every_s": 3
+   },
+   "deposits": []
+  },
+  {
+   "name": "gina",
+   "kind": "evm",
+   "network": "regtest",
+   "net": "evm:84532:0xB82000000000000000000000000000000000940E",
+   "net_short": "evm:84532:0xB820\u2026940E",
+   "detected": true,
+   "ok": true,
+   "id": "020707070707070707070707070707070707070707070707070707070707070707",
+   "alias": "gina",
+   "blockheight": 4410211,
+   "syncing": false,
+   "wallet": {
+    "confirmed": 5000000,
+    "unconfirmed": 0,
+    "unit": "sat"
+   },
+   "confirms": 3,
+   "mining": false,
+   "peers": [
+    {
+     "id": "020808080808080808080808080808080808080808080808080808080808080808",
+     "name": "hank",
+     "connected": true
+    }
+   ],
+   "evm": {
+    "contract": "0xB82000000000000000000000000000000000940E",
+    "chain_id": 84532,
+    "interval": 60,
+    "confirm": "safe",
+    "eth_address": "0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
+    "token": "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238",
+    "units_per_sat": 100,
+    "gas_wei": 1000000000000000000,
+    "gas_text": "1 ETH \u00b7 100,000,000 sat",
+    "gas_title": "1 ETH = 1,000,000,000,000,000,000 wei",
+    "min_balance_wei": 10000000000000000,
+    "min_balance_text": "0.01 ETH \u00b7 1,000,000 sat",
+    "low_gas": false,
+    "token_balance_units": 5000000000,
+    "token_balance_text": "5,000,000,000 USDC units \u00b7 50,000,000 sat",
+    "withdrawable": 250000,
+    "withdrawable_sat": 2500,
+    "withdrawable_text": "250,000 USDC units \u00b7 2,500 sat",
+    "withdrawable_title": "250,000 base units",
+    "cached": false,
+    "balance_age_s": null,
+    "withdrawable_age_s": null,
+    "tip": 4410211,
+    "current_height": 4410213,
+    "lag": 2,
+    "tag_age_s": 14.2,
+    "tag_unchanged_s": 1.0,
+    "checkpoint": {
+     "evm_block": 128,
+     "count": 40
+    },
+    "pending_sends": [],
+    "alarms": {},
+    "sync_error": null,
+    "options_checked": true,
+    "option_problems": [],
+    "opens_refused": null,
+    "errors": [],
+    "anvil": false,
+    "rpc_calls_total": 12563,
+    "credits": 1172815,
+    "credits_per_day": 1497184,
+    "credits_pct": 49.9,
+    "credits_hours": 18.8,
+    "token_label": "USDC",
+    "read_age_s": 0,
+    "refresh_wait_s": 0,
+    "poll_every_s": 300
+   },
+   "deposits": [
+    {
+     "sat": 1000000,
+     "txid": "5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d",
+     "height": 4410219,
+     "in_wallet": false
+    }
+   ]
+  },
+  {
+   "name": "hank",
+   "kind": "evm",
+   "network": "regtest",
+   "net": "evm:84532:0xB82000000000000000000000000000000000940E",
+   "net_short": "evm:84532:0xB820\u2026940E",
+   "detected": true,
+   "ok": true,
+   "id": "020808080808080808080808080808080808080808080808080808080808080808",
+   "alias": "hank",
+   "blockheight": 4410211,
+   "syncing": false,
+   "wallet": {
+    "confirmed": 5000000,
+    "unconfirmed": 0,
+    "unit": "sat"
+   },
+   "confirms": 3,
+   "mining": false,
+   "peers": [
+    {
+     "id": "020707070707070707070707070707070707070707070707070707070707070707",
+     "name": "gina",
+     "connected": true
+    }
+   ],
+   "evm": {
+    "contract": "0xB82000000000000000000000000000000000940E",
+    "chain_id": 84532,
+    "interval": 60,
+    "confirm": "safe",
+    "eth_address": "0x90F79bf6EB2c4f870365E785982E1f101E93b906",
+    "token": "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238",
+    "units_per_sat": 100,
+    "gas_wei": 6000000000000000,
+    "gas_text": "0.006 ETH \u00b7 600,000 sat",
+    "gas_title": "0.006 ETH = 6,000,000,000,000,000 wei",
+    "min_balance_wei": 10000000000000000,
+    "min_balance_text": "0.01 ETH \u00b7 1,000,000 sat",
+    "low_gas": true,
+    "token_balance_units": 5000000000,
+    "token_balance_text": "5,000,000,000 USDC units \u00b7 50,000,000 sat",
+    "withdrawable": 0,
+    "withdrawable_sat": 0,
+    "withdrawable_text": "0 USDC units \u00b7 0 sat",
+    "withdrawable_title": "0 base units",
+    "cached": false,
+    "balance_age_s": null,
+    "withdrawable_age_s": null,
+    "tip": 4410211,
+    "current_height": 4410213,
+    "lag": 2,
+    "tag_age_s": 14.2,
+    "tag_unchanged_s": 1.0,
+    "checkpoint": {
+     "evm_block": 128,
+     "count": 40
+    },
+    "pending_sends": [
+     {
+      "kind": "withdraw",
+      "txid": "4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e",
+      "nonce": 17,
+      "evm_txs": [
+       "0x1212121212121212121212121212121212121212121212121212121212121212"
+      ],
+      "age_s": 41.0,
+      "replacements": 1,
+      "max_fee_per_gas": 1500000
+     }
+    ],
+    "alarms": {
+     "balance": "ETH balance 0.006 below evm-min-balance 0.01"
+    },
+    "sync_error": null,
+    "options_checked": true,
+    "option_problems": [],
+    "opens_refused": "the node's ETH balance is below evm-min-balance",
+    "errors": [],
+    "anvil": false,
+    "rpc_calls_total": 12563,
+    "credits": 1172815,
+    "credits_per_day": 1497184,
+    "credits_pct": 49.9,
+    "credits_hours": 18.8,
+    "token_label": "USDC",
+    "read_age_s": 0,
+    "refresh_wait_s": 0,
+    "poll_every_s": 300
+   },
+   "deposits": []
+  }
+ ],
+ "channels": [
+  {
+   "id": "3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f",
+   "net": "btc:regtest",
+   "node_net": "btc:regtest",
+   "kind": "bitcoin",
+   "a": "alice",
+   "b": "bob",
+   "b_id": "020202020202020202020202020202020202020202020202020202020202020202",
+   "b_ours": true,
+   "asset": null,
+   "asset_label": "BTC",
+   "unit": "sat",
+   "state": "open",
+   "raw_state": "CHANNELD_NORMAL",
+   "status": "",
+   "a_units": 740000,
+   "b_units": 260000,
+   "scid": "112x1x0",
+   "opener": "local",
+   "private": false,
+   "peer_connected": true,
+   "confirm": null
+  },
+  {
+   "id": "c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1",
+   "net": "evm:31337:0x5FbDB2315678afecb367f032d93F642f64180aa3/ETH",
+   "node_net": "evm:31337:0x5FbDB2315678afecb367f032d93F642f64180aa3",
+   "kind": "evm",
+   "a": "erin",
+   "b": "frank",
+   "b_id": "020606060606060606060606060606060606060606060606060606060606060606",
+   "b_ours": true,
+   "asset": null,
+   "asset_label": "ETH",
+   "unit": "sat",
+   "state": "open",
+   "raw_state": "CHANNELD_NORMAL",
+   "status": "",
+   "a_units": 450000,
+   "b_units": 50000,
+   "scid": "31x1x0",
+   "opener": "local",
+   "private": false,
+   "peer_connected": true,
+   "confirm": null
+  },
+  {
+   "id": "d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4",
+   "net": "evm:84532:0xB82000000000000000000000000000000000940E/USDC",
+   "node_net": "evm:84532:0xB82000000000000000000000000000000000940E",
+   "kind": "evm",
+   "a": "gina",
+   "b": "hank",
+   "b_id": "020808080808080808080808080808080808080808080808080808080808080808",
+   "b_ours": true,
+   "asset": null,
+   "asset_label": "USDC",
+   "unit": "sat",
+   "state": "open",
+   "raw_state": "CHANNELD_NORMAL",
+   "status": "",
+   "a_units": 60000,
+   "b_units": 40000,
+   "scid": "4410100x1x0",
+   "opener": "local",
+   "private": false,
+   "peer_connected": true,
+   "confirm": null
+  },
+  {
+   "id": "5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b",
+   "net": "liquid:regtest/L-BTC",
+   "node_net": "liquid:regtest",
+   "kind": "liquid",
+   "a": "carol",
+   "b": "dave",
+   "b_id": "020404040404040404040404040404040404040404040404040404040404040404",
+   "b_ours": true,
+   "asset": null,
+   "asset_label": "L-BTC",
+   "unit": "sat",
+   "state": "open",
+   "raw_state": "CHANNELD_NORMAL",
+   "status": "",
+   "a_units": 180000,
+   "b_units": 20000,
+   "scid": "2690380x1x0",
+   "opener": "local",
+   "private": false,
+   "peer_connected": true,
+   "confirm": null
+  },
+  {
+   "id": "a43d57113597e25b773c94de882c6d857bb8edb589689abd598b491f57db544d",
+   "net": "liquid:regtest/TEST",
+   "node_net": "liquid:regtest",
+   "kind": "liquid",
+   "a": "carol",
+   "b": "dave",
+   "b_id": "020404040404040404040404040404040404040404040404040404040404040404",
+   "b_ours": true,
+   "asset": "ddc8da3f868bd193d25e3bbdd3e3c075d6629fa45dee1c3d829682d82094ba50",
+   "asset_label": "TEST",
+   "unit": "units",
+   "state": "open",
+   "raw_state": "CHANNELD_NORMAL",
+   "status": "",
+   "a_units": 930000,
+   "b_units": 70000,
+   "scid": "2690367x1x0",
+   "opener": "local",
+   "private": false,
+   "peer_connected": true,
+   "confirm": null
+  },
+  {
+   "id": "d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5",
+   "net": "evm:84532:0xB82000000000000000000000000000000000940E/USDC",
+   "node_net": "evm:84532:0xB82000000000000000000000000000000000940E",
+   "kind": "evm",
+   "a": "gina",
+   "b": "hank",
+   "b_id": "020808080808080808080808080808080808080808080808080808080808080808",
+   "b_ours": true,
+   "asset": null,
+   "asset_label": "USDC",
+   "unit": "sat",
+   "state": "opening",
+   "raw_state": "CHANNELD_AWAITING_LOCKIN",
+   "status": "",
+   "a_units": 200000,
+   "b_units": 0,
+   "scid": "4410210x1x0",
+   "opener": "local",
+   "private": false,
+   "peer_connected": true,
+   "confirm": {
+    "depth": 2,
+    "need": 3
+   }
+  },
+  {
+   "id": "c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2",
+   "net": "evm:31337:0x5FbDB2315678afecb367f032d93F642f64180aa3/ETH",
+   "node_net": "evm:31337:0x5FbDB2315678afecb367f032d93F642f64180aa3",
+   "kind": "evm",
+   "a": "erin",
+   "b": "frank",
+   "b_id": "020606060606060606060606060606060606060606060606060606060606060606",
+   "b_ours": true,
+   "asset": null,
+   "asset_label": "ETH",
+   "unit": "sat",
+   "state": "onchain",
+   "raw_state": "ONCHAIN",
+   "status": "ONCHAIN:1 outputs unresolved: in 23 blocks will spend DELAYED_OUTPUT_TO_US (aa\u2026:0) using OUR_DELAYED_RETURN_TO_WALLET",
+   "a_units": 300000,
+   "b_units": 0,
+   "scid": "18x1x0",
+   "opener": "local",
+   "private": false,
+   "peer_connected": true,
+   "confirm": null
+  }
+ ],
+ "maps": {
+  "btc:regtest": {
+   "nodes": [
+    {
+     "key": "020101010101010101010101010101010101010101010101010101010101010101",
+     "name": "alice",
+     "ours": true
+    },
+    {
+     "key": "020202020202020202020202020202020202020202020202020202020202020202",
+     "name": "bob",
+     "ours": true
+    },
+    {
+     "key": "037a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a",
+     "name": "037a7a7a",
+     "ours": false
+    }
+   ],
+   "edges": [
+    {
+     "a": "020101010101010101010101010101010101010101010101010101010101010101",
+     "b": "020202020202020202020202020202020202020202020202020202020202020202",
+     "cap": 1000000,
+     "local": true,
+     "state": "open",
+     "label": ""
+    },
+    {
+     "a": "020202020202020202020202020202020202020202020202020202020202020202",
+     "b": "037a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a",
+     "cap": 500000,
+     "local": false,
+     "state": "open",
+     "label": ""
+    }
+   ],
+   "peers": [
+    {
+     "a": "020101010101010101010101010101010101010101010101010101010101010101",
+     "b": "020202020202020202020202020202020202020202020202020202020202020202"
+    }
+   ]
+  },
+  "liquid:regtest": {
+   "nodes": [
+    {
+     "key": "020303030303030303030303030303030303030303030303030303030303030303",
+     "name": "carol",
+     "ours": true
+    },
+    {
+     "key": "020404040404040404040404040404040404040404040404040404040404040404",
+     "name": "dave",
+     "ours": true
+    }
+   ],
+   "edges": [
+    {
+     "a": "020303030303030303030303030303030303030303030303030303030303030303",
+     "b": "020404040404040404040404040404040404040404040404040404040404040404",
+     "cap": 200000,
+     "local": true,
+     "state": "open",
+     "label": "L-BTC"
+    },
+    {
+     "a": "020303030303030303030303030303030303030303030303030303030303030303",
+     "b": "020404040404040404040404040404040404040404040404040404040404040404",
+     "cap": 1000000,
+     "local": true,
+     "state": "open",
+     "label": "TEST"
+    }
+   ],
+   "peers": [
+    {
+     "a": "020303030303030303030303030303030303030303030303030303030303030303",
+     "b": "020404040404040404040404040404040404040404040404040404040404040404"
+    }
+   ]
+  },
+  "evm:31337:0x5FbDB2315678afecb367f032d93F642f64180aa3": {
+   "nodes": [
+    {
+     "key": "020505050505050505050505050505050505050505050505050505050505050505",
+     "name": "erin",
+     "ours": true
+    },
+    {
+     "key": "020606060606060606060606060606060606060606060606060606060606060606",
+     "name": "frank",
+     "ours": true
+    }
+   ],
+   "edges": [
+    {
+     "a": "020505050505050505050505050505050505050505050505050505050505050505",
+     "b": "020606060606060606060606060606060606060606060606060606060606060606",
+     "cap": 500000,
+     "local": true,
+     "state": "open",
+     "label": ""
+    },
+    {
+     "a": "020505050505050505050505050505050505050505050505050505050505050505",
+     "b": "020606060606060606060606060606060606060606060606060606060606060606",
+     "cap": 300000,
+     "local": true,
+     "state": "onchain",
+     "label": ""
+    }
+   ],
+   "peers": [
+    {
+     "a": "020505050505050505050505050505050505050505050505050505050505050505",
+     "b": "020606060606060606060606060606060606060606060606060606060606060606"
+    }
+   ]
+  },
+  "evm:84532:0xB82000000000000000000000000000000000940E": {
+   "nodes": [
+    {
+     "key": "020707070707070707070707070707070707070707070707070707070707070707",
+     "name": "gina",
+     "ours": true
+    },
+    {
+     "key": "020808080808080808080808080808080808080808080808080808080808080808",
+     "name": "hank",
+     "ours": true
+    }
+   ],
+   "edges": [
+    {
+     "a": "020707070707070707070707070707070707070707070707070707070707070707",
+     "b": "020808080808080808080808080808080808080808080808080808080808080808",
+     "cap": 100000,
+     "local": true,
+     "state": "open",
+     "label": ""
+    },
+    {
+     "a": "020707070707070707070707070707070707070707070707070707070707070707",
+     "b": "020808080808080808080808080808080808080808080808080808080808080808",
+     "cap": 200000,
+     "local": true,
+     "state": "opening",
+     "label": ""
+    }
+   ],
+   "peers": [
+    {
+     "a": "020707070707070707070707070707070707070707070707070707070707070707",
+     "b": "020808080808080808080808080808080808080808080808080808080808080808"
+    }
+   ]
+  }
+ },
+ "assets": {
+  "ddc8da3f868bd193d25e3bbdd3e3c075d6629fa45dee1c3d829682d82094ba50": "TEST"
+ },
+ "now": 1794100000,
+ "jobs": [
+  {
+   "id": 6,
+   "title": "Deposit 500,000 sat to gina (evm:84532:0xB820\u2026940E/USDC)",
+   "net": "evm:84532:0xB82000000000000000000000000000000000940E",
+   "nodes": [
+    "gina"
+   ],
+   "status": "running",
+   "queued": 1794099975,
+   "started": 1794099975,
+   "ended": null,
+   "log": [
+    "deposited 500,000 sat (50,000,000 USDC units) to gina: EVM tx 0x5d\u2026, pending"
+   ],
+   "result": {},
+   "cancelling": false
+  },
+  {
+   "id": 7,
+   "title": "Exit all sat from hank to its ETH address",
+   "net": "evm:84532:0xB82000000000000000000000000000000000940E",
+   "nodes": [
+    "hank"
+   ],
+   "status": "waiting",
+   "queued": 1794099995,
+   "started": null,
+   "ended": null,
+   "log": [],
+   "result": {},
+   "cancelling": false,
+   "waiting_for": [
+    "Deposit 500,000 sat to gina (evm:84532:0xB820\u2026940E/USDC)"
+   ]
+  }
+ ],
+ "history": [
+  {
+   "id": 5,
+   "title": "Open liquid:regtest/TEST channel carol to dave, 1,000,000 units",
+   "net": "liquid:regtest",
+   "nodes": [
+    "carol",
+    "dave"
+   ],
+   "status": "done",
+   "queued": 1794099960,
+   "started": 1794099960,
+   "ended": 1794099988,
+   "log": [
+    "funding tx a43d57113597e25b773c94de882c6d857bb8edb589689abd598b491f57db544d:0, 2000 sat L-BTC fee reserve next to the asset",
+    "liquid:regtest/TEST channel carol -> dave ready: 1,000,000 units (2690367x1x0)"
+   ],
+   "result": {},
+   "cancelling": false
+  },
+  {
+   "id": 3,
+   "title": "Deposit 1,000,000 sat to erin (evm:31337:0x5FbDB2315678afecb367f032d93F642f64180aa3/ETH)",
+   "net": "evm:31337:0x5FbDB2315678afecb367f032d93F642f64180aa3",
+   "nodes": [
+    "erin"
+   ],
+   "status": "done",
+   "queued": 1794099700,
+   "started": 1794099700,
+   "ended": 1794099710,
+   "log": [
+    "erin sees it in its wallet"
+   ],
+   "result": {},
+   "cancelling": false
+  },
+  {
+   "id": 2,
+   "title": "Pay 50,000 sat from gina to hank (evm:84532:0xB820\u2026940E/USDC)",
+   "net": "evm:84532:0xB82000000000000000000000000000000000940E",
+   "nodes": [
+    "gina",
+    "hank"
+   ],
+   "status": "error",
+   "queued": 1794099600,
+   "started": 1794099600,
+   "ended": 1794099600,
+   "log": [
+    "error: gina: xpay: no route"
+   ],
+   "result": {},
+   "cancelling": false
+  },
+  {
+   "id": 1,
+   "title": "Mine 6 on btc:regtest",
+   "net": "btc:regtest",
+   "nodes": [],
+   "status": "done",
+   "queued": 1794099500,
+   "started": 1794099500,
+   "ended": 1794099501,
+   "log": [
+    "mined 6 blocks on btc:regtest"
+   ],
+   "result": {},
+   "cancelling": false
+  }
+ ]
+}

@@ -13,6 +13,7 @@
 #   contrib/assetchan/nodes.sh log A                # tail the log
 #
 # Environment: ASSETCHAN_NETWORK (liquid-testnet, or liquid-regtest),
+# ASSETCHAN_PORT_BASE (node ports: base + 1..4, default 20740),
 # ASSETCHAN_DIR (node data; default ~/.assetchan-testnet or ~/.assetchan-regtest,
 # never inside the source tree), ELEMENTS_RPC (default
 # http://poc:poc@127.0.0.1:7039 on testnet: the liquid-ln-testnet docker
@@ -52,12 +53,15 @@ wallet=${ELEMENTS_WALLET:-poc}
 userpass=$(printf '%s' "$rpc" | sed -E 's|^[a-z]+://([^@]*)@.*|\1|')
 hostport=$(printf '%s' "$rpc" | sed -E 's|^[a-z]+://([^@]*@)?([^/]*).*|\2|')
 
+# Node ports: ASSETCHAN_PORT_BASE + 1..4 (default 20740), so nodes of two
+# networks can run side by side (e.g. ASSETCHAN_PORT_BASE=20760 for testnet).
 port_of() {
+	base=${ASSETCHAN_PORT_BASE:-20740}
 	case "$1" in
-	A) echo 20741 ;;
-	B) echo 20742 ;;
-	C) echo 20743 ;;
-	D) echo 20744 ;;
+	A) echo $((base + 1)) ;;
+	B) echo $((base + 2)) ;;
+	C) echo $((base + 3)) ;;
+	D) echo $((base + 4)) ;;
 	*) echo "no such node: $1" >&2; exit 1 ;;
 	esac
 }
