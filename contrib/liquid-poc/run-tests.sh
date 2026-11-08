@@ -7,6 +7,7 @@
 #   contrib/liquid-poc/run-tests.sh                   # the Liquid asset tests
 #   contrib/liquid-poc/run-tests.sh -k penalty        # ... some of them
 #   contrib/liquid-poc/run-tests.sh tests/test_closing.py -n 8
+#   contrib/liquid-poc/run-tests.sh plugins/assetswap-plugin/tests/
 #   contrib/liquid-poc/run-tests.sh logs DIR          # last run's test dirs to DIR
 #   contrib/liquid-poc/run-tests.sh clean             # remove the build volume
 #
@@ -53,7 +54,7 @@ has_tests=no
 has_n=no
 for arg in "$@"; do
 	case "$arg" in
-	tests/*|*.py|*.py::*) has_tests=yes ;;
+	tests/*|plugins/*|*.py|*.py::*) has_tests=yes ;;
 	-n|-n*|--numprocesses*) has_n=yes ;;
 	esac
 done
@@ -63,7 +64,7 @@ done
 list=$(mktemp "${TMPDIR:-/tmp}/lnpoc-files.XXXXXX")
 trap 'rm -f "$list"' EXIT
 cd "$root"
-{ git ls-files --recurse-submodules; git ls-files --others --exclude-standard; } \
+{ git ls-files --recurse-submodules; git ls-files --others --exclude-standard; find .git; } \
 	| while IFS= read -r f; do [ -e "$f" ] && printf '%s\n' "$f"; done > "$list"
 
 # macOS's tar would add extended attributes and ._ files.
@@ -80,6 +81,7 @@ COPYFILE_DISABLE=1 tar $tarflags -cf - -T "$list" \
 set -e
 tar -xf - -C /build 2> /dev/null
 cd /build
+git config --global --add safe.directory "*"
 if [ ! -f config.vars ]; then
 	echo "configuring ..."
 	PYTHON=python3 ./configure --disable-rust --disable-valgrind > /tmp/configure.log 2>&1 \
@@ -88,6 +90,11 @@ fi
 echo "building ..."
 make -j"$(nproc)" VERSION=v26.09-liquid all-programs default-targets > /tmp/make.log 2>&1 \
 	|| { grep -E "error|Error" /tmp/make.log | head -40; tail -20 /tmp/make.log; exit 1; }
+
+echo "building rust plugins ..."
+export CARGO_HOME=/build/.cargo
+cargo build -p cln-assetswap -p cln-pricetiers > /tmp/cargo.log 2>&1 \
+	|| { tail -60 /tmp/cargo.log; exit 1; }
 
 export PYTHONPATH=/build/contrib/pyln-testing:/build/contrib/pyln-client:/build/contrib/pyln-proto:/build/contrib/pyln-spec/bolt7:/build/contrib/pyln-grpc-proto
 export TEST_NETWORK=liquid-regtest TEST_DIR=/tmp/ltests SLOW_MACHINE=1
