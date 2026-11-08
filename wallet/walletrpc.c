@@ -654,7 +654,7 @@ static struct command_result *json_withdrawasset(struct command *cmd,
 	const u8 *destination;
 	u8 *asset;
 	u64 *amount_units;
-	u32 *feerate_opt, feerate, height = get_block_height(ld->topology);
+	u32 *feerate_opt, feerate, height;
 	struct sending_asset *sending;
 	struct asset_output **all;
 	struct utxo **utxos, **sign_utxos;
@@ -676,6 +676,7 @@ static struct command_result *json_withdrawasset(struct command *cmd,
 		   p_opt("feerate", param_u32, &feerate_opt),
 		   NULL))
 		return command_param_failed();
+	height = get_block_height(ld->topology);
 
 	if (!chainparams->is_elements)
 		return command_fail(cmd, LIGHTNINGD, "Not on Liquid");
