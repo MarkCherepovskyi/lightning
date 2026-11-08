@@ -76,12 +76,54 @@ class LogsNode(evm.EvmRpc):
                 for b in range(lo, hi + 1) for i in range(self.lpb[b])]
 
 
-def test_get_logs_ranges_start_at_2000():
-    node = LogsNode([0] * 5000)
-    chunks = list(node.get_logs_chunked('0x' + '00' * 20, None, 0, 4999))
-    assert [(a, b) for a, b, _ in chunks] == [(0, 1999), (2000, 3999), (4000, 4999)]
-    assert node.ranges == [(0, 1999), (2000, 3999), (4000, 4999)]
+def test_get_logs_ranges_start_at_10000():
+    node = LogsNode([0] * 25000)
+    chunks = list(node.get_logs_chunked('0x' + '00' * 20, None, 0, 24999))
+    assert [(a, b) for a, b, _ in chunks] == [(0, 9999), (10000, 19999), (20000, 24999)]
+    assert node.ranges == [(0, 9999), (10000, 19999), (20000, 24999)]
     assert list(node.get_logs_chunked('0x' + '00' * 20, None, 10, 9)) == []
+
+
+@pytest.mark.parametrize('msg,limit', [
+    ('range 50000 exceeds limit of 10000', 10000),
+    ('eth_getLogs: exceed maximum block range: 5000', 5000),
+    ('Log response size exceeded. You can make eth_getLogs requests with up to a 2K block range', 2000),
+    ('Under the Free tier plan, you can make eth_getLogs requests with up to a 10 block range', 10),
+    ('query returned more than 10000 results', None),
+    ('header not found', None),
+])
+def test_stated_range_limit(msg, limit):
+    assert evm.stated_range_limit(msg) == limit
+    assert evm.EvmError(msg, -32602).range_limit == limit
+    # The summary text a real call raises holds no part of the reply; the cap rides along.
+    assert evm.EvmError('eth_getLogs: JSON-RPC error -32602', -32602, range_limit=7).range_limit == 7
+
+
+class CappedNode(LogsNode):
+    """Refuses ranges wider than max_range the way Infura on Base does."""
+
+    def __init__(self, n, max_range):
+        super().__init__([0] * n)
+        self.max_range = max_range
+
+    def call(self, method, *params):
+        lo, hi = int(params[0]['fromBlock'], 16), int(params[0]['toBlock'], 16)
+        if hi - lo + 1 > self.max_range:
+            self.ranges.append((lo, hi))
+            raise evm.EvmError('range {} exceeds limit of {}'.format(hi - lo + 1, self.max_range), -32602)
+        return super().call(method, *params)
+
+
+def test_get_logs_adopts_the_stated_range_cap():
+    node = CappedNode(20000, 3000)
+    chunks = list(node.get_logs_chunked('0x' + '00' * 20, None, 0, 19999))
+    spans = [(a, b) for a, b, _ in chunks]
+    assert spans[0] == (0, 2999) and spans[-1][1] == 19999 and max(b - a + 1 for a, b in spans) == 3000
+    assert node.ranges[0] == (0, 9999) and len(node.ranges) == 1 + 7     # one refusal, then 3,000 at a time
+    assert node.logs_range_cap == 3000
+    node.ranges = []
+    list(node.get_logs_chunked('0x' + '00' * 20, None, 0, 5999))
+    assert node.ranges == [(0, 2999), (3000, 5999)], 'the cap is remembered'
 
 
 def test_get_logs_splits_on_too_many_results():
@@ -97,7 +139,7 @@ def test_get_logs_splits_on_too_many_results():
     assert spans[0][0] == 0 and spans[-1][1] == 5999
     assert all(spans[i][1] + 1 == spans[i + 1][0] for i in range(len(spans) - 1))
     assert all(sum(lpb[a:b + 1]) <= 10000 for a, b in spans)
-    assert max(b - a + 1 for a, b in node.ranges) == 2000
+    assert max(b - a + 1 for a, b in node.ranges) == 6000
     failed = [r for r in node.ranges if sum(lpb[r[0]:r[1] + 1]) > 10000]
     assert failed and all(r[1] - r[0] + 1 > 1 for r in failed)
     assert len(node.ranges) < 40

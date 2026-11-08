@@ -104,12 +104,12 @@ def test_clamped_getlogs_must_not_lose_a_confirmed_row(tmp_path):
 
 
 def test_catch_up_makes_progress_under_rate_limits(tmp_path):
-    """8,000 blocks to catch up (4 eth_getLogs ranges) with a provider that
-    allows 2 calls per poll: every poll restarts at DEPLOY_BLOCK, so the first
-    sync never completes and ibd stays true."""
+    """4 eth_getLogs ranges (4 x LOGS_CHUNK blocks) to catch up with a
+    provider that allows 2 calls per poll: every poll restarts at
+    DEPLOY_BLOCK, so the first sync never completes and ibd stays true."""
     node = RateLimited()
     ix = fresh(tmp_path, node)
-    for i in range(8000):
+    for i in range(4 * evm.LOGS_CHUNK):
         node.add_block(node.T(1) + i)
     starts = []
     for _ in range(6):

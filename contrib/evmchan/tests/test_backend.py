@@ -1465,3 +1465,81 @@ def test_idle_tracker_reads_the_nonce_only_while_a_send_is_exposed(tmp_path):
     legacy = p.to_dict()
     del legacy['mined_block']
     assert eb.Pending.from_dict(legacy).mined_block is None
+
+
+class CountingRpc(evm.EvmRpc):
+    """eth_getBalance and the withdrawable eth_call, counted per method."""
+
+    def __init__(self):
+        super().__init__('http://fake.invalid')
+        self.balance, self.wd = 10**18, 5 * SAT
+
+    def call(self, method, *params):
+        with self._calls_lock:
+            self.calls[method] += 1
+        if method == 'eth_getBalance':
+            return evm.qty(self.balance)
+        if method == 'eth_call':
+            return '0x' + evm.abi_encode(['uint256'], [self.wd]).hex()
+        raise evm.EvmError('{}: unexpected'.format(method))
+
+
+class StatusIx(FakeIx):
+    ibd = False
+
+    def checkpoint(self):
+        return None
+
+
+def test_status_cached_reads_no_fresh_balances(tmp_path):
+    """evm-status cached=true (contrib/nodeui's poll): the ETH balance the
+    poll keeps, and withdrawable at most once per evm-poll or after a change.
+    Without it, every call reads both afresh (as before)."""
+    b = offline_backend(tmp_path)
+    b.cfg.poll = 60.0
+    b.ix, b.rpc = StatusIx(), CountingRpc()
+    b.balance, b.balance_at = 10**18, time.time()
+
+    def reads():
+        return b.rpc.calls['eth_getBalance'], b.rpc.calls['eth_call']
+    s = b.status()
+    assert reads() == (1, 1) and s['cached'] is False and s['withdrawable_wei'] == 5 * SAT
+    b.status()
+    assert reads() == (2, 2), 'uncached: fresh every time'
+    for _ in range(10):
+        s = b.status(cached=True)
+    assert reads() == (2, 2), 'cached: the values just read'
+    assert s['cached'] is True and s['balance_wei'] == 10**18 and s['withdrawable_wei'] == 5 * SAT
+    assert 'withdrawable_age_s' in s and 'balance_age_s' in s
+    # Older than evm-poll: one read, then cached again.
+    b.withdrawable_cache = (b.withdrawable_cache[0], time.time() - 61)
+    b.rpc.wd = 7 * SAT
+    assert b.status(cached=True)['withdrawable_wei'] == 7 * SAT
+    b.status(cached=True)
+    assert reads() == (2, 3)
+    # A send (or receipt, or new logs) marks it dirty: one read.
+    b.withdrawable_dirty = True
+    b.rpc.wd = 9 * SAT
+    assert b.status(cached=True)['withdrawable_wei'] == 9 * SAT
+    b.status(cached=True)
+    assert reads() == (2, 4)
+    # The balance never refreshes from evm-status cached=true; the poll does that.
+    b.rpc.balance = 3 * 10**18
+    assert b.status(cached=True)['balance_wei'] == 10**18 and reads()[0] == 2
+    # Ten cached reads cost what one uncached read did before: none at all here.
+    before = sum(b.rpc.calls.values())
+    for _ in range(10):
+        b.status(cached=True)
+    assert sum(b.rpc.calls.values()) == before
+
+
+def test_catchup_jitter(tmp_path):
+    b = offline_backend(tmp_path)
+    b.cfg.poll = 60.0
+    b.ix = StatusIx()
+    assert b.catchup_jitter() == 0.0
+    b.ix.ibd = True
+    got = [b.catchup_jitter() for _ in range(50)]
+    assert all(0 <= x <= eb.CATCHUP_JITTER for x in got) and len(set(got)) > 1
+    b.cfg.poll = 1.0
+    assert all(b.catchup_jitter() <= 0.5 for _ in range(20))

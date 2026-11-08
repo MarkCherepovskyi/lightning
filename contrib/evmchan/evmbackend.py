@@ -42,6 +42,7 @@ import decimal
 import json
 import os
 import queue
+import random
 import stat
 import sys
 import threading
@@ -69,6 +70,7 @@ CONNECT_RETRY = 60                    # seconds init keeps trying the EVM node (
 RECENT_KEEP = 64                      # mined sends remembered, to re-send if a reorg takes their nonce back
 IDLE_GAP_POLLS = 10                   # idle: the nonce gap check runs every 10th poll (M5: Infura credits)
 CLN_DEFAULT_POLL = 30                 # lightningd polls the backend every 30 s without --dev-bitcoind-poll
+CATCHUP_JITTER = 5.0                  # most seconds of random delay before a catch-up poll (SPEC 5.2)
 SUBMIT_SIG = 'submit(bytes,(uint64,bytes,uint32)[])'
 SUBMIT_TYPES = ['bytes', '(uint64,bytes,uint32)[]']
 
@@ -739,6 +741,8 @@ class Backend:
         self.balance = None
         self.balance_at = 0.0
         self.balance_dirty = True
+        self.withdrawable_cache = None   # (wei, time.time()) for evm-status cached=true
+        self.withdrawable_dirty = True   # a send, receipt or new log may have changed it
         self.alarms = {}         # name -> {'since', 'logged', 'message'}
         self.started_at = time.time()   # rpc_calls in evm-status count from here
         self.sync_error_since = None
@@ -1184,7 +1188,7 @@ class Backend:
             self.log('unusual', '{} {}: eth_sendRawTransaction failed ({}); re-sending nonce {} next tick'
                      .format(kind, btc_txid or '', why, nonce))
             p.replace_at = time.monotonic()
-        self.balance_dirty = True
+        self.balance_dirty = self.withdrawable_dirty = True
         self.log('debug', '{} {} sent as EVM tx {} (nonce {}, gas {})'.format(
             kind, btc_txid or '', txhash, nonce, gas_limit))
         return ok(), p
@@ -1563,7 +1567,7 @@ class Backend:
                     level, why = 'unusual', 'its inputs were spent by another submit first'
                 self.log(level, 'submit of {} (nonce {}) reverted on chain; {}'.format(which, p.nonce, why))
         p.result, p.receipt = res, receipt
-        self.balance_dirty = True
+        self.balance_dirty = self.withdrawable_dirty = True
         with self._plock:
             self.mined_floor = max(self.mined_floor, p.nonce + 1)
             self.recent.pop(p.nonce, None)
@@ -1672,8 +1676,19 @@ class Backend:
 
     # -------------------------------------------------------- polling and alarms (5.2, 5.5)
 
+    def catchup_jitter(self):
+        """Seconds to wait before a poll: while the index catches up (no
+        checkpoint yet in this process), a random 0..CATCHUP_JITTER s (at most
+        half the poll), so fresh nodes sharing one API key spread their
+        eth_getLogs out (SPEC 5.2); 0 once caught up."""
+        if self.ix is None or not self.ix.ibd:
+            return 0.0
+        return random.uniform(0, min(CATCHUP_JITTER, self.cfg.poll / 2.0))
+
     def _poll_loop(self):
         while not self.stop_event.is_set():
+            if self.stop_event.wait(self.catchup_jitter()):
+                break
             self.poll_once()
             self.stop_event.wait(self.cfg.poll)
 
@@ -1683,6 +1698,8 @@ class Backend:
             if not res.get('skipped'):
                 self.sync_error_since = None
                 self.last_sync_error = None
+            if res.get('added') or res.get('dropped'):
+                self.withdrawable_dirty = True      # a new TxApplied may pay out to us
         except evm.EvmError as e:
             self._sync_failed(self.scrub(e), now)
         except Exception as e:
@@ -2019,7 +2036,23 @@ class Backend:
 
     def withdrawable(self):
         data = evm.calldata('withdrawable(address)', ['address'], [self.address])
-        return evm.abi_decode(['uint256'], self.rpc.eth_call(self.contract, data))[0]
+        self.withdrawable_dirty = False     # before the read: a change during it marks it again
+        try:
+            v = evm.abi_decode(['uint256'], self.rpc.eth_call(self.contract, data))[0]
+        except BaseException:
+            self.withdrawable_dirty = True
+            raise
+        self.withdrawable_cache = (v, time.time())
+        return v
+
+    def cached_withdrawable(self, now=None):
+        """withdrawable(), read at most once per evm-poll interval unless a
+        send, a receipt or new logs marked it dirty."""
+        now = time.time() if now is None else now
+        hit = self.withdrawable_cache
+        if hit is not None and not self.withdrawable_dirty and now - hit[1] < self.cfg.poll:
+            return hit[0]
+        return self.withdrawable()
 
     def deposit(self, amount, address=None):
         try:
@@ -2063,15 +2096,24 @@ class Backend:
         except ValueError:
             raise UserError('not a 20-byte hex ETH address') from None
 
-    def status(self):
+    def status(self, cached=False):
+        """evm-status. cached: no fresh reads for the balances. The ETH
+        balance is the one the poll keeps (refresh_balance's rules), the
+        withdrawable is read at most once per evm-poll interval or after a
+        change (for pollers such as contrib/nodeui: SPEC 5.5)."""
         out = {'contract': self.contract, 'chain_id': self.ix.chain_id, 'interval': self.interval,
-               'confirm': self.cfg.confirm, 'eth_address': self.address}
+               'confirm': self.cfg.confirm, 'eth_address': self.address, 'cached': bool(cached)}
         try:
-            out['balance_wei'] = self.refresh_balance(force=True)
+            if cached and self.balance is not None:
+                out['balance_wei'] = self.balance
+            else:
+                out['balance_wei'] = self.refresh_balance(force=not cached)
+            out['balance_age_s'] = round(max(0.0, time.time() - self.balance_at), 1)
         except evm.EvmError as e:
             out['balance_error'] = self.scrub(e)
         try:
-            out['withdrawable_wei'] = self.withdrawable()
+            out['withdrawable_wei'] = self.cached_withdrawable() if cached else self.withdrawable()
+            out['withdrawable_age_s'] = round(max(0.0, time.time() - self.withdrawable_cache[1]), 1)
         except evm.EvmError as e:
             out['withdrawable_error'] = self.scrub(e)
         tb = self.ix.tag_block()
@@ -2291,9 +2333,11 @@ def main():
         rpc_in_thread('evm-withdraw', lambda: backend().withdraw(), request)
 
     @plugin.async_method('evm-status')
-    def evm_status(plugin, request, **kwargs):
-        """Contract, chain, key, balances, tip, lag, pending sends, alarms."""
-        rpc_in_thread('evm-status', lambda: backend().status(), request)
+    def evm_status(plugin, request, cached=False, **kwargs):
+        """Contract, chain, key, balances, tip, lag, pending sends, alarms; {cached}=true
+        reads no fresh balances (the poll's ETH balance, withdrawable at most once per evm-poll)."""
+        flag = cached is True or (isinstance(cached, str) and cached.lower() in ('true', '1'))
+        rpc_in_thread('evm-status', lambda: backend().status(cached=flag), request)
 
     plugin.run()
 

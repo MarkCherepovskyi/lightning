@@ -171,8 +171,9 @@ def test_failure_after_the_first_range_keeps_progress(tmp_path):
     node = Flaky()
     ix = fresh(tmp_path, node)
     first = node.deposit()
-    for i in range(5000):
-        node.add_block(node.T(1) + i, [first] if i == 10 else [node.deposit()] if i in (2500, 4500) else [])
+    c = evm.LOGS_CHUNK
+    for i in range(c * 5 // 2):
+        node.add_block(node.T(1) + i, [first] if i == 10 else [node.deposit()] if i in (c * 5 // 4, c * 9 // 4) else [])
     node.fail_at = 2
     with pytest.raises(evm.EvmError):
         ix.sync()
@@ -181,7 +182,7 @@ def test_failure_after_the_first_range_keeps_progress(tmp_path):
     calls = len(node.calls)
     r = ix.sync()
     starts = [int(p[0]['fromBlock'], 16) for m, p in node.calls[calls:] if m == 'eth_getLogs']
-    assert starts[0] == node.deploy_block + 2000      # resumed, not restarted
+    assert starts[0] == node.deploy_block + c         # resumed, not restarted
     assert r['proven'] and not ix.ibd
     check_chain(ix, node)
 

@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: MIT
 """An in-memory EVM node for the index tests: blocks with timestamps and
 TxApplied logs, tags (safe = latest - 1, as anvil --slots-in-an-epoch 1),
-reorgs at will, and an optional cap on eth_getLogs results that fails the way
-Infura does."""
+reorgs at will, and optional eth_getLogs limits that fail the way Infura
+does: a cap on results (-32005 "more than N results"), a cap on the block
+range (-32602 "range N exceeds limit of M", Base Sepolia) and HTTP 429s."""
 import copy
 import os
 
@@ -14,9 +15,13 @@ CONTRACT = '0x00000000000000000000000000000000000C0FFE'
 
 
 class FakeChain(evm.EvmRpc):
-    def __init__(self, genesis_time=1793949807, interval=2, deploy_block=5, max_logs=None):
+    def __init__(self, genesis_time=1793949807, interval=2, deploy_block=5, max_logs=None, max_range=None,
+                 rate_limited=None):
+        """rate_limited(n): True to answer the n-th eth_getLogs (from 1) with HTTP 429."""
         super().__init__('http://fake.invalid')
         self.G, self.I, self.deploy_block, self.max_logs = genesis_time, interval, deploy_block, max_logs
+        self.max_range, self.rate_limited = max_range, rate_limited
+        self.rate_limit_backoff = 0     # request()'s retries, without the sleeps
         self.blocks = []        # [{'number', 'hash', 'timestamp', 'logs': [log dicts]}]
         self.calls = []         # (method, params)
         self.nonce = 0
@@ -113,6 +118,13 @@ class FakeChain(evm.EvmRpc):
         if method == 'eth_getLogs':
             f = params[0]
             lo, hi = int(f['fromBlock'], 16), int(f['toBlock'], 16)
+            if self.rate_limited is not None and self.rate_limited(self.count('eth_getLogs')):
+                # As EvmRpc.call raises it: the reply is dropped, only the status is kept.
+                raise evm.EvmError('eth_getLogs: HTTP 429', rate_limited=True, too_many=False)
+            if self.max_range is not None and hi - lo + 1 > self.max_range:
+                raise evm.EvmError('eth_getLogs: JSON-RPC error -32602', -32602, too_many=True,
+                                   rate_limited=False, range_limit=evm.stated_range_limit(
+                                       'range {} exceeds limit of {}'.format(hi - lo + 1, self.max_range)))
             if f['address'].lower() != CONTRACT.lower():
                 return []
             out = [log for b in self.blocks[lo:hi + 1] for log in b['logs']

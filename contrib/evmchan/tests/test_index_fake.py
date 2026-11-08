@@ -441,3 +441,83 @@ def test_quiet_check_is_pinned_to_latest_and_sees_a_reorg(tmp_path):
     assert [m for m, _ in node.calls[n:]].count('eth_call') >= 2     # not quiet: tag state read
     assert r['proven'] and ix.utxo(txid, 0) is None
     check_chain(ix, node)
+
+
+# ------------------------------------------------------------ catch-up of a fresh node (SPEC 5.2 ranges)
+
+CATCHUP_BLOCKS = 86_000         # two days of Base Sepolia (2 s blocks) since DEPLOY_BLOCK
+
+
+def long_chain(**kw):
+    """A chain CATCHUP_BLOCKS past DEPLOY_BLOCK with a deposit every 5,000 blocks."""
+    node = FakeChain(**kw)
+    raws, t0 = [], node.T(1)
+    for i in range(CATCHUP_BLOCKS):
+        txs = [node.deposit()] if i % 5000 == 2500 else []
+        raws += txs
+        node.add_block(t0 + i, txs)
+    return node, raws
+
+
+def logs_ranges(node):
+    return [(int(p[0]['fromBlock'], 16), int(p[0]['toBlock'], 16)) for m, p in node.calls if m == 'eth_getLogs']
+
+
+def assert_caught_up(ix, node, raws):
+    assert not ix.ibd and ix.tip() == ix.height_at(node.blocks[-2]['timestamp']) - 1
+    assert all(ix.utxo(btc.Tx.parse(r).txid_hex(), 0) for r in raws)
+    assert ix.checkpoint()[2] == len(raws)
+
+
+@pytest.mark.parametrize('chunk,most', [(evm.LOGS_CHUNK, 9), (2000, 44)])
+def test_catchup_on_a_10000_block_limit(tmp_path, monkeypatch, chunk, most):
+    """Infura on Base Sepolia refuses ranges over 10,000 blocks (-32602
+    "range N exceeds limit of 10000"). Ranges of 10,000: 9 calls for 86,000
+    blocks, where the 2,000 of draft 5 took 44."""
+    monkeypatch.setattr(evm, 'LOGS_CHUNK', chunk)
+    node, raws = long_chain(max_range=10_000)
+    ix = fresh(tmp_path, node)
+    assert ix.sync()['proven']
+    assert node.count('eth_getLogs') == most
+    assert_caught_up(ix, node, raws)
+
+
+def test_catchup_adopts_a_smaller_stated_limit(tmp_path):
+    node, raws = long_chain(max_range=4_000)
+    ix = fresh(tmp_path, node)
+    assert ix.sync()['proven']
+    ranges = logs_ranges(node)
+    assert ranges[0][1] - ranges[0][0] + 1 == 10_000            # refused once...
+    assert all(b - a + 1 <= 4_000 for a, b in ranges[1:])       # ...then 4,000 at a time, remembered
+    assert len(ranges) == 1 + 22 and node.logs_range_cap == 4_000
+    assert_caught_up(ix, node, raws)
+
+
+def test_catchup_with_some_429s(tmp_path):
+    """Every 4th eth_getLogs answers HTTP 429: retried in place, 9 ranges
+    plus 3 retries."""
+    node, raws = long_chain(max_range=10_000, rate_limited=lambda n: n % 4 == 0)
+    ix = fresh(tmp_path, node)
+    assert ix.sync()['proven']
+    assert 9 <= node.count('eth_getLogs') <= 12
+    assert_caught_up(ix, node, raws)
+
+
+def test_catchup_resumes_after_429s_give_up(tmp_path):
+    """429s past request()'s retries fail the sync; the next one resumes from
+    the last committed range, never from DEPLOY_BLOCK."""
+    node, raws = long_chain(max_range=10_000, rate_limited=lambda n: 4 <= n <= 4 + node.rate_limit_retries)
+    ix = fresh(tmp_path, node)
+    with pytest.raises(evm.EvmError) as e:
+        ix.sync()
+    assert e.value.rate_limited and ix.ibd
+    first = logs_ranges(node)
+    done = first[:3]
+    assert done[-1][1] == node.deploy_block + 30_000 - 1        # three ranges committed
+    node.calls.clear()
+    node.rate_limited = None
+    assert ix.sync()['proven']
+    again = logs_ranges(node)
+    assert again[0][0] == done[-1][1] + 1, 'resumed at the cursor'
+    assert len(again) == 6
+    assert_caught_up(ix, node, raws)

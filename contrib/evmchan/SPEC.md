@@ -431,8 +431,18 @@ lightningd waits on the backend plugin at startup, as it does with bcli.
     - Otherwise the poll goes on as below.
     - A node with a backlog reads logs first, so a rate-limited provider's
       budget goes to making progress.
-  - Ranges start at 2,000 blocks and are split in half whenever the node
-    reports too many results (Infura caps at 10,000).
+  - **Ranges** start at 10,000 blocks, Infura's cap on Base: a fresh node
+    reads two days of Base Sepolia (86,000 blocks) in 9 calls.
+    - A node that states a smaller cap ("range N exceeds limit of M", or
+      "maximum block range M") has M adopted as the cap for that RPC,
+      remembered while the plugin runs. The range is retried at once; this
+      is not a failure.
+    - A range is halved whenever the node reports too many results (Infura
+      caps a reply at 10,000 logs), and grows back toward the cap after each
+      sparse range (under 1,000 logs).
+    - While the index catches up (no checkpoint yet in this process), each
+      poll waits a random 0–5 s first (at most half of `evm-poll`), so fresh
+      nodes that share one API key spread their calls out.
   - It does not use log subscriptions, which Infura charges per block.
   - **Cost.** A quiet poll is 240 Infura credits: two block reads and one
     `eth_call`. A poll with new txs is about 655: `eth_getLogs` plus three
@@ -465,8 +475,10 @@ lightningd waits on the backend plugin at startup, as it does with bcli.
   changes `logHash` there, so the poll is not quiet. Blocks are rebuilt from what
   remains (section 3.4).
 - **Progress:** state is committed per log range, so a failed sync resumes
-  where it stopped. Rate-limit errors (HTTP 429, or -32005 that isn't "too many
-  results") are retried with exponential backoff.
+  where it stopped, never from `DEPLOY_BLOCK`. Rate-limit errors (HTTP 429, or
+  -32005 that isn't "too many results") are retried with exponential backoff;
+  if they outlast the retries, the sync fails and the next poll resumes at
+  the last committed range.
 - **Undecodable events.** An event whose raw tx btc.py can't parse, or whose
   txid doesn't match its raw tx, is logged at BROKEN level.
   - It still counts in the log hash.
@@ -654,8 +666,17 @@ treats that as fatal.
   20 bytes) that `withdraw` pays out to that ETH address.
 - **`evm-withdraw`:** calls the contract's `withdraw` for the node key (fees,
   and exits to it).
-- **`evm-status`:** contract, chain id, the node's ETH address and balance, its
-  `withdrawable`, tip, current height, lag `L`, the tag's age, pending sends.
+- **`evm-status [cached]`:** contract, chain id, the node's ETH address and
+  balance, its `withdrawable`, tip, current height, lag `L`, the tag's age,
+  pending sends.
+  - By default it reads the balance and `withdrawable` afresh: an
+    `eth_getBalance` and an `eth_call`.
+  - With `cached=true`, for pollers such as `contrib/nodeui`:
+    - the balance is the one the poll already keeps (read every 5 minutes,
+      after a send, or every poll while below `evm-min-balance`);
+    - `withdrawable` is read at most once per `evm-poll`, or after a send, a
+      receipt or new logs marked it changed.
+    - `balance_age_s` and `withdrawable_age_s` say how old they are.
 - **Alarms**, logged at BROKEN level:
   - `L` above a third of the smallest margin in 5.6;
   - the tag not advancing for `10 × INTERVAL`;

@@ -312,7 +312,8 @@ def decode_log(log, event_signature, indexed_types, data_types):
 
 # --- JSON-RPC ---
 
-LOGS_CHUNK = 2000  # SPEC 5.2: eth_getLogs ranges start at 2,000 blocks
+LOGS_CHUNK = 10000  # SPEC 5.2: eth_getLogs ranges start at 10,000 blocks (Infura's cap)
+SPARSE_LOGS = 1000  # a range with fewer logs than this lets the next one grow back
 
 # How nodes say an eth_getLogs reply would be too big or its range too wide:
 #   Infura    -32005 "query returned more than 10000 results. Try with this block range [...]"
@@ -324,8 +325,25 @@ LOGS_CHUNK = 2000  # SPEC 5.2: eth_getLogs ranges start at 2,000 blocks
 _TOO_MANY = re.compile(r'more than \d+ (results|logs)|too many (results|logs)|response size|'
                        r'response too large|(block )?range.*(too|large|wide|exceed)|exceed.*range|'
                        r'up to a \d+ block range|expanded block range', re.I)
+# How a node states its block-range cap, e.g. Infura on Base: -32602 "range
+# 50000 exceeds limit of 10000"; others "exceed maximum block range: 5000",
+# "up to a 2K block range" (Alchemy, K = 1,000).
+_RANGE_LIMIT = re.compile(r'exceeds? (?:the )?limit of (\d+)|maximum block range(?: is|:| of)? (\d+)|'
+                          r'up to a (\d+)(k?) block range', re.I)
 _RATE_LIMIT = re.compile(r'rate.?limit|request count|credits|capacity|too many requests|'
                          r'request rate|throttl', re.I)
+
+
+def stated_range_limit(message):
+    """The block-range cap a node's error message states, or None."""
+    m = _RANGE_LIMIT.search(str(message or ''))
+    if not m:
+        return None
+    if m.group(1) or m.group(2):
+        n = int(m.group(1) or m.group(2))
+    else:
+        n = int(m.group(3)) * (1000 if m.group(4) else 1)
+    return n if n >= 1 else None
 
 
 def classify(message, code=None, http_status=None):
@@ -343,15 +361,17 @@ class EvmError(Exception):
     (SPEC 5.2, "Secrets"): evm.py builds it from the method name, the error's
     type and its code only. The node's message is classified on arrival into
     .too_many (split the eth_getLogs range) and .rate_limited (back off), then
-    dropped. .data keeps a revert's data (for decoding error names); it is
-    never part of the text."""
+    dropped; .range_limit keeps the block-range cap it states (a number), if
+    any. .data keeps a revert's data (for decoding error names); it is never
+    part of the text."""
 
-    def __init__(self, message, code=None, data=None, too_many=None, rate_limited=None):
+    def __init__(self, message, code=None, data=None, too_many=None, rate_limited=None, range_limit=None):
         super().__init__(message)
         self.code, self.data = code, data
         tm, rl = classify(message, code)
         self.too_many = tm if too_many is None else too_many
         self.rate_limited = rl if rate_limited is None else rate_limited
+        self.range_limit = stated_range_limit(message) if range_limit is None else range_limit
 
 
 def too_many_results(err):
@@ -373,6 +393,7 @@ class EvmRpc:
         self.url, self.timeout, self._ids, self._chain_id = url, timeout, itertools.count(1), None
         self.calls = collections.Counter()      # HTTP requests by method (for credit accounting)
         self._calls_lock = threading.Lock()
+        self.logs_range_cap = None  # the eth_getLogs block-range cap the node stated, once it has
 
     def call(self, method, *params):
         """One JSON-RPC call; raises EvmError on any failure. Safe to call from
@@ -415,7 +436,7 @@ class EvmRpc:
             too_many, rate = classify(msg, code, status)
             raise EvmError('{}: JSON-RPC error {}'.format(method, code), code,
                            err.get('data') if isinstance(err, dict) else None,
-                           too_many=too_many, rate_limited=rate)
+                           too_many=too_many, rate_limited=rate, range_limit=stated_range_limit(msg) or 0)
         if status is not None:
             too_many, rate = classify('', None, status)
             raise EvmError('{}: HTTP {}'.format(method, status), too_many=too_many, rate_limited=rate)
@@ -496,29 +517,44 @@ class EvmRpc:
             f['topics'] = topics
         return self.request('eth_getLogs', f)
 
-    def get_logs_chunked(self, address, topics, from_block, to_block, chunk=LOGS_CHUNK):
+    def get_logs_chunked(self, address, topics, from_block, to_block, chunk=None):
         """eth_getLogs over [from_block, to_block] (block numbers, inclusive) in
-        ranges of at most `chunk` blocks, halving a range whenever the node
-        reports too many results (Infura caps a reply at 10,000 logs) and
-        growing back after each success. Yields (first, last, logs) per range,
-        in block order, so a caller can store each range as it comes. Raises
-        EvmError if a single block still has too many results."""
+        ranges of at most `chunk` blocks (LOGS_CHUNK), or the block-range cap
+        the node stated ("range N exceeds limit of M": M is adopted for this
+        RPC, remembered, and the range retried). A range is halved whenever
+        the node reports too many results (Infura caps a reply at 10,000
+        logs) and grows back toward the cap after each sparse one. Yields
+        (first, last, logs) per range, in block order, so a caller can store
+        each range as it comes. Raises EvmError if a single block still has
+        too many results, or on any other failure (rate limits are retried
+        inside request())."""
         if from_block > to_block:
             return
-        size = max(1, int(chunk))
+        cap = max(1, int(chunk or LOGS_CHUNK))
+        if self.logs_range_cap:
+            cap = min(cap, self.logs_range_cap)
+        size = cap
         start = from_block
         while start <= to_block:
             end = min(to_block, start + size - 1)
             try:
                 logs = self.get_logs(address, topics, start, end)
             except EvmError as e:
+                limit = getattr(e, 'range_limit', None)
+                if limit and limit < end - start + 1:
+                    # Not a failure: the node said what it takes.
+                    self.logs_range_cap = min(limit, self.logs_range_cap or limit)
+                    cap, size = min(cap, limit), min(size, limit)
+                    continue
                 if not too_many_results(e) or end == start:
                     raise
                 size = max(1, (end - start + 1) // 2)
                 continue
-            yield start, end, logs or []
+            logs = logs or []
+            yield start, end, logs
             start = end + 1
-            size = min(int(chunk), size * 2)
+            if len(logs) < SPARSE_LOGS:
+                size = min(cap, size * 2)
 
     def send_raw(self, raw):
         return self.request('eth_sendRawTransaction', '0x' + raw.hex())
