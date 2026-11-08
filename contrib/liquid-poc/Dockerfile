@@ -41,7 +41,7 @@ FROM debian:bookworm-slim AS pytest
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       build-essential autoconf automake libtool gettext pkg-config git \
-      python3 python3-mako python3-venv lowdown jq ca-certificates \
+      python3 python3-mako python3-venv lowdown jq ca-certificates curl \
       libsodium-dev libsqlite3-dev zlib1g-dev \
  && rm -rf /var/lib/apt/lists/*
 RUN python3 -m venv /venv \
@@ -51,7 +51,12 @@ RUN python3 -m venv /venv \
       Flask 'cheroot<=10' psutil requests mnemonic \
       base58 bitstring coincurve cryptography PySocks mako
 COPY --from=elements /usr/local/bin/elementsd /usr/local/bin/elements-cli /usr/local/bin/
-ENV PATH=/venv/bin:${PATH}
+# assetswap-plugin and pricetiers-plugin's own tests (plugins/*/tests/) build
+# and run these from source each time (see run-tests.sh), so the toolchain
+# just needs to be present here -- not the crates themselves.
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+      | sh -s -- -y --profile minimal --default-toolchain 1.85.0
+ENV PATH=/venv/bin:/root/.cargo/bin:${PATH}
 WORKDIR /build
 
 # Core Lightning from this source tree (the liquid branch).  Rust plugins are
