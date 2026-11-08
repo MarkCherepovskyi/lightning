@@ -256,18 +256,30 @@ def test_success_on_accept_then_replaced_at_the_same_nonce(chain, backend):
         t1 = time.monotonic()
         assert backend.send_now(tx.serialize().hex())['success']        # step 5: at once
         assert time.monotonic() - t1 < 0.2 and len(p.hashes) == n_sent
+        # The newest version the node has accepted. A replacement's hash is
+        # in p.hashes (persisted) before it is sent, and only in p.sent once
+        # the node took it, so p.hashes[-1] may not be in anvil's pool yet;
+        # and on a slow machine a third may already have replaced the second
+        # there (eth_getTransactionByHash then says None: look again).
+
+        def newest_accepted():
+            with backend._plock:
+                sent = [h for h in p.hashes if h in p.sent]
+            if len(sent) < 2:
+                return None
+            return chain.rpc.request('eth_getTransactionByHash', sent[-1])
         wait = time.monotonic() + 3 * INTERVAL + 2
-        while len(p.hashes) < 2 and time.monotonic() < wait:
+        second = newest_accepted()
+        while second is None and time.monotonic() < wait:
             time.sleep(0.1)
-        assert len(p.hashes) >= 2
-        # The newest version (on a slow machine a third may already have
-        # replaced the second in anvil's pool).
-        second = chain.rpc.request('eth_getTransactionByHash', p.hashes[-1])
+            second = newest_accepted()
+        assert second is not None, 'no replacement accepted'
         assert second['nonce'] == first['nonce']
         assert int(second['maxFeePerGas'], 16) * 4 >= int(first['maxFeePerGas'], 16) * 5
         assert int(second['maxPriorityFeePerGas'], 16) * 4 >= int(first['maxPriorityFeePerGas'], 16) * 5
         assert txpool_pending(chain) == 1
-        assert any('replaced submit ' + tx.txid_hex() in m for m in backend.log_capture.at('info'))
+        # Logged just after p.sent is updated.
+        wait_until(lambda: any('replaced submit ' + tx.txid_hex() in m for m in backend.log_capture.at('info')), 2)
         # Tracked sends survive a restart (evm-pending.json: calldata, no signatures).
         saved = json.load(open(backend.pending_file))['pending']
         assert [d['nonce'] for d in saved] == [p.nonce] and saved[0]['hashes'] == p.hashes

@@ -491,6 +491,10 @@ lightningd --network=regtest --disable-plugin=bcli \
   - Use 1 on anvil.
 - **`evm-min-balance`:** the ETH below which the plugin refuses new channels and
   logs at BROKEN level. Default 0.01 ETH.
+- **`evm-snapshot`:** an index snapshot file (5.2 "Snapshots"), relative to
+  the lightning dir.
+  - It is used only when the index is empty.
+  - Otherwise it is ignored, with an INFO line.
 
 The plugin is `dynamic: false` and MUST NOT call lightningd during `init`.
 lightningd waits on the backend plugin at startup, as it does with bcli.
@@ -571,6 +575,55 @@ lightningd waits on the backend plugin at startup, as it does with bcli.
   - It is left out of served blocks, so that no node serves CLN a block CLN
     can't parse.
   - It never stops the index.
+- **Snapshots.** A fresh node can start from an index snapshot made by
+  anyone (`evm-snapshot`, 5.5), and need not trust it. A snapshot is a
+  gzip'd JSON-lines file, `evmindex.py` has the format:
+  - a header with the format and version, chain id, contract,
+    `DEPLOY_BLOCK`, and a checkpoint (block number and hash, count,
+    `logHash`);
+  - then every `TxApplied` row up to the checkpoint block, in EVM order:
+    EVM block and hash, log index, height, txid, raw tx.
+
+  With `evm-snapshot` set and an empty index, before the first poll, the
+  plugin:
+  - checks the chain id, contract and `DEPLOY_BLOCK`;
+  - proves the checkpoint:
+    - the node's block at its number has its hash, at or below the tag;
+    - `txCount` and `logHash` read there (`eth_call` pinned to that hash,
+      `requireCanonical`) equal its count and hash;
+  - reads the rows without storing them:
+    - each raw tx MUST parse, re-serialize to the same bytes and hash to its
+      txid;
+    - their count and `logHash`, from the empty state, MUST equal the
+      checkpoint's;
+  - reads them again and ingests them through the normal path, so outputs
+    and spends are derived locally. Each witness is checked first (below);
+  - records the checkpoint, sets the cursor to it, and syncs from there.
+
+  **Trust.** `logHash` commits to every applied tx's height and txid, in
+  order. Read from the contract at a canonical block, it makes the chain
+  the only thing trusted for those, and for every tx but its witness.
+  - A witness is in no txid, so the plugin checks each one. A tx that spends
+    earlier outputs MUST be valid under 4.3 against them at its height
+    (`reference/pyref.py`). A tx that spends none is a deposit, which MUST
+    have no witness.
+  - Valid witnesses can't be forged without the keys. Low-S, strict DER and
+    the fixed templates rule out third-party malleation, so a preimage can't
+    be hidden either.
+  - A row's EVM block, hash and log index are bookkeeping. `logHash` does not
+    commit to them, only their order is checked. They don't change what is
+    served.
+  - Undecodable rows can't be proven, so a snapshot that has any is refused.
+
+  **Refusal.** Any mismatch, a malformed file (lines are capped at 200 kB,
+  and rows at the proven `txCount`), or a checkpoint block that is not
+  canonical refuses the snapshot. The plugin logs it at UNUSUAL, empties
+  the index and catches up from `DEPLOY_BLOCK` as before.
+  - EVM node errors are retried up to 3 times first.
+  - A snapshot never makes the node serve a block it couldn't prove.
+  - An interrupted import is undone at the next start.
+  - The import also records the tag it was proven at, so a lagging node's
+    later poll counts as a stale backend.
 - **Secrets:** errors and logs MUST NOT contain the RPC URL or any part of a
   response body. Only the method name and the error's type and code are
   allowed.
@@ -752,6 +805,15 @@ treats that as fatal.
   20 bytes) that `withdraw` pays out to that ETH address.
 - **`evm-withdraw`:** calls the contract's `withdraw` for the node key (fees,
   and exits to it).
+- **`evm-snapshot [path]`:** writes the index's rows up to its newest
+  checkpoint, with that checkpoint, as a snapshot (5.2), for
+  `--evm-snapshot` on a fresh node.
+  - The default path is `<lightning-dir>/evm-snapshot.jsonl.gz`.
+  - The name MUST end in `.jsonl.gz`, because the file is replaced.
+  - The rows are re-hashed against the checkpoint before writing.
+  - It reads in a SQLite read transaction of its own, so polling goes on.
+  - `python3 evmindex.py <index file> [out]` does the same without
+    lightningd.
 - **`evm-status [cached]`:** contract, chain id, the node's ETH address and
   balance, its `withdrawable`, tip, current height, lag `L`, the tag's age,
   pending sends. In token mode also the token, `UNITS_PER_SAT` and the key's

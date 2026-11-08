@@ -17,6 +17,7 @@ from evmchan_utils import ALARM_LAG, ALARM_SYNC, ALARM_TAG, HOLD, SAT, EvmChain,
 
 import base64
 import hashlib
+import logging
 import os
 import pytest
 import re
@@ -1063,3 +1064,49 @@ def test_outage(node_factory, chain):
         raised = [i for i, line in enumerate(n.daemon.logs) if 'evmbackend.py: alarm: ' in line]
         assert raised and all(i < up[n] for i in raised), raised
         assert not any('**BROKEN**' in line for line in n.daemon.logs[up[n]:])
+
+
+# ------------------------------------------------------------ index snapshots (SPEC 5.2)
+
+def test_snapshot_catchup(node_factory, chain):
+    """A node's index exported with evm-snapshot; a fresh node started with
+    --evm-snapshot imports it (proven on chain), reads only the logs after
+    its checkpoint, and can open a channel. Another fresh node without it
+    reads every 10,000-block range from DEPLOY_BLOCK."""
+    l1 = node_factory.get_node()
+    l1.deposit(500_000)
+    l1.deposit(300_000, 'bech32')
+    # 40,000 empty EVM blocks in one second (heights stay), so a full
+    # catch-up spans at least 4 ranges of 10,000 blocks.
+    with chain.paused():
+        chain.rpc.call('anvil_mine', evm.qty(40_000), '0x0')
+        top = int(chain.latest()['number'], 16)
+    chain.mine(2)
+    wait_for(lambda: l1.evm_status().get('checkpoint', {}).get('evm_block', 0) >= top)
+    snap = l1.rpc.call('evm-snapshot')
+    assert snap['checkpoint']['evm_block'] >= top and snap['rows'] == snap['checkpoint']['count'] >= 2
+    assert snap['path'] == os.path.join(l1.daemon.lightning_dir, 'regtest', 'evm-snapshot.jsonl.gz')
+    assert snap['contract'] == chain.contract and snap['chain_id'] == chain.chain_id
+
+    l2, l3 = node_factory.get_nodes(2, opts=[{'evm-snapshot': snap['path']}, {}])
+    for n in (l2, l3):
+        wait_for(lambda: not n.evm_status()['ibd'])
+    chain.wait_synced([l2, l3])
+    assert l2.daemon.is_in_log(r'evmbackend.py: snapshot .* imported: {} txs up to EVM block {}'.format(
+        snap['rows'], snap['checkpoint']['evm_block']))
+    assert not l3.daemon.is_in_log(r'evmbackend.py: snapshot')
+    with_snap = l2.evm_status()['rpc_calls'].get('eth_getLogs', 0)
+    without = l3.evm_status()['rpc_calls'].get('eth_getLogs', 0)
+    logging.info('eth_getLogs to catch up: {} with the snapshot, {} without'.format(with_snap, without))
+    assert with_snap <= 2 and without >= 5, (with_snap, without)
+    # Same chain, same blocks.
+    tip = chain.wait_synced([l1, l2, l3])
+    for h in (1, tip):
+        ref = chain.reference_blocks(h)[h]
+        assert all(n.rpc.call('getrawblockbyheight', {'height': h})['blockhash'] == ref for n in (l2, l3))
+    # l2 knows l1's deposits (getutxout from rows it rebuilt) and opens a channel to l1.
+    for e in chain.events():
+        assert l2.rpc.call('getutxout', {'txid': e.txid, 'vout': 0})['amount'] == e.tx.outputs[0][0]
+    l2.deposit(1_000_000)
+    open_channel(chain, l2, l1, 500_000)
+    l2.rpc.pay(l1.rpc.invoice(10_000_000, 's', 's')['bolt11'])

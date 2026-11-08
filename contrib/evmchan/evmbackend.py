@@ -74,6 +74,7 @@ RECENT_KEEP = 64                      # mined sends remembered, to re-send if a 
 IDLE_GAP_POLLS = 10                   # idle: the nonce gap check runs every 10th poll (M5: Infura credits)
 CLN_DEFAULT_POLL = 30                 # lightningd polls the backend every 30 s without --dev-bitcoind-poll
 CATCHUP_JITTER = 5.0                  # most seconds of random delay before a catch-up poll (SPEC 5.2)
+SNAPSHOT_TRIES = 3                    # imports cut short by EVM node errors before a full catch-up (SPEC 5.2)
 SUBMIT_SIG = 'submit(bytes,(uint64,bytes,uint32)[])'
 SUBMIT_TYPES = ['bytes', '(uint64,bytes,uint32)[]']
 
@@ -398,10 +399,11 @@ def psbt_problem(b64):
 
 class Config:
     def __init__(self, rpc_url, contract, key, key_file, confirm, poll, min_balance_wei, lightning_dir,
-                 secrets=(), dev_no_outbound_filter=False):
+                 secrets=(), dev_no_outbound_filter=False, snapshot=None):
         self.rpc_url, self.contract, self.key, self.key_file = rpc_url, contract, key, key_file
         self.confirm, self.poll, self.min_balance_wei = confirm, poll, min_balance_wei
         self.lightning_dir = lightning_dir
+        self.snapshot = snapshot     # SPEC 5.2: an index snapshot to start a fresh index from
         self.secrets = [s for s in secrets if s]
         # Tests only (SPEC 5.4): the rpc_command hook lets our own opens
         # through, so a peer's hooks are what refuses them.
@@ -451,10 +453,12 @@ class Config:
         no_filter = get_option(DEV_NO_OUTBOUND_FILTER) in (True, 'true')
         if no_filter and not developer:
             raise ConfigError('--{} is for tests: it needs lightningd --developer'.format(DEV_NO_OUTBOUND_FILTER))
+        snapshot = get_option('evm-snapshot')
+        snapshot = os.path.join(lightning_dir, snapshot) if snapshot else None   # relative to the lightning dir
         key = load_or_create_key(key_file, log)
         secrets.append(key.hex())
         return cls(url, contract, key, key_file, confirm, poll, min_balance_wei, lightning_dir, secrets,
-                   dev_no_outbound_filter=no_filter)
+                   dev_no_outbound_filter=no_filter, snapshot=snapshot)
 
 
 def load_or_create_key(path, log=None):
@@ -1735,7 +1739,60 @@ class Backend:
             return 0.0
         return random.uniform(0, min(CATCHUP_JITTER, self.cfg.poll / 2.0))
 
+    def import_snapshot(self):
+        """SPEC 5.2 "Snapshots": with --evm-snapshot and an empty index,
+        imports the snapshot (proven against the chain before any row goes
+        in) before the first poll. A refused one is logged at UNUSUAL and
+        the index catches up from DEPLOY_BLOCK as usual; EVM node errors are
+        retried a few times first. Returns True if imported."""
+        path = self.cfg.snapshot
+        if not path or self.ix is None:
+            return False
+        if not self.ix.is_empty():
+            self.log('info', 'the index is not empty: --evm-snapshot not used')
+            return False
+        for attempt in range(1, SNAPSHOT_TRIES + 1):
+            t0 = time.monotonic()
+            try:
+                r = self.ix.import_snapshot(path)
+            except evmindex.SnapshotRefused as e:
+                self.log('unusual', 'snapshot {} refused: {}; catching up from DEPLOY_BLOCK'.format(path, e))
+                return False
+            except evm.EvmError as e:
+                self.log('unusual', 'snapshot {} not imported (attempt {} of {}): {}'.format(
+                    path, attempt, SNAPSHOT_TRIES, self.scrub(e)))
+                if self.stop_event.wait(min(self.cfg.poll, 5.0)):
+                    return False
+                continue
+            except Exception as e:    # noqa: B902 - the index is left empty: a full catch-up follows
+                self.log('unusual', 'snapshot {} not imported ({}); catching up from DEPLOY_BLOCK'.format(
+                    path, type(e).__name__))
+                return False
+            self.log('info', 'snapshot {} imported: {} txs up to EVM block {}, proven on chain ({:.1f} s)'.format(
+                path, r['rows'], r['checkpoint'], time.monotonic() - t0))
+            return True
+        self.log('unusual', 'snapshot {} not imported: catching up from DEPLOY_BLOCK'.format(path))
+        return False
+
+    def export_snapshot(self, path=None):
+        """evm-snapshot (SPEC 5.5): the index's rows up to its newest
+        checkpoint, to path (relative to the lightning dir; default
+        evm-snapshot.jsonl.gz there)."""
+        if path is not None and not isinstance(path, str):
+            raise UserError('path must be a string')
+        out = os.path.join(self.cfg.lightning_dir, path or evmindex.SNAPSHOT_FILE)
+        if not out.endswith('.jsonl.gz'):
+            # It replaces the file: never hsm_secret, evm-key or the index.
+            raise UserError('the snapshot file name must end in .jsonl.gz')
+        try:
+            return self.ix.export_snapshot(out)
+        except evmindex.EvmIndexError as e:
+            raise UserError(str(e)) from None
+        except OSError as e:
+            raise UserError('cannot write {} ({})'.format(out, type(e).__name__)) from None
+
     def _poll_loop(self):
+        self.import_snapshot()
         while not self.stop_event.is_set():
             if self.stop_event.wait(self.catchup_jitter()):
                 break
@@ -1744,6 +1801,11 @@ class Backend:
 
     def poll_once(self, now=None):
         try:
+            if self.ix.importing():
+                # A failed snapshot import whose rows could not be removed
+                # (e.g. disk full): never sync on top of them.
+                self.ix._wipe()
+                self.log('unusual', 'the rows of a failed snapshot import were removed')
             res = self.ix.sync()
             if not res.get('skipped'):
                 self.sync_error_since = None
@@ -2263,6 +2325,8 @@ def main():
     plugin.add_option('evm-confirm', 'safe', 'confirmation tag: safe or latest')
     plugin.add_option('evm-poll', '60', 'seconds between index polls (1 on anvil)')
     plugin.add_option('evm-min-balance', '0.01', 'ETH below which new channels are refused')
+    plugin.add_option('evm-snapshot', None, 'index snapshot (from evm-snapshot) to start an empty index from; '
+                      'proven against the chain, else ignored')
     plugin.add_flag_option(DEV_NO_OUTBOUND_FILTER, 'tests only, needs --developer: our own channel opens skip '
                            'the rpc_command checks, so the peer\'s hooks refuse them')
     developer = '--developer' in sys.argv[1:]      # lightningd passes it to plugins it runs with --developer
@@ -2435,6 +2499,12 @@ def main():
     def evm_withdraw(plugin, request, **kwargs):
         """Withdraws the node key's withdrawable ETH or token (fees and exits) from the contract."""
         rpc_in_thread('evm-withdraw', lambda: backend().withdraw(), request)
+
+    @plugin.async_method('evm-snapshot')
+    def evm_snapshot(plugin, request, path=None, **kwargs):
+        """Writes the index's rows up to its newest checkpoint to {path} (default
+        <lightning-dir>/evm-snapshot.jsonl.gz), for --evm-snapshot on a fresh node."""
+        rpc_in_thread('evm-snapshot', lambda: backend().export_snapshot(path), request)
 
     @plugin.async_method('evm-status')
     def evm_status(plugin, request, cached=False, **kwargs):

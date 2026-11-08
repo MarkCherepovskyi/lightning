@@ -545,6 +545,32 @@ in an environment variable) to deploy.
   **Proposed fix:** start from an index snapshot from any source, proven
   with a single `eth_call` of `logHash` at its checkpoint block. That hash
   commits to the whole history, so the snapshot doesn't need to be trusted.
+
+  **Addressed (2026-11-08): index snapshots (SPEC 5.2 "Snapshots").**
+  - `evm-snapshot [path]` exports the index up to its newest checkpoint, and
+    so does `python3 evmindex.py <index> [out]` without lightningd.
+  - `--evm-snapshot=<file>` on an empty index proves the file against the
+    chain, ingests its rows and reads logs only from its checkpoint on.
+    Proving it takes two `eth_getBlockByNumber` and two `eth_call`, plus one
+    more block read at the end.
+  - logHash does not cover witnesses. So every witness is checked against
+    SPEC 4.3 with `reference/pyref.py`, and deposits must have none.
+  - Anything that doesn't check out is refused at UNUSUAL, and the node
+    does a full catch-up.
+  - Measured on anvil, 40,000 blocks past DEPLOY_BLOCK: a fresh node made 1
+    `eth_getLogs` call with a snapshot and 5 without (`test_snapshot_catchup`).
+    In the unit tests, with a 10-block range cap: 4 calls against 44.
+  - **On Base Sepolia (2026-11-08):** a snapshot of 37 txs (11 kB),
+    exported in 0.1 s with the CLI from an earlier node's index, was proven
+    in 2.1 s.
+    - The fresh node synced in 38 s with 3 `eth_getLogs` (2,770 credits).
+    - A full catch-up on the same contract took 159 s and 124 calls
+      (~33k credits).
+  - Nobody publishes snapshots yet: an operator copies one from a node they
+    run.
+  - **nodeui:** its "credits/day" is averaged since the node started, so
+    right after a catch-up it reads high. A short moving window would be
+    better.
 - **The lag `L`:** `safe` trailed by 46–132 s, which is 2.5–4.5 virtual
   blocks. `finalized` trailed by about 19 min. The 5.6 margins (2.4 h, 24 h)
   are about 30× `L`.
