@@ -17,14 +17,16 @@ question (section 10), not an implementation choice.
   talks to a backend plugin instead of bcli, and the plugin talks to a contract
   that holds the ETH as a Bitcoin-style UTXO set.
 - **Version 1** covers ETH on anvil (tests) and Base Sepolia (testnet).
-- **Later** (section 9): ERC-20, a CLN network of its own (chainparams from
+- **Token mode** (4.6): the same for one ERC-20 token per contract instance,
+  CLN still unchanged.
+- **Later** (section 9): a CLN network of its own (chainparams from
   config), gas optimisation, an L1 force-inclusion fallback, audit, mainnet.
 
 Components and where they live:
 
 | Path | What |
 |---|---|
-| `contrib/evmchan/contracts/` | Foundry project: `UtxoChain.sol` and its libraries, tests, deploy script |
+| `contrib/evmchan/contracts/` | Foundry project: `UtxoChainBase.sol`, the deployables `UtxoChain.sol` (ETH) and `UtxoChainToken.sol` (4.6), their libraries, tests, deploy script |
 | `contrib/evmchan/evmbackend.py` | The backend plugin (stdlib + coincurve) |
 | `contrib/evmchan/evm.py` | EVM JSON-RPC, keccak, RLP, EIP-1559 signing, ABI (from spike S6) |
 | `contrib/evmchan/btc.py` | Bitcoin tx/block serialization, bech32 (from spike S1) |
@@ -37,6 +39,8 @@ New files are MIT-licensed. No GPL, BUSL or unlicensed code is copied in.
 ## 2. Units and constants
 
 - **1 sat = 10 gwei = 10^10 wei.** So 10^8 sat = 1 ETH: the chain's "BTC" is ETH.
+  In token mode a sat is `UNITS_PER_SAT` token units instead (4.6); every rule
+  below then reads in those units.
 - **`MAX_MONEY` = 21,000,000 × 10^8 sat**, as in Bitcoin. Any amount or sum above
   it is invalid.
 - **Deposits** MUST be a whole number of sats: `msg.value % 10^10 == 0`, and
@@ -138,7 +142,8 @@ Virtual block `h` is:
   `keccak256(abi.encodePacked(txid, uint32 vout))`; the value is
   `keccak256(abi.encodePacked(uint64 amount, bytes scriptPubKey, uint32 height))`.
   Zero means no such unspent output. `txid` is in internal byte order.
-- **`mapping(address => uint256) withdrawable`** holds exits and fees, in wei.
+- **`mapping(address => uint256) withdrawable`** holds exits and fees, in wei
+  (in token units in token mode).
 - **Immutables:** `GENESIS_TIME`, `INTERVAL`, `DEPLOY_BLOCK`.
 - **`depositNonce`.**
 - **`txCount`** (`uint64`) and **`logHash`** (`bytes32`, starts at zero). For
@@ -151,7 +156,8 @@ Virtual block `h` is:
   - The cost, measured in M2, is about 10.6k gas per tx (two slots), and 44.8k
     for the very first tx. Packing both into one slot would halve it (section 9).
 - **Invariant:** `address(this).balance` ≥ the sum of all UTXO amounts × 10^10
-  + the sum of `withdrawable`.
+  + the sum of `withdrawable`. In token mode: `TOKEN.balanceOf(this)` ≥ the sum
+  of all UTXO amounts × `UNITS_PER_SAT` + the sum of `withdrawable`.
 
 ### 4.2 Interface
 
@@ -357,6 +363,9 @@ listed is invalid.
   signatures and templates live in internal libraries (`BtcTx`, `Bip143`,
   `TaprootSighash`, `Ecdsa`, `Schnorr`, `Secp256k1`, `Templates`), compiled into
   the one contract. M1 measured 23,150 bytes.
+  - Since token mode, the logic is in the abstract `UtxoChainBase`, and the
+    two deployables add only the asset: `UtxoChain` (ETH, 23,511 bytes, the
+    ABI and behaviour of M1's) and `UtxoChainToken` (24,278 bytes).
 - **EVM.** It needs Cancun opcodes (`mcopy`). Gas is measured with Osaka pricing
   (EIP-7883 modexp).
 - **Errors.** They are in `Errors.sol`.
@@ -376,6 +385,82 @@ listed is invalid.
   - an HTLC-timeout ≤ 125k;
   - a wallet P2TR spend ≤ 60k.
 
+### 4.6 Token mode (ERC-20)
+
+One `UtxoChainToken` instance holds one ERC-20 token. Everything in 3 and
+4.1–4.5 holds unchanged, with amounts in token units instead of wei. CLN is
+unchanged: it still sees sats.
+
+- **Units.** 1 sat = `UNITS_PER_SAT` token units, an immutable:
+  - `10^(decimals − 8)` for a token with at least 8 decimals (10^10 for 18
+    decimals, as for ETH), else 1. A 6-decimal token (USDC, USDT) has
+    1 sat = 1 unit, so 10^8 sat = 100 tokens, and `MAX_MONEY` is 2.1 billion
+    tokens.
+  - Below 8 decimals a sat is worth more than on Bitcoin. CLN's dust limit
+    (546 sat) and fees are in sats, so a token with very few decimals makes
+    them expensive.
+  - The constructor checks it: it MUST equal that value when the token
+    answers `decimals()`; without `decimals()` it MUST be a power of ten up to
+    10^18 (`BadUnitsPerSat`).
+- **Constructor** `(uint256 interval, address token, uint256 unitsPerSat)`.
+  The token MUST have code and answer `balanceOf` (`BadToken`).
+- **Interface.** As 4.2, except:
+
+  ```solidity
+  function deposit(uint256 amount, bytes calldata scriptPubKey) external returns (bytes32 txid);
+  function TOKEN() external view returns (address);
+  function UNITS_PER_SAT() external view returns (uint256);
+  ```
+
+  - `deposit` is not payable, and the contract has no `receive`: it never
+    holds ETH.
+  - `amount` follows section 2's value rules in units: a whole number of sats,
+    at least 1, at most `MAX_MONEY` (`BadDepositValue`).
+  - After those checks and before any effect, it takes `amount` from
+    `msg.sender` with `transferFrom`. The depositor approves first.
+  - `withdraw()` pays with `transfer`, after zeroing the balance.
+- **Token calls** (`transfer`, `transferFrom`):
+  - a call that reverts or returns `false` fails with `TokenTransferFailed`.
+    Empty return data is success (USDT-style tokens); any other return MUST be
+    exactly the 32-byte word 1;
+  - **balance-difference check:** the contract reads its own `balanceOf` before
+    and after each call. It MUST have grown (deposit) or shrunk (withdraw) by
+    exactly the amount, else `TokenAmountMismatch`. This refuses
+    fee-on-transfer tokens whose fee comes out of what the contract receives,
+    or is charged to it on top. A fee the depositor pays on top, or one out of
+    what a withdrawer receives, is theirs and is not refused;
+  - **lock:** no deposit or withdraw may run inside another's token call
+    (`Reentrancy`, a transient-storage lock released after each call). A token
+    with transfer hooks (ERC-777 style) can't interleave them. `submit` makes
+    no token call and is not locked.
+- **Tokens that MUST NOT be used:** the checks above see one call at a time,
+  so a token whose balances change between calls breaks the 4.1 invariant
+  where no check can see it:
+  - rebasing tokens: a negative rebase leaves the last withdrawers unpaid, and
+    a positive one is surplus locked forever;
+  - tokens whose fee or rules the issuer can change later: a fee turned on
+    makes every withdraw revert until it is turned off;
+  - tokens rounding transfers by a unit or two (stETH): every deposit reverts.
+
+  Blocklists and pausing (USDC, USDT) are a trust in the issuer: a blocked
+  recipient can't withdraw, and a blocked or paused contract pays nobody,
+  while submits go on.
+- **Gas** is still paid in ETH. Measured: a deposit (6-decimal token, approved
+  without limit, second deposit) 89,275 gas against 74,523 in ETH; a withdraw
+  45,973 against 34,140.
+- **The plugin** (5.1, 5.5) reads `TOKEN()` and `UNITS_PER_SAT()` at startup.
+  A `UtxoChain` has no `TOKEN()`: its call reverts while `INTERVAL()` answers,
+  twice in a row, and the plugin is then in ETH mode.
+  - `evm-deposit` checks the key's token balance, approves exactly the amount
+    (after setting a non-zero allowance to 0 first, as USDT requires), then
+    calls `deposit(amount, script)`. Both go through the send path (5.3).
+  - `evm-withdraw` and `evm-status` give token amounts in units
+    (`amount_units`, `withdrawable_units`, `token_balance_units`) alongside the
+    ETH balance. `evm-min-balance` and the balance alarm stay in ETH.
+- **Deploying:** `contracts/deploy.sh --token <address>` (with
+  `--units-per-sat`, else it reads `decimals()`); `run-anvil.sh --token
+  mock:<decimals>` deploys a mock token first.
+
 ## 5. The backend plugin `evmbackend.py`
 
 ### 5.1 Options
@@ -391,7 +476,8 @@ lightningd --network=regtest --disable-plugin=bcli \
   - The key MUST NOT be written to files or logs.
 - **`evm-contract`:** the contract's address.
   - At startup the plugin checks there is code at it and reads `DEPLOY_BLOCK`,
-    `GENESIS_TIME` and `INTERVAL`.
+    `GENESIS_TIME` and `INTERVAL`, and `TOKEN()` and `UNITS_PER_SAT()` in
+    token mode (4.6).
   - Logs are scanned from `DEPLOY_BLOCK`. No start-block option exists, so none
     can be wrong.
 - **`evm-key-file`:** the node's own ETH private key, which pays for gas.
@@ -668,14 +754,15 @@ treats that as fatal.
   and exits to it).
 - **`evm-status [cached]`:** contract, chain id, the node's ETH address and
   balance, its `withdrawable`, tip, current height, lag `L`, the tag's age,
-  pending sends.
-  - By default it reads the balance and `withdrawable` afresh: an
-    `eth_getBalance` and an `eth_call`.
+  pending sends. In token mode also the token, `UNITS_PER_SAT` and the key's
+  token balance (4.6).
+  - By default it reads the balances and `withdrawable` afresh: an
+    `eth_getBalance` and one `eth_call` each.
   - With `cached=true`, for pollers such as `contrib/nodeui`:
-    - the balance is the one the poll already keeps (read every 5 minutes,
-      after a send, or every poll while below `evm-min-balance`);
-    - `withdrawable` is read at most once per `evm-poll`, or after a send, a
-      receipt or new logs marked it changed.
+    - the ETH balance is the one the poll already keeps (read every 5
+      minutes, after a send, or every poll while below `evm-min-balance`);
+    - `withdrawable` and the token balance are read at most once per
+      `evm-poll`, or after a send, a receipt or new logs marked them changed.
     - `balance_age_s` and `withdrawable_age_s` say how old they are.
 - **Alarms**, logged at BROKEN level:
   - `L` above a third of the smallest margin in 5.6;
@@ -754,6 +841,10 @@ from a background thread.
   for signatures, BIP143 and BIP341.
 - **Deposit and exit accounting:** the 4.1 invariant after every operation.
 - **Reentrancy** in `withdraw`.
+- **Token mode (4.6):** mock tokens of 6 and 18 decimals, without a bool
+  return, returning false, with a fee either side, and with transfer hooks;
+  the real and synthetic txs replayed in token units, with the invariant
+  after every operation.
 - **Gas:** a report for each tx kind, plus the worst-case commitment (30 + 30
   HTLCs) under 12M.
 
@@ -776,6 +867,8 @@ from a background thread.
 - **Rejections:** a non-anchor channel, a lease and a non-segwit dual-fund
   input are refused, and so is a peer without anchors.
 - **Exits:** `withdraw` to an exit address, then the contract's `withdraw`.
+- **Token mode (4.6):** on a 6-decimal token, deposit, open, pay, mutual
+  close, exits and withdraw, each exact in token units.
 - **Restart and reorg:** restarts mid-close; an anvil reorg above `safe`; anvil
   stopped for longer than `L` (outage) and restarted.
 - **Options:** a node started with regtest's default options refuses to open
@@ -806,8 +899,7 @@ Each needs its tests green and your review before the next.
 
 ## 9. Later (out of scope for version 1)
 
-- **ERC-20:** one contract instance per token. `deposit(amount, script)` uses
-  `transferFrom`, exits use `transfer`, and the token's decimals fix the sat.
+- **ERC-20** is no longer later: it is token mode, section 4.6.
 - **A CLN network of its own:** chainparams from config, about 50 lines in CLN,
   giving its own chain hash, address prefixes and limits.
 - **An L1 force-inclusion fallback** for penalties and HTLC claims when the L2

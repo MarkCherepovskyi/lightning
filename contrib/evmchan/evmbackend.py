@@ -19,6 +19,9 @@ What it does (section numbers are SPEC's):
   the same nonce at 1.25x the fees.
 - 5.4 hooks that keep CLN on what the contract can spend.
 - 5.5 evm-deposit, evm-exitaddr, evm-withdraw, evm-status, and alarms.
+- 4.6 token mode: on a UtxoChainToken (TOKEN() answers) amounts are token
+  units (UNITS_PER_SAT per sat), evm-deposit approves the token first, and
+  gas is still paid in ETH.
 - 5.6 the CLN option check, from a background thread after init.
 
 No backend method ever returns a JSON-RPC error (lightningd treats one as
@@ -60,7 +63,7 @@ import evmindex    # noqa: E402
 
 # ------------------------------------------------------------ constants
 
-SAT_WEI = 10**10                      # SPEC 2: 1 sat = 10 gwei
+SAT_WEI = 10**10                      # SPEC 2: 1 sat = 10 gwei (in token mode, UNITS_PER_SAT units)
 GAS_CAP = 12_000_000                  # SPEC 4.5 / 5.3: refuse a submit estimated above this
 GAS_LIMIT_MAX = 16_000_000            # below EIP-7825's 16,777,216 per-tx cap
 MAX_HTLCS = 30                        # SPEC 5.4 / 5.6
@@ -89,6 +92,11 @@ ERRORS = {
     'e68ef9b9': 'BadDepositScript()',
     'd0d04f60': 'NothingToWithdraw()',
     '750b219c': 'WithdrawFailed()',
+    '7401d931': 'BadToken()',
+    'd3c6b55e': 'BadUnitsPerSat()',
+    '045c4b02': 'TokenTransferFailed()',
+    '570883e5': 'TokenAmountMismatch()',
+    'ab143c06': 'Reentrancy()',
     'cf3c5481': 'TxTooLarge()',
     'cdda5c84': 'Truncated()',
     'd47a5751': 'NonCanonicalCompactSize()',
@@ -728,6 +736,8 @@ class Backend:
         self.rpc = None          # the poll thread's and the read RPCs'
         self.srpc = None         # the send worker's (short timeouts)
         self.interval = None
+        self.token = None        # SPEC 4.6: the ERC-20 of a UtxoChainToken; None for ETH
+        self.units_per_sat = SAT_WEI
         self.jobs = queue.Queue()
         self.pending = {}        # nonce -> Pending (the send worker owns it; others read under _plock)
         self._plock = threading.Lock()
@@ -741,7 +751,8 @@ class Backend:
         self.balance = None
         self.balance_at = 0.0
         self.balance_dirty = True
-        self.withdrawable_cache = None   # (wei, time.time()) for evm-status cached=true
+        self.withdrawable_cache = None   # (wei or units, time.time()) for evm-status cached=true
+        self.token_balance_cache = None  # (units, time.time()), token mode, likewise
         self.withdrawable_dirty = True   # a send, receipt or new log may have changed it
         self.alarms = {}         # name -> {'since', 'logged', 'message'}
         self.started_at = time.time()   # rpc_calls in evm-status count from here
@@ -796,6 +807,7 @@ class Backend:
                 self.log('unusual', 'EVM node not ready ({}); retrying'.format(e))
                 time.sleep(1)
         self.interval = self.ix.interval
+        self._read_asset(end)
         # Per-call timeout well inside a send's budget (step 8).
         self.srpc = srpc or evm.EvmRpc(self.cfg.rpc_url, timeout=max(1.0, min(20.0, self.interval / 2.0)))
         # The tag's timestamp, which getchaininfo needs before the first
@@ -819,6 +831,41 @@ class Backend:
         self.rpc.timeout = 30
         self.log('info', 'UtxoChain {} on chain {} (INTERVAL {} s, DEPLOY_BLOCK {}); node key {}; tip {}'.format(
             self.contract, self.ix.chain_id, self.interval, self.ix.deploy_block, self.address, self.ix.tip()))
+        if self.token is not None:
+            self.log('info', 'token mode: ERC-20 {}, {} units per sat'.format(self.token, self.units_per_sat))
+
+    def _read_asset(self, end):
+        """SPEC 4.6: TOKEN() and UNITS_PER_SAT() of a UtxoChainToken. A
+        UtxoChain (ETH) has no TOKEN(): its call reverts while INTERVAL()
+        answers, twice in a row, so a node's passing error is not taken for
+        ETH mode. Retries the node until `end` (time.monotonic())."""
+        def call(name):
+            return self.rpc.eth_call(self.contract, evm.selector(name + '()'))
+        while True:
+            try:
+                try:
+                    ret = call('TOKEN')
+                except evm.EvmError:
+                    call('INTERVAL')            # the node answers: TOKEN() itself failed
+                    try:
+                        ret = call('TOKEN')
+                    except evm.EvmError:
+                        call('INTERVAL')
+                        self.token, self.units_per_sat = None, SAT_WEI
+                        return
+                token = evm.abi_decode(['address'], ret)[0]
+                units = evm.abi_decode(['uint256'], call('UNITS_PER_SAT'))[0]
+                break
+            except evm.EvmError as e:
+                if time.monotonic() >= end:
+                    raise
+                self.log('unusual', 'EVM node not ready ({}); retrying'.format(e))
+                time.sleep(1)
+            except ValueError:
+                raise evmindex.EvmIndexError('TOKEN() or UNITS_PER_SAT() returned no value') from None
+        if int(token, 16) == 0 or units == 0:
+            raise evmindex.EvmIndexError('bad TOKEN() or UNITS_PER_SAT()')
+        self.token, self.units_per_sat = token, units
 
     def _load_pending(self):
         try:
@@ -1054,13 +1101,15 @@ class Backend:
                 return self._resign(old, txid, data, gas, outpoints, reply, budget_end), old
             return self._send_new('submit', txid, data, 0, gas, outpoints, reply, budget_end)
 
-    def _check_call(self, data, value, out_of_time=lambda: False):
-        """Step 3: (gas, None), or (None, why) if it would revert or not fit."""
+    def _check_call(self, data, value, out_of_time=lambda: False, to=None):
+        """Step 3: (gas, None), or (None, why) if it would revert or not fit.
+        `to` is the contract unless given (the token, for an approve)."""
         why = None
+        to = to or self.contract
         if out_of_time():
             return None, NOT_SENT
         try:
-            self.srpc.eth_call(self.contract, data, 'latest', value=value, sender=self.address)
+            self.srpc.eth_call(to, data, 'latest', value=value, sender=self.address)
         except evm.EvmError as e:
             why = revert_reason(e) if (e.data is not None or e.code == 3) else \
                 'eth_call failed: {}'.format(self.scrub(e))
@@ -1069,7 +1118,7 @@ class Backend:
         if out_of_time():
             return None, NOT_SENT
         try:
-            gas = self.srpc.estimate_gas(self.address, self.contract, data, value, block='latest')
+            gas = self.srpc.estimate_gas(self.address, to, data, value, block='latest')
         except evm.EvmError as e:
             why = revert_reason(e) if (e.data is not None or e.code == 3) else \
                 'eth_estimateGas failed: {}'.format(self.scrub(e))
@@ -1139,18 +1188,19 @@ class Backend:
             return False, True, why
         return False, False, why
 
-    def _send_new(self, kind, btc_txid, data, value, gas, outpoints, reply, budget_end):
+    def _send_new(self, kind, btc_txid, data, value, gas, outpoints, reply, budget_end, to=None):
         """Step 4 at a new nonce: persist, sign, send; success once the
         node accepts it. The caller holds _klock. Returns (result, Pending
-        or None)."""
+        or None). `to` is the contract unless given."""
+        to = to or self.contract
         tip, max_fee = self.srpc.fees()
         nonce = self._alloc_nonce()
         gas_limit = self._gas_limit(gas)
-        raw, txhash = self._sign(nonce, tip, max_fee, gas_limit, self.contract, value, data)
+        raw, txhash = self._sign(nonce, tip, max_fee, gas_limit, to, value, data)
         if time.monotonic() >= budget_end:
             self._release_nonce(nonce)
             return fail(NOT_SENT), None
-        p = Pending(kind, btc_txid, nonce, gas_limit, self.contract, data, value, tip, max_fee, txhash, outpoints)
+        p = Pending(kind, btc_txid, nonce, gas_limit, to, data, value, tip, max_fee, txhash, outpoints)
         p.replace_at = time.monotonic() + self.interval
         with self._plock:
             self.pending[nonce] = p
@@ -1650,20 +1700,20 @@ class Backend:
             raise box['e']
         return box['r']
 
-    def contract_call(self, kind, data, value=0, wait=None):
-        """A call to the contract from the node key (evm-deposit,
-        evm-withdraw): checked and sent on the worker, then its receipt
-        (ingested by the tracker) waited for here. Returns (Pending, receipt
-        or None while pending). Raises UserError with the revert reason, or
-        if it reverted on chain."""
+    def contract_call(self, kind, data, value=0, wait=None, to=None):
+        """A call to the contract (or to `to`: the token, for an approve)
+        from the node key (evm-deposit, evm-withdraw): checked and sent on
+        the worker, then its receipt (ingested by the tracker) waited for
+        here. Returns (Pending, receipt or None while pending). Raises
+        UserError with the revert reason, or if it reverted on chain."""
         wait = wait if wait is not None else max(60.0, 4.0 * self.interval)
 
         def run(dequeued):
-            gas, why = self._check_call(data, value)
+            gas, why = self._check_call(data, value, to=to)
             if why is not None:
                 raise UserError(why)
             with self._klock:
-                res, p = self._send_new(kind, None, data, value, gas, [], None, dequeued + self.time_limit())
+                res, p = self._send_new(kind, None, data, value, gas, [], None, dequeued + self.time_limit(), to=to)
             if p is None:
                 raise UserError(res['errmsg'])
             return p
@@ -2054,6 +2104,40 @@ class Backend:
             return hit[0]
         return self.withdrawable()
 
+    def token_view(self, signature, types, values):
+        """A uint256 view of the token (balanceOf, allowance), at latest."""
+        return evm.abi_decode(['uint256'], self.rpc.eth_call(self.token, evm.calldata(signature, types, values)))[0]
+
+    def token_balance(self):
+        v = self.token_view('balanceOf(address)', ['address'], [self.address])
+        self.token_balance_cache = (v, time.time())
+        return v
+
+    def cached_token_balance(self, now=None):
+        """token_balance() for evm-status cached=true: read at most once per
+        evm-poll interval, or after a send (which may move tokens)."""
+        now = time.time() if now is None else now
+        hit = self.token_balance_cache
+        if hit is not None and not self.withdrawable_dirty and now - hit[1] < self.cfg.poll:
+            return hit[0]
+        return self.token_balance()
+
+    def _approve(self, units):
+        """Token mode: lets the contract take `units` from the node key,
+        unless it may already. A non-zero allowance is set to 0 first, which
+        tokens like USDT require."""
+        have = self.token_balance()
+        if have < units:
+            raise UserError('the node key holds {} token units, below {}'.format(have, units))
+        allowed = self.token_view('allowance(address,address)', ['address', 'address'], [self.address, self.contract])
+        if allowed >= units:
+            return
+        for v in ([0] if allowed else []) + [units]:
+            data = evm.calldata('approve(address,uint256)', ['address', 'uint256'], [self.contract, v])
+            p, receipt = self.contract_call('approve', data, to=self.token)
+            if receipt is None:
+                raise UserError('approve still pending (EVM tx {}): try again once it is mined'.format(p.hashes[-1]))
+
     def deposit(self, amount, address=None):
         try:
             amount = int(amount)
@@ -2067,9 +2151,17 @@ class Backend:
             spk = btc.address_script(address, 'bcrt')
         except ValueError:
             raise UserError('not a bcrt segwit address') from None
-        data = evm.calldata('deposit(bytes)', ['bytes'], [spk])
-        p, receipt = self.contract_call('deposit', data, amount * SAT_WEI)
-        out = {'address': address, 'amount_sat': amount, 'evm_tx': p.hashes[-1]}
+        if self.token is None:
+            data = evm.calldata('deposit(bytes)', ['bytes'], [spk])
+            p, receipt = self.contract_call('deposit', data, amount * SAT_WEI)
+            out = {'address': address, 'amount_sat': amount, 'evm_tx': p.hashes[-1]}
+        else:
+            units = amount * self.units_per_sat
+            self._approve(units)
+            data = evm.calldata('deposit(uint256,bytes)', ['uint256', 'bytes'], [units, spk])
+            p, receipt = self.contract_call('deposit', data)
+            out = {'address': address, 'amount_sat': amount, 'amount_units': units, 'token': self.token,
+                   'evm_tx': p.hashes[-1]}
         if receipt is None:
             out['status'] = 'pending'
             return out
@@ -2086,8 +2178,12 @@ class Backend:
         if amount == 0:
             raise UserError('nothing to withdraw for {}'.format(self.address))
         p, receipt = self.contract_call('withdraw', evm.selector('withdraw()'))
-        return {'address': self.address, 'amount_wei': amount, 'evm_tx': p.hashes[-1],
-                'status': 'mined' if receipt is not None else 'pending'}
+        out = {'address': self.address, 'evm_tx': p.hashes[-1], 'status': 'mined' if receipt is not None else 'pending'}
+        if self.token is None:
+            out['amount_wei'] = amount
+        else:
+            out.update({'amount_units': amount, 'token': self.token})
+        return out
 
     def exitaddr(self, ethaddress):
         try:
@@ -2111,8 +2207,15 @@ class Backend:
             out['balance_age_s'] = round(max(0.0, time.time() - self.balance_at), 1)
         except evm.EvmError as e:
             out['balance_error'] = self.scrub(e)
+        unit = 'wei' if self.token is None else 'units'
+        if self.token is not None:
+            out.update({'token': self.token, 'units_per_sat': self.units_per_sat})
+            try:
+                out['token_balance_units'] = self.cached_token_balance() if cached else self.token_balance()
+            except evm.EvmError as e:
+                out['token_balance_error'] = self.scrub(e)
         try:
-            out['withdrawable_wei'] = self.cached_withdrawable() if cached else self.withdrawable()
+            out['withdrawable_' + unit] = self.cached_withdrawable() if cached else self.withdrawable()
             out['withdrawable_age_s'] = round(max(0.0, time.time() - self.withdrawable_cache[1]), 1)
         except evm.EvmError as e:
             out['withdrawable_error'] = self.scrub(e)
@@ -2319,7 +2422,8 @@ def main():
 
     @plugin.async_method('evm-deposit')
     def evm_deposit(plugin, request, amount, address=None, **kwargs):
-        """Deposits {amount} sats from the node's ETH key to {address} (default: a new p2tr address)."""
+        """Deposits {amount} sats from the node's ETH key (ETH, or the token: approved first) to {address}
+        (default: a new p2tr address)."""
         rpc_in_thread('evm-deposit', lambda: backend().deposit(amount, address), request)
 
     @plugin.async_method('evm-exitaddr')
@@ -2329,13 +2433,14 @@ def main():
 
     @plugin.async_method('evm-withdraw')
     def evm_withdraw(plugin, request, **kwargs):
-        """Withdraws the node key's withdrawable ETH (fees and exits) from the contract."""
+        """Withdraws the node key's withdrawable ETH or token (fees and exits) from the contract."""
         rpc_in_thread('evm-withdraw', lambda: backend().withdraw(), request)
 
     @plugin.async_method('evm-status')
     def evm_status(plugin, request, cached=False, **kwargs):
-        """Contract, chain, key, balances, tip, lag, pending sends, alarms; {cached}=true
-        reads no fresh balances (the poll's ETH balance, withdrawable at most once per evm-poll)."""
+        """Contract, chain, key, balances (ETH, and the token in token mode), tip, lag, pending sends,
+        alarms; {cached}=true reads no fresh balances (the poll's ETH balance; withdrawable and the
+        token balance at most once per evm-poll)."""
         flag = cached is True or (isinstance(cached, str) and cached.lower() in ('true', '1'))
         rpc_in_thread('evm-status', lambda: backend().status(cached=flag), request)
 

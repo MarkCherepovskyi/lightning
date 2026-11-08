@@ -602,3 +602,58 @@ in an environment variable) to deploy.
   - The Mac slept for 8 min during the idle wait, so these rates are
     computed over the awake time. Run the smoke scripts under
     `caffeinate -i`.
+
+### ERC-20 token mode (2026-11-06)
+
+- **What was built** (SPEC 4.6; one contract instance per token, CLN
+  unchanged):
+  - **Contract.** M1's contract didn't fit a token mode in one code base: it
+    was 23,478 bytes, and the test harness would have gone over 24,576. So:
+    - `UtxoChainBase` (abstract) holds all the logic, with three hooks:
+      `_unit()`, `_collect()` and `_pay()`;
+    - `UtxoChain` (ETH) keeps M1's ABI, storage layout and behaviour. It is
+      23,511 bytes (+33). A deposit costs 74,523 gas (+126) and a withdraw
+      34,140 (+204), from the internal calls. Validation gas is unchanged;
+    - `UtxoChainToken` is 24,278 bytes (298 to spare). It adds `deposit(amount,
+      script)` with `transferFrom`, `withdraw` with `transfer`, and USDT-style
+      no-bool returns. A balance-difference check on every token call refuses
+      fee-on-transfer tokens, and a transient-storage lock covers deposit and
+      withdraw. The constructor checks `UNITS_PER_SAT` against `decimals()`;
+    - the validation libraries are unchanged.
+  - **Gas, token mode:** a deposit is 89,275 (+14,752 over ETH) and a withdraw
+    45,973 (+11,833).
+  - **Plugin:**
+    - it reads `TOKEN()` and `UNITS_PER_SAT()` at connect; a `UtxoChain`
+      reverts on `TOKEN()`, which means ETH mode;
+    - `evm-deposit` approves and then deposits, through the existing send
+      path. A call's `to` can now be the token;
+    - `evm-withdraw` and `evm-status` report amounts in token units;
+    - gas and `evm-min-balance` stay in ETH.
+  - **Scripts:** `deploy.sh --token <address> [--units-per-sat N]` and
+    `run-anvil.sh --token <address|mock:D>`.
+- **Tests:**
+  - Contracts: 60 (46 before). The mocks are tokens of 6 and 18 decimals,
+    no-bool, returning false or malformed, fee on either side, with hooks, and
+    without `decimals()`. The real and synthetic txs are replayed in token
+    units, with the invariant after every operation and everything withdrawn
+    exactly. Reentrancy through hooks is tested in both directions, and so are
+    several token calls in one tx.
+  - Plugin unit tests: 192 (182 before). The 10 new ones are in
+    `test_backend_token.py` and run against anvil with three tokens.
+  - Integration: `test_token_channel` on a 6-decimal token covers deposit,
+    open, pay, mutual close, exits and withdraw. Amounts are exact in units,
+    tokens are conserved, and gas is paid in ETH only.
+- **Review:** one fresh-agent security review of the contract found nothing
+  critical, high or medium. Fixed:
+  - the lock's release was untested; a test now does several token calls in
+    one tx, and it catches that mutation;
+  - `unitsPerSat` is now checked against the token's decimals, and
+    `balanceOf` is checked at construction;
+  - the `transient` pragma was raised to `^0.8.28`.
+- **Open:**
+  - An exit to an address the token blocklists is stuck. `withdrawTo(address)`
+    in token mode would fix it, but the harness has only 102 bytes left.
+  - Rebasing, rounding and changeable-fee tokens are refused by spec, not by
+    code.
+  - The token case is not run in Docker yet, and not on Base Sepolia.
+

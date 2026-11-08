@@ -3,17 +3,22 @@
 #
 # Starts anvil and deploys UtxoChain to it (SPEC 6), for tests and by hand.
 #
-#   ./run-anvil.sh [--port 8545] [--interval 2] [--block-time S] [-- anvil args...]
+#   ./run-anvil.sh [--port 8545] [--interval 2] [--block-time S] [--token T] [-- anvil args...]
 #
-# Prints the contract's address on stdout (one line), then keeps anvil in the
-# foreground until this script is stopped (Ctrl-C, SIGTERM, SIGHUP), which
-# kills anvil too. Everything else goes to stderr.
+# Prints the contract's address on stdout (one line; with --token, a second
+# line: the token's address), then keeps anvil in the foreground until this
+# script is stopped (Ctrl-C, SIGTERM, SIGHUP), which kills anvil too.
+# Everything else goes to stderr.
 #
 #   --port        anvil's port (default 8545)
 #   --interval    the contract's INTERVAL, seconds per virtual block (default 2)
 #   --block-time  mine a block every S seconds (default: only on transactions,
 #                 evm_mine and anvil_mine; tests move time themselves with
 #                 evm_setNextBlockTimestamp + evm_mine)
+#   --token       token mode (SPEC 4.6): UtxoChainToken instead, for T, an
+#                 ERC-20's address (with anvil --fork-url), or mock:D, which
+#                 first deploys contracts/test/Tokens.sol's MockERC20 of D
+#                 decimals (anyone can mint it)
 #   --            the rest goes to anvil as is (e.g. --timestamp, --hardfork)
 #
 # anvil runs with --slots-in-an-epoch 1, so `safe` trails `latest` by one
@@ -23,14 +28,16 @@ set -euo pipefail
 port=8545
 interval=2
 block_time=()
+token=""
 extra=()
 while [ $# -gt 0 ]; do
     case "$1" in
         --port) port="$2"; shift 2 ;;
         --interval) interval="$2"; shift 2 ;;
         --block-time) block_time=(--block-time "$2"); shift 2 ;;
+        --token) token="$2"; shift 2 ;;
         --) shift; extra=("$@"); break ;;
-        -h|--help) sed -n '3,21p' "$0"; exit 0 ;;
+        -h|--help) sed -n '3,26p' "$0"; exit 0 ;;
         *) echo "run-anvil.sh: unknown argument $1" >&2; exit 2 ;;
     esac
 done
@@ -67,10 +74,30 @@ done
 [ -n "$up" ] || { echo "run-anvil.sh: anvil did not start on port $port" >&2; exit 1; }
 
 # anvil's account 0 (the well-known test mnemonic).
-address=$(DEPLOYER_PRIVATE_KEY=0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80 \
-    "$here/contracts/deploy.sh" --rpc-url "$rpc" --interval "$interval")
+key=0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
+token_args=()
+case "$token" in
+    '') ;;
+    mock:*)
+        decimals="${token#mock:}"
+        case "$decimals" in ''|*[!0-9]*) echo "run-anvil.sh: bad --token $token" >&2; exit 2 ;; esac
+        out=$(builtin cd "$here/contracts" && forge create test/Tokens.sol:MockERC20 --rpc-url "$rpc" \
+            --private-key "$key" --broadcast --json --constructor-args "$decimals")
+        token=$(printf '%s' "$out" | sed -n 's/.*"deployedTo": *"\(0x[0-9a-fA-F]\{40\}\)".*/\1/p')
+        [ -n "$token" ] || { echo "run-anvil.sh: no token address in forge's output" >&2; exit 1; }
+        token_args=(--token "$token") ;;
+    *) token_args=(--token "$token") ;;
+esac
+address=$(DEPLOYER_PRIVATE_KEY=$key \
+    "$here/contracts/deploy.sh" --rpc-url "$rpc" --interval "$interval" ${token_args[@]+"${token_args[@]}"})
 echo "$address"
-echo "run-anvil.sh: anvil on $rpc (pid $anvil_pid), UtxoChain at $address, INTERVAL $interval" >&2
+if [ -n "$token" ]; then
+    echo "$token"
+    echo "run-anvil.sh: anvil on $rpc (pid $anvil_pid), UtxoChainToken at $address for token $token," \
+        "INTERVAL $interval" >&2
+else
+    echo "run-anvil.sh: anvil on $rpc (pid $anvil_pid), UtxoChain at $address, INTERVAL $interval" >&2
+fi
 
 # `wait` returns early when a trapped signal arrives, then the trap exits.
 wait "$anvil_pid"

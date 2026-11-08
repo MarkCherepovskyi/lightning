@@ -2,6 +2,7 @@
 pragma solidity ^0.8.24;
 
 import {UtxoChain} from "../src/UtxoChain.sol";
+import {UtxoChainToken} from "../src/UtxoChainToken.sol";
 import {Prevout, TxView, BtcTx} from "../src/BtcTx.sol";
 import {Validation} from "../src/Validation.sol";
 import {TaprootSighash} from "../src/TaprootSighash.sol";
@@ -41,6 +42,18 @@ contract UtxoChainHarness is UtxoChain {
 
     function parseOnly(bytes calldata rawTx) external pure returns (bytes32) {
         return BtcTx.parse(rawTx).txid;
+    }
+}
+
+/// Test-only: UtxoChainToken plus `seed` only (the same validation code as
+/// UtxoChainHarness, which measures it; and less code, so it stays under
+/// the 24,576-byte limit). The test mints a seeded output's amount to this
+/// contract, so the balance invariant holds.
+contract UtxoChainTokenHarness is UtxoChainToken {
+    constructor(uint256 interval, address token, uint256 unitsPerSat) UtxoChainToken(interval, token, unitsPerSat) {}
+
+    function seed(bytes32 txid, uint32 vout, Prevout calldata p) external {
+        utxo[utxoKey(txid, vout)] = _commitment(p.amount, p.scriptPubKey, p.height);
     }
 }
 

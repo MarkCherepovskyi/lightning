@@ -720,6 +720,86 @@ def test_exit_withdraw(node_factory, chain):
     assert total == 1_000_000 - 350_000 - fees
 
 
+# ------------------------------------------------------------ token mode (SPEC 4.6)
+
+@pytest.mark.parametrize('chain', [{'token_decimals': 6}], indirect=True)
+def test_token_channel(node_factory, chain):
+    """A UtxoChainToken on a 6-decimal ERC-20 (1 sat = 1 unit), CLN unchanged:
+    evm-deposit approves and deposits; open, pay, mutual close; both nodes
+    withdraw everything to their exit addresses, then evm-withdraw. Every
+    amount on chain is exact in token units, the contract ends holding
+    nothing, and gas is paid in ETH only."""
+    assert chain.token is not None and chain.units == 1
+    l1, l2 = node_factory.get_nodes(2)
+    nodes = (l1, l2)
+    minted = {n.eth_address: chain.token_balance(n.eth_address) for n in nodes}
+    s = l1.evm_status()
+    assert s['token'] == chain.token and s['units_per_sat'] == 1
+    assert s['token_balance_units'] == minted[l1.eth_address] and s['withdrawable_units'] == 0
+
+    txid, _ = l1.deposit(1_000_000)
+    assert chain.event(txid).tx.outputs[0][0] == 1_000_000
+    assert chain.token_balance(chain.contract) == 1_000_000
+    assert chain.token_balance(l1.eth_address) == minted[l1.eth_address] - 1_000_000
+    res, _ = open_channel(chain, l1, l2, 600_000)
+    l1.rpc.pay(l2.rpc.invoice(150_000_000, 't', 't')['bolt11'])
+    wait_for(lambda: l2.channel(l1)['to_us_msat'] == 150_000_000)
+    ours = l1.channel(l2)['to_us_msat'] // 1000
+
+    close = l1.rpc.close(l2.info['id'])
+    assert close['type'] == 'mutual'
+    ev = chain.wait_event(close['txids'][0])
+    assert ev.spends() == [(res['txid'], res['outnum'])]
+    fee = chain.fee_of(ev.txid)
+    assert sorted(a for a, _ in ev.tx.outputs) == sorted([150_000, ours - fee])
+    for n in nodes:
+        wait_for(lambda: any(o['txid'] == ev.txid and o['status'] == 'confirmed'
+                             for o in n.rpc.listfunds()['outputs']))
+    wait_forgotten(chain, l1, l2)
+
+    # Everything each wallet holds goes to its own exit address.
+    for n in nodes:
+        addr = n.rpc.call('evm-exitaddr', {'ethaddress': n.eth_address})['address']
+        w = n.rpc.withdraw(addr, 'all')
+        chain.wait_event(w['txid'])
+        wait_for(lambda: n.rpc.listfunds()['outputs'] == [])
+
+    # What the contract owes each key: its exits, and the fee of every tx it
+    # submitted (SPEC 4.4), in units.
+    owed = {n.eth_address: 0 for n in nodes}
+    for e in chain.events():
+        if e.is_deposit:
+            continue
+        sender = evm.checksum_address(chain.rpc.request('eth_getTransactionByHash', e.evm_tx)['from'])
+        owed[sender] = owed.get(sender, 0) + chain.fee_of(e.txid)
+        for amount, spk in e.tx.outputs:
+            if len(spk) == 22 and spk[:2] == b'\x60\x14':
+                to = evm.checksum_address(spk[2:])
+                owed[to] = owed.get(to, 0) + amount
+    assert set(owed) == {n.eth_address for n in nodes}
+    assert sum(owed.values()) == 1_000_000
+    for x, sats in owed.items():
+        assert chain.withdrawable(x) == sats * chain.units
+    assert chain.token_balance(chain.contract) == 1_000_000
+
+    for n in nodes:
+        eth0 = chain.balance(n.eth_address)
+        tok0 = chain.token_balance(n.eth_address)
+        assert n.evm_status()['withdrawable_units'] == owed[n.eth_address]
+        wd = n.rpc.call('evm-withdraw')
+        assert wd['status'] == 'mined' and wd['amount_units'] == owed[n.eth_address] and wd['token'] == chain.token
+        rc = chain.rpc.request('eth_getTransactionReceipt', wd['evm_tx'])
+        assert chain.token_balance(n.eth_address) - tok0 == owed[n.eth_address]
+        assert eth0 - chain.balance(n.eth_address) == int(rc['gasUsed'], 16) * int(rc['effectiveGasPrice'], 16)
+        assert chain.withdrawable(n.eth_address) == 0
+    assert chain.token_balance(chain.contract) == 0
+    # Tokens conserved: l2 ends with l1's payment, less what its txs paid in
+    # fees to others; together they hold exactly what was minted.
+    final = {n.eth_address: chain.token_balance(n.eth_address) for n in nodes}
+    assert sum(final.values()) == sum(minted.values())
+    assert final[l2.eth_address] - minted[l2.eth_address] == owed[l2.eth_address]
+
+
 # ------------------------------------------------------------ payment size (SPEC open question 1)
 
 def test_max_payment(node_factory, chain):

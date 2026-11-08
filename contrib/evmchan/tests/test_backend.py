@@ -130,12 +130,14 @@ def test_selector_table_matches_errors_sol_and_abi():
         assert evm.selector(sig).hex() == sel, sig
     ours = set(eb.ERRORS.values()) - {'Error(string)', 'Panic(uint256)'}
     assert ours == _sol_errors()
-    artifact = os.path.join(EVMCHAN, 'contracts', 'out', 'UtxoChain.sol', 'UtxoChain.json')
-    if not os.path.exists(artifact):
-        pytest.skip('contracts/out not built')
-    abi = json.load(open(artifact))['abi']
-    abi_errors = {'{}({})'.format(e['name'], ','.join(i['type'] for i in e['inputs'])) for e in abi
-                  if e['type'] == 'error'}
+    abi_errors = set()
+    for name in ('UtxoChain', 'UtxoChainToken'):         # ETH and token mode (SPEC 4.6)
+        artifact = os.path.join(EVMCHAN, 'contracts', 'out', name + '.sol', name + '.json')
+        if not os.path.exists(artifact):
+            pytest.skip('contracts/out not built')
+        abi = json.load(open(artifact))['abi']
+        abi_errors |= {'{}({})'.format(e['name'], ','.join(i['type'] for i in e['inputs'])) for e in abi
+                       if e['type'] == 'error'}
     assert abi_errors == ours
 
 

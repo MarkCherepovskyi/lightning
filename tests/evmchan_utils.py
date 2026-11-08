@@ -15,6 +15,10 @@ contract (contrib/evmchan, SPEC 5-7) instead of bitcoind.
   <lightning-dir>/regtest/evm-key and funded before it starts).
 - On-chain facts come from the contract itself: its TxApplied events,
   isUnspent, withdrawable and ETH balances.
+- Token mode (SPEC 4.6): EvmChain(token_decimals=D) deploys a mock ERC-20
+  of D decimals (contracts/test/Tokens.sol) and a UtxoChainToken on it
+  instead; every node key gets NODE_TOKENS of it too. Amounts on chain are
+  then token units, `units` per sat.
 """
 from fixtures import LightningNode as TestsLightningNode
 from pyln.testing.utils import (LightningD, TIMEOUT, drop_unused_port, reserve_unused_port,
@@ -42,6 +46,8 @@ import evmindex   # noqa: E402
 PLUGIN = os.path.join(EVMCHAN, 'evmbackend.py')
 HOLD = os.path.join(EVMCHAN, 'spikes', 's1-toychain', 'hold.py')
 ARTIFACT = os.path.join(EVMCHAN, 'contracts', 'out', 'UtxoChain.sol', 'UtxoChain.json')
+TOKEN_ARTIFACT = os.path.join(EVMCHAN, 'contracts', 'out', 'UtxoChainToken.sol', 'UtxoChainToken.json')
+MOCK_ARTIFACT = os.path.join(EVMCHAN, 'contracts', 'out', 'Tokens.sol', 'MockERC20.json')
 FOUNDRY_BIN = os.path.expanduser('~/.foundry/bin')
 
 INTERVAL = 2                      # SPEC 2: seconds per virtual block on anvil
@@ -49,6 +55,18 @@ SAT = 10**10                      # SPEC 2: wei per sat
 # anvil's default account 0 (its key is public): the deployer.
 DEPLOYER_KEY = '0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80'
 NODE_ETH = 100 * 10**18           # what each node key gets before it starts
+NODE_TOKENS = 10**8               # and, in token mode, sats' worth of the token
+
+
+def units_per_sat(decimals):
+    """SPEC 2/4.6: 10^(decimals - 8) token units per sat, or 1 below 8 decimals."""
+    return 10**(decimals - 8) if decimals >= 8 else 1
+
+
+def _code(artifact):
+    with open(artifact) as f:
+        return evm.unhex(json.load(f)['bytecode']['object'])
+
 
 # SPEC 5.6, the anvil column: 80 s at INTERVAL 2.
 OPTIONS_56 = {
@@ -132,7 +150,7 @@ class EvmChain:
 
     canned_blocks = None
 
-    def __init__(self, directory, interval=INTERVAL, keep_state=False, wallclock=False):
+    def __init__(self, directory, interval=INTERVAL, keep_state=False, wallclock=False, token_decimals=None):
         self.directory = directory
         os.makedirs(directory, exist_ok=True)
         self.interval_arg = interval
@@ -150,13 +168,22 @@ class EvmChain:
         self._miner = None
         self.wallclock = wallclock
         self.mined = 0
+        self._send_lock = threading.Lock()    # the deployer's sends (nodes are built in parallel)
+        self.token = None                     # token mode: the mock ERC-20's address
+        self.units = SAT                      # wei, or token units, per sat
         try:
             self.start_anvil()
             self.deployer = evm.Account(DEPLOYER_KEY)
-            with open(ARTIFACT) as f:
-                code = evm.unhex(json.load(f)['bytecode']['object'])
-            rc = self.rpc.send(self.deployer, None, data=code + evm.abi_encode(['uint256'], [interval]),
-                               gas=8_000_000)
+            if token_decimals is None:
+                data = _code(ARTIFACT) + evm.abi_encode(['uint256'], [interval])
+            else:
+                rc = self.rpc.send(self.deployer, None, gas=3_000_000,
+                                   data=_code(MOCK_ARTIFACT) + evm.abi_encode(['uint8'], [token_decimals]))
+                self.token = evm.checksum_address(rc['contractAddress'])
+                self.units = units_per_sat(token_decimals)
+                data = _code(TOKEN_ARTIFACT) + evm.abi_encode(['uint256', 'address', 'uint256'],
+                                                              [interval, self.token, self.units])
+            rc = self.rpc.send(self.deployer, None, data=data, gas=8_000_000)
             self.contract = evm.checksum_address(rc['contractAddress'])
             self.deploy_block = int(rc['blockNumber'], 16)
             self.G = self.const('GENESIS_TIME')
@@ -296,6 +323,17 @@ class EvmChain:
 
     def balance(self, address):
         return int(self.rpc.request('eth_getBalance', address, 'latest'), 16)
+
+    def token_balance(self, address):
+        """Token mode: the mock token's balanceOf, in units."""
+        data = evm.calldata('balanceOf(address)', ['address'], [address])
+        return evm.abi_decode(['uint256'], self.rpc.eth_call(self.token, data))[0]
+
+    def fund_token(self, address, units):
+        """Token mode: mints `units` of the mock token to address."""
+        with self._send_lock:
+            self.rpc.send(self.deployer, self.token, gas=200_000, data=evm.calldata(
+                'mint(address,uint256)', ['address', 'uint256'], [address, units]))
 
     def fund_eth(self, address, wei=NODE_ETH):
         self.rpc.call('anvil_setBalance', address, evm.qty(wei))
@@ -465,6 +503,8 @@ class EvmNode(TestsLightningNode):
         self.eth_address = self.eth.address
         if fund_eth:
             chain.fund_eth(self.eth_address, fund_eth)
+        if chain.token is not None:
+            chain.fund_token(self.eth_address, NODE_TOKENS * chain.units)
         chain.nodes.append(self)
 
     # ---------------------------------------------------- helpers

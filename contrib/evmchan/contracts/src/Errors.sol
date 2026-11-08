@@ -12,6 +12,13 @@ error BadDepositScript(); // over 10,000 bytes, an exit script, or OP_RETURN
 error NothingToWithdraw();
 error WithdrawFailed();
 
+// Token mode (UtxoChainToken, SPEC 4.6)
+error BadToken(); // no code at the token address (or it does not answer balanceOf)
+error BadUnitsPerSat(); // not 10^(decimals - 8) (or 1); without decimals(), not a power of ten up to 10^18
+error TokenTransferFailed(); // transfer or transferFrom reverted or returned false
+error TokenAmountMismatch(); // the balance moved by other than the amount (fee-on-transfer)
+error Reentrancy(); // a deposit or withdraw inside another's token call
+
 // 4.3.1 Encoding
 error TxTooLarge();
 error Truncated();
