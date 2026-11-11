@@ -75,6 +75,10 @@ def evm_factory(request, directory, test_name, chain, executor, db_provider, tea
     """node_factory's twin for the EVM nodes (their own directories)."""
     nf = NodeFactory(request, test_name, chain, executor, directory=os.path.join(directory, 'evm'),
                      db_provider=db_provider, node_cls=RegtestEvmNode, jsonschemas=jsonschemas)
+    # pyln-testing derives a node's key from its directory's name
+    # (lightning-<n>): numbered apart from node_factory's, the EVM nodes get
+    # node ids of their own, not the Liquid nodes' twins.
+    nf.next_id = 101
     yield nf
     ok, errs = nf.killall([not n.may_fail for n in nf.nodes])
     for e in errs:
@@ -121,6 +125,8 @@ def swap_nodes(node_factory, evm_factory, chain, bitcoind, pair_from='lbtc',
         'assetswap-provider': provider_l.info['id'],
     })
     payer.rpc.connect(provider_l.info['id'], 'localhost', provider_l.port)
+    ids = [n.info['id'] for n in (payer, provider_l, provider_e, payee)]
+    assert len(set(ids)) == 4, ids
     return payer, provider_l, provider_e, payee
 
 
