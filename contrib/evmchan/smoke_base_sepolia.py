@@ -246,7 +246,7 @@ def main():
         sys.exit('--cleanup needs --contract')
     if not contract:
         log('deploying UtxoChain (INTERVAL {})'.format(INTERVAL))
-        out = subprocess.run([os.path.join(HERE, 'contracts', 'deploy.sh'), '--rpc-url', RPC_TEMPLATE,
+        out = subprocess.run([os.path.join(HERE, '..', '..', 'contracts', 'evm', 'deploy.sh'), '--rpc-url', RPC_TEMPLATE,
                               '--interval', str(INTERVAL)], capture_output=True, text=True,
                              env=dict(os.environ, PATH=os.path.expanduser('~/.foundry/bin') + ':' + os.environ['PATH']))
         contract = out.stdout.strip()

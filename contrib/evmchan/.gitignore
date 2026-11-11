@@ -2,8 +2,6 @@
 out/
 cache/
 __pycache__/
-# Regenerable test data (deterministic; see contracts/README.md):
+# Regenerable test data (deterministic; see contracts/evm/README.md):
 #   reference/fuzz.py writes reference/cases/ (~11 MB)
-#   contracts/script/gen_vectors.py writes contracts/test/generated/ (~35 MB)
 reference/cases/
-contracts/test/generated/

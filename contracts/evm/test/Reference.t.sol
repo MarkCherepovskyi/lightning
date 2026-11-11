@@ -11,7 +11,7 @@ import {Ref, RefDeposit} from "./Types.sol";
 /// a reading of the SPEC; for them the contract may only be stricter (reject a
 /// case the reference accepts), never more lenient.
 ///
-/// script/gen_vectors.py writes the cases to test/generated/reference-*.hex, in
+/// contrib/evmchan/gen_vectors.py writes the cases to test/generated/reference-*.hex, in
 /// 16 parts; without them (no reference directory) every test here skips.
 contract ReferenceTest is ChainBase {
     string internal constant DIR = "test/generated/";

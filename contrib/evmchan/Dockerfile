@@ -55,7 +55,7 @@ RUN arch="${TARGETARCH:-$(dpkg --print-architecture)}" \
  && /opt/foundry/bin/anvil --version && /opt/foundry/bin/forge --version
 ENV PATH=/venv/bin:/opt/foundry/bin:${PATH}
 
-# solc for the contract (contracts/foundry.toml pins it), fetched once here
+# solc for the contract (contracts/evm/foundry.toml pins it), fetched once here
 # rather than on every run.
 RUN mkdir -p /tmp/solc/src \
  && printf '[profile.default]\nsolc_version = "%s"\noffline = false\n' "${SOLC_VERSION}" > /tmp/solc/foundry.toml \

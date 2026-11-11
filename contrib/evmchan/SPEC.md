@@ -26,7 +26,8 @@ Components and where they live:
 
 | Path | What |
 |---|---|
-| `contrib/evmchan/contracts/` | Foundry project: `UtxoChainBase.sol`, the deployables `UtxoChain.sol` (ETH) and `UtxoChainToken.sol` (4.6), their libraries, tests, deploy script |
+| `contracts/evm/` | Foundry project, standalone (no dependency on this tree to build or test it): `UtxoChainBase.sol`, the deployables `UtxoChain.sol` (ETH) and `UtxoChainToken.sol` (4.6), their libraries, tests, deploy script |
+| `contrib/evmchan/gen_vectors.py` | Writes the contract's test vectors into `contracts/evm/test/generated/` (from the CLN vectors, the BIP vectors and `reference/`) |
 | `contrib/evmchan/evmbackend.py` | The backend plugin (stdlib + coincurve) |
 | `contrib/evmchan/evm.py` | EVM JSON-RPC, keccak, RLP, EIP-1559 signing, ABI (from spike S6) |
 | `contrib/evmchan/btc.py` | Bitcoin tx/block serialization, bech32 (from spike S1) |
@@ -338,8 +339,8 @@ listed is invalid.
       `ecrecover` trick from spike S2.
       - It rejects what BIP340 would accept only for an output key with x in
         [n, p), or for e = 0 or s = 0. Nobody can produce any of those.
-    - **Soundness** is argued in `contracts/src/Ecdsa.sol` and
-      `contracts/src/Schnorr.sol`:
+    - **Soundness** is argued in `contracts/evm/src/Ecdsa.sol` and
+      `contracts/evm/src/Schnorr.sol`:
       - points are compared by keccak address, so a forgery needs a 160-bit
         second preimage;
       - the chain's `ecrecover` MUST return zero for x off the curve and for the
@@ -457,7 +458,7 @@ unchanged: it still sees sats.
   - `evm-withdraw` and `evm-status` give token amounts in units
     (`amount_units`, `withdrawable_units`, `token_balance_units`) alongside the
     ETH balance. `evm-min-balance` and the balance alarm stay in ETH.
-- **Deploying:** `contracts/deploy.sh --token <address>` (with
+- **Deploying:** `contracts/evm/deploy.sh --token <address>` (with
   `--units-per-sat`, else it reads `decimals()`); `run-anvil.sh --token
   mock:<decimals>` deploys a mock token first.
 

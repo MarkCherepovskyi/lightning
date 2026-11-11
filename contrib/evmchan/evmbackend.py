@@ -83,7 +83,7 @@ ESTIMATEFEES = {'feerate_floor': 1000,
                 'feerates': [{'blocks': 2, 'feerate': 5000}, {'blocks': 6, 'feerate': 4000},
                              {'blocks': 12, 'feerate': 3000}, {'blocks': 100, 'feerate': 1000}]}
 
-# Every custom error of contracts/src/Errors.sol by selector, plus Solidity's
+# Every custom error of contracts/evm/src/Errors.sol by selector, plus Solidity's
 # Error(string) and Panic(uint256). Embedded so the plugin never depends on
 # build output; tests/test_backend.py checks it against Errors.sol and the ABI.
 ERRORS = {

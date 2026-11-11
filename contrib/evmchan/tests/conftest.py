@@ -26,7 +26,8 @@ import pyref    # noqa: E402
 # anvil's default account 0 (the deployer in run-anvil.sh) and 1.
 KEY0 = '0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80'
 KEY1 = '0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d'
-ARTIFACT = os.path.join(EVMCHAN, 'contracts', 'out', 'UtxoChain.sol', 'UtxoChain.json')
+CONTRACTS = os.path.normpath(os.path.join(EVMCHAN, '..', '..', 'contracts', 'evm'))
+ARTIFACT = os.path.join(CONTRACTS, 'out', 'UtxoChain.sol', 'UtxoChain.json')
 SAT = 10**10
 SUBMIT_SIG = 'submit(bytes,(uint64,bytes,uint32)[])'
 SUBMIT_TYPES = ['bytes', '(uint64,bytes,uint32)[]']

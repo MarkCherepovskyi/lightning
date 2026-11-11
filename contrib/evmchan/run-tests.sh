@@ -230,7 +230,7 @@ start=$(date +%s)
 make -j"$(nproc)" VERSION=v26.06-evmchan all-programs default-targets > /tmp/make.log 2>&1 \
 	|| { grep -E "error|Error" /tmp/make.log | head -40; tail -20 /tmp/make.log; exit 1; }
 echo "building the contract ..."
-(cd contrib/evmchan/contracts && forge build --offline --skip test --skip script > /tmp/forge.log 2>&1) \
+(cd contracts/evm && forge build --offline --skip test --skip script > /tmp/forge.log 2>&1) \
 	|| { cat /tmp/forge.log; exit 1; }
 echo "built in $(( $(date +%s) - start )) s"
 

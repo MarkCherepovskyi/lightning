@@ -20,7 +20,7 @@ import pytest
 import btc
 import evm
 import evmbackend as eb
-from conftest import EVMCHAN, SAT, Key, sign, wait_until
+from conftest import CONTRACTS, EVMCHAN, SAT, Key, sign, wait_until
 
 A = Key(0xA11CE)
 INTERVAL = 2
@@ -117,7 +117,7 @@ def spend(b, prev_txid, vout, amount, key=A, out_script=None, fee=1000, locktime
 # ------------------------------------------------------------ the selector table
 
 def _sol_errors():
-    src = open(os.path.join(EVMCHAN, 'contracts', 'src', 'Errors.sol')).read()
+    src = open(os.path.join(CONTRACTS, 'src', 'Errors.sol')).read()
     out = set()
     for m in re.finditer(r'^error\s+(\w+)\(([^)]*)\)\s*;', src, re.M):
         args = [a.strip().split()[0] for a in m.group(2).split(',') if a.strip()]
@@ -132,9 +132,9 @@ def test_selector_table_matches_errors_sol_and_abi():
     assert ours == _sol_errors()
     abi_errors = set()
     for name in ('UtxoChain', 'UtxoChainToken'):         # ETH and token mode (SPEC 4.6)
-        artifact = os.path.join(EVMCHAN, 'contracts', 'out', name + '.sol', name + '.json')
+        artifact = os.path.join(CONTRACTS, 'out', name + '.sol', name + '.json')
         if not os.path.exists(artifact):
-            pytest.skip('contracts/out not built')
+            pytest.skip('contracts/evm/out not built')
         abi = json.load(open(artifact))['abi']
         abi_errors |= {'{}({})'.format(e['name'], ','.join(i['type'] for i in e['inputs'])) for e in abi
                        if e['type'] == 'error'}

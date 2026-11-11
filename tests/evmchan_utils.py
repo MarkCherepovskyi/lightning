@@ -16,7 +16,7 @@ contract (contrib/evmchan, SPEC 5-7) instead of bitcoind.
 - On-chain facts come from the contract itself: its TxApplied events,
   isUnspent, withdrawable and ETH balances.
 - Token mode (SPEC 4.6): EvmChain(token_decimals=D) deploys a mock ERC-20
-  of D decimals (contracts/test/Tokens.sol) and a UtxoChainToken on it
+  of D decimals (contracts/evm/test/Tokens.sol) and a UtxoChainToken on it
   instead; every node key gets NODE_TOKENS of it too. Amounts on chain are
   then token units, `units` per sat.
 """
@@ -45,9 +45,9 @@ import evmindex   # noqa: E402
 
 PLUGIN = os.path.join(EVMCHAN, 'evmbackend.py')
 HOLD = os.path.join(EVMCHAN, 'hold.py')
-ARTIFACT = os.path.join(EVMCHAN, 'contracts', 'out', 'UtxoChain.sol', 'UtxoChain.json')
-TOKEN_ARTIFACT = os.path.join(EVMCHAN, 'contracts', 'out', 'UtxoChainToken.sol', 'UtxoChainToken.json')
-MOCK_ARTIFACT = os.path.join(EVMCHAN, 'contracts', 'out', 'Tokens.sol', 'MockERC20.json')
+ARTIFACT = os.path.join(ROOT, 'contracts', 'evm', 'out', 'UtxoChain.sol', 'UtxoChain.json')
+TOKEN_ARTIFACT = os.path.join(ROOT, 'contracts', 'evm', 'out', 'UtxoChainToken.sol', 'UtxoChainToken.json')
+MOCK_ARTIFACT = os.path.join(ROOT, 'contracts', 'evm', 'out', 'Tokens.sol', 'MockERC20.json')
 FOUNDRY_BIN = os.path.expanduser('~/.foundry/bin')
 
 INTERVAL = 2                      # SPEC 2: seconds per virtual block on anvil

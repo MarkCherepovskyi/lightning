@@ -17,7 +17,7 @@
 #                 evm_setNextBlockTimestamp + evm_mine)
 #   --token       token mode (SPEC 4.6): UtxoChainToken instead, for T, an
 #                 ERC-20's address (with anvil --fork-url), or mock:D, which
-#                 first deploys contracts/test/Tokens.sol's MockERC20 of D
+#                 first deploys contracts/evm/test/Tokens.sol's MockERC20 of D
 #                 decimals (anyone can mint it)
 #   --            the rest goes to anvil as is (e.g. --timestamp, --hardfork)
 #
@@ -44,6 +44,7 @@ done
 case "$port" in ''|*[!0-9]*) echo "run-anvil.sh: bad --port" >&2; exit 2 ;; esac
 
 here="$(builtin cd "$(dirname "$0")" && pwd)"
+contracts="$here/../../contracts/evm"
 export PATH="$HOME/.foundry/bin:$PATH"
 command -v anvil >/dev/null || { echo "run-anvil.sh: anvil not found (install Foundry)" >&2; exit 1; }
 rpc="http://127.0.0.1:$port"
@@ -81,7 +82,7 @@ case "$token" in
     mock:*)
         decimals="${token#mock:}"
         case "$decimals" in ''|*[!0-9]*) echo "run-anvil.sh: bad --token $token" >&2; exit 2 ;; esac
-        out=$(builtin cd "$here/contracts" && forge create test/Tokens.sol:MockERC20 --rpc-url "$rpc" \
+        out=$(builtin cd "$contracts" && forge create test/Tokens.sol:MockERC20 --rpc-url "$rpc" \
             --private-key "$key" --broadcast --json --constructor-args "$decimals")
         token=$(printf '%s' "$out" | sed -n 's/.*"deployedTo": *"\(0x[0-9a-fA-F]\{40\}\)".*/\1/p')
         [ -n "$token" ] || { echo "run-anvil.sh: no token address in forge's output" >&2; exit 1; }
@@ -89,7 +90,7 @@ case "$token" in
     *) token_args=(--token "$token") ;;
 esac
 address=$(DEPLOYER_PRIVATE_KEY=$key \
-    "$here/contracts/deploy.sh" --rpc-url "$rpc" --interval "$interval" ${token_args[@]+"${token_args[@]}"})
+    "$contracts/deploy.sh" --rpc-url "$rpc" --interval "$interval" ${token_args[@]+"${token_args[@]}"})
 echo "$address"
 if [ -n "$token" ]; then
     echo "$token"

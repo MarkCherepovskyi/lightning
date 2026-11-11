@@ -14,11 +14,11 @@ import pytest
 import btc
 import evm
 import evmbackend as eb
-from conftest import EVMCHAN, KEY1, Chain, Key
+from conftest import CONTRACTS, EVMCHAN, KEY1, Chain, Key
 from test_backend import (A, GOOD_CONFIGS, GOOD_INFO, CountingRpc, FakeLn, Log, StatusIx, make_cfg,
                           offline_backend, spend)
 
-OUT = os.path.join(EVMCHAN, 'contracts', 'out')
+OUT = os.path.join(CONTRACTS, 'out')
 
 
 def artifact(sol, name):
