@@ -2,7 +2,7 @@
 """A minimal EVM client: keccak-256, RLP, EIP-1559 signing (coincurve), a
 JSON-RPC client over urllib, just enough ABI (static types, bytes, string,
 dynamic arrays and tuples) and eth_getLogs with adaptive range splitting.
-Standard library + coincurve. From spike S6 (spikes/s6-pysigner)."""
+Standard library + coincurve."""
 import collections
 import itertools
 import json

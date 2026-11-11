@@ -5,7 +5,7 @@ Usage (from contracts/, with a Python that has coincurve):
   python -I script/gen_vectors.py [--vectors DIR] [--reference DIR]
 
 Reads:
-  - every *.jsonl in --vectors (default ../spikes/s1-toychain/vectors): real CLN
+  - every *.jsonl in --vectors (default ../tests/vectors): real CLN
     transactions, one JSON object per line: {tx, txid, height, prevouts: [{amount,
     script, height} | {mint: true}], kind?}. Each file is replayed in order through
     the real contract (RealVectors.sol).
@@ -89,13 +89,13 @@ def cs(n):
 
 
 def _load_keccak():
-    for path in (os.path.join(EVMCHAN, "evm.py"), os.path.join(EVMCHAN, "spikes", "s6-pysigner", "evm.py")):
+    for path in (os.path.join(EVMCHAN, "evm.py"),):
         if os.path.exists(path):
             spec = importlib.util.spec_from_file_location("evmchan_evm", path)
             mod = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(mod)
             return mod.keccak256
-    raise SystemExit("no keccak256: need contrib/evmchan/evm.py or spikes/s6-pysigner/evm.py")
+    raise SystemExit("no keccak256: need contrib/evmchan/evm.py")
 
 
 keccak256 = _load_keccak()
@@ -1419,7 +1419,7 @@ def gen_real(files):
     out = [HEADER, IMPORTS]
     emit = out.append
     emit("/// Real CLN transactions, one library function per vector file, in the")
-    emit("/// order the toy chain applied them (spikes/s1-toychain/vectors).")
+    emit("/// order the toy chain applied them (tests/vectors).")
     emit("library RealVectors {")
     emit("    uint256 internal constant GENESIS_TIME = %d;" % GENESIS_TIME)
     emit("    uint256 internal constant INTERVAL = %d;" % INTERVAL)
@@ -1665,7 +1665,7 @@ def gen_reference(rdir):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--vectors", default=os.path.join(EVMCHAN, "spikes", "s1-toychain", "vectors"))
+    ap.add_argument("--vectors", default=os.path.join(EVMCHAN, "tests", "vectors"))
     ap.add_argument("--reference", default=os.path.join(EVMCHAN, "reference", "cases"))
     a = ap.parse_args()
     rng = random.Random(4243)

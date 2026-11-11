@@ -33,7 +33,7 @@ $PY check_vectors.py --cases   # also re-validate every case line
 ```
 
 Results at the last run:
-- All 42 non-deposit CLN txs in `spikes/s1-toychain/vectors/*.jsonl` are valid
+- All 42 non-deposit CLN txs in `tests/vectors/*.jsonl` are valid
   at their heights, with matching txids.
 - Their earliest valid height is the same by search and from the tx's fields.
 - The 27 that are timelocked fail one block earlier, each with a timelock error.

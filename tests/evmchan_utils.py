@@ -44,7 +44,7 @@ import evm        # noqa: E402
 import evmindex   # noqa: E402
 
 PLUGIN = os.path.join(EVMCHAN, 'evmbackend.py')
-HOLD = os.path.join(EVMCHAN, 'spikes', 's1-toychain', 'hold.py')
+HOLD = os.path.join(EVMCHAN, 'hold.py')
 ARTIFACT = os.path.join(EVMCHAN, 'contracts', 'out', 'UtxoChain.sol', 'UtxoChain.json')
 TOKEN_ARTIFACT = os.path.join(EVMCHAN, 'contracts', 'out', 'UtxoChainToken.sol', 'UtxoChainToken.json')
 MOCK_ARTIFACT = os.path.join(EVMCHAN, 'contracts', 'out', 'Tokens.sol', 'MockERC20.json')

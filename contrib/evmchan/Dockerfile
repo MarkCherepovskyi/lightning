@@ -6,7 +6,7 @@
 # run-tests.sh next to this file streams the tree in and builds CLN and the
 # contract in a volume. No bitcoind: the tests run on anvil.
 
-# As on the host (PLAN.md, M1-M3).
+# As on the host.
 ARG FOUNDRY_VERSION=v1.9.0
 ARG SOLC_VERSION=0.8.30
 

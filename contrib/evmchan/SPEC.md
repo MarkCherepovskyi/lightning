@@ -5,7 +5,7 @@ the option minimums (5.6), after M3's review. Draft 4 added the log hash (4.1, 5
 Draft 3 was dated 2026-11-05. Draft 2 was revised after an adversarial review
 (the changes are in section 11). Draft 3 fixes the readings that M1's contract
 and the independent Python reference had to choose (end of 4.3.7, and 4.5). It
-is what the implementation follows. The reasoning and the spike results behind it are in `PLAN.md`.
+is what the implementation follows.
 
 MUST and MUST NOT are normative. Anything this spec doesn't decide is an open
 question (section 10), not an implementation choice.
@@ -338,8 +338,8 @@ listed is invalid.
       `ecrecover` trick from spike S2.
       - It rejects what BIP340 would accept only for an output key with x in
         [n, p), or for e = 0 or s = 0. Nobody can produce any of those.
-    - **Soundness** is argued in `spikes/s3-segwit/src/Ecdsa.sol` and
-      `spikes/s2-taproot/src/Schnorr.sol`:
+    - **Soundness** is argued in `contracts/src/Ecdsa.sol` and
+      `contracts/src/Schnorr.sol`:
       - points are compared by keccak address, so a forgery needs a 160-bit
         second preimage;
       - the chain's `ecrecover` MUST return zero for x off the curve and for the
@@ -537,7 +537,7 @@ lightningd waits on the backend plugin at startup, as it does with bcli.
   - **Cost.** A quiet poll is 240 Infura credits: two block reads and one
     `eth_call`. A poll with new txs is about 655: `eth_getLogs` plus three
     `eth_call`s. At a 60 s poll an idle node used about 0.41M credits a day on
-    Base Sepolia, against 1.7–2.1M with the earlier design (PLAN M5).
+    Base Sepolia, against 1.7–2.1M with the earlier design.
 - **Completeness: the tip advances only on proof.** A node's `eth_getLogs` can
   silently return too little: it may clamp `toBlock` to its own head, lag in
   indexing, or answer from another backend behind a load balancer. So:
@@ -1023,7 +1023,7 @@ Each needs its tests green and your review before the next.
 6. **Infura credits (M5): addressed.** Measured at about 1.85M/day per node
    with `evm-poll` 45, too close to the free tier's 3M/day. Now there are
    quiet polls (5.2), the idle tracker reads less (5.3 step 7), and
-   `evm-poll` is 60. Re-measured in PLAN M5.
+   `evm-poll` is 60.
 
 ## 11. Changes from draft 1 (review)
 

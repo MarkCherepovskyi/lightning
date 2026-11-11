@@ -13,7 +13,7 @@ import pyref
 from pyref import Invalid
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-CLN = os.path.join(HERE, '..', 'spikes', 's1-toychain', 'vectors')
+CLN = os.path.join(HERE, '..', 'tests', 'vectors')
 TIMELOCK_ERRORS = {'NonFinal', 'RelativeLockNotMet', 'CsvNotMet', 'CltvNotMet'}
 
 failures = []

@@ -25,7 +25,7 @@ forge test
 ```
 
 `gen_vectors.py` reads the real CLN transactions in
-`../spikes/s1-toychain/vectors/*.jsonl`, the official BIP340/BIP341 vectors in
+`../tests/vectors/*.jsonl`, the official BIP340/BIP341 vectors in
 `test/data/`, and the reference cases. Rerun it after any of those change.
 
 ## Deploying

@@ -47,7 +47,7 @@ import evm   # noqa: E402
 from smoke_base_sepolia import (CHAIN_ID, FREE_TIER_PER_DAY, INTERVAL, RPC_TEMPLATE, Node, credits,   # noqa: E402
                                 exit_coins, log, refund, wait_for)
 
-HOLD = os.path.join(HERE, 'spikes', 's1-toychain', 'hold.py')
+HOLD = os.path.join(HERE, 'hold.py')
 NAMES = ('A', 'B', 'C', 'D')
 FUND_WEI = 17 * 10**15           # evm-min-balance (0.01) + gas + the deposit
 DEPOSIT_SAT = 500_000

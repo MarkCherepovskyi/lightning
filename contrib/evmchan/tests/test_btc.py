@@ -146,7 +146,7 @@ def test_blocks_against_independent_construction():
     G, I = 1793949807, 2  # noqa: E741
     prev = bytes(32)
     vectors = [json.loads(line) for f in sorted(glob.glob(os.path.join(
-        EVMCHAN, 'spikes', 's1-toychain', 'vectors', '*.jsonl'))) for line in open(f)]
+        EVMCHAN, 'tests', 'vectors', '*.jsonl'))) for line in open(f)]
     raws = [bytes.fromhex(v['tx']) for v in vectors]
     for h in list(range(0, 20)) + [127, 128, 32767, 32768, 2**24]:
         if h == 0:
@@ -167,7 +167,7 @@ def test_blocks_against_independent_construction():
 
 
 def test_cln_vectors_round_trip():
-    files = sorted(glob.glob(os.path.join(EVMCHAN, 'spikes', 's1-toychain', 'vectors', '*.jsonl')))
+    files = sorted(glob.glob(os.path.join(EVMCHAN, 'tests', 'vectors', '*.jsonl')))
     assert files
     n = witness = 0
     for f in files:
@@ -188,7 +188,7 @@ def test_cln_vectors_round_trip():
 
 def test_strict_parse():
     good = bytes.fromhex(json.loads(open(glob.glob(os.path.join(
-        EVMCHAN, 'spikes', 's1-toychain', 'vectors', 'cln-regtest-txs.jsonl'))[0]).readlines()[3])['tx'])
+        EVMCHAN, 'tests', 'vectors', 'cln-regtest-txs.jsonl'))[0]).readlines()[3])['tx'])
     tx = btc.Tx.parse(good)
     assert tx.has_witness()
     bad = {
