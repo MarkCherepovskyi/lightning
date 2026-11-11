@@ -348,7 +348,9 @@ pub(crate) async fn on_htlc_accepted(p: Plugin<State>, v: Value) -> Result<Value
         return Ok(fail_incorrect_details()); // replay: someone already claimed this hash
     };
 
-    let maxdelay = cltv_expiry_relative.saturating_sub(leg2_final_cltv + p.state().config.safety_blocks);
+    // xpay's maxdelay bounds leg 2's whole CLTV, the payee's final one
+    // included: leg 2 must time out safety_blocks before leg 1 does.
+    let maxdelay = cltv_expiry_relative.saturating_sub(p.state().config.safety_blocks);
     let layers = match asset_layers(&mut rpc2, &rec.to_asset).await {
         Ok(l) => l,
         Err(e) => {

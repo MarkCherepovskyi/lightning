@@ -108,7 +108,9 @@ def swap_nodes(node_factory, evm_factory, chain, bitcoind, pair_from='lbtc',
     provider_l (pricing pair_from:eth 1:1, leg 2 through provider_e) and the
     payer on Liquid, not yet connected.  The payer carries the same pair,
     for payassetinvoice's local estimate."""
-    provider_e, payee = evm_factory.get_nodes(2, opts=[{}, {'plugin': ASSETSWAP_PLUGIN}])
+    # The payee's invoices ask for a final CLTV of 144, as the Base Sepolia
+    # nodes' do: leg 2's maxdelay has to leave room for all of it.
+    provider_e, payee = evm_factory.get_nodes(2, opts=[{}, {'plugin': ASSETSWAP_PLUGIN, 'cltv-final': 144}])
     open_evm_channel(chain, provider_e, payee, EVM_CHANNEL_SAT)
 
     pair = f'{pair_from}:eth:1000000:0'
