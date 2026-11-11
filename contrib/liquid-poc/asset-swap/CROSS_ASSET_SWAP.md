@@ -1,7 +1,7 @@
 # Cross-asset payments via a swap-provider plugin
 
 Design doc, not yet implemented. Proof of concept, not for real funds (see
-[README.md Limits](README.md#limits) for the asset-channel limits this builds
+[README.md Limits](../README.md#limits) for the asset-channel limits this builds
 on).
 
 ## Problem
@@ -17,13 +17,13 @@ invoice while only holding asset-A channels.
 The natural-sounding fix — let one hop in the route convert asset A to asset
 B — is blocked by `lightningd` itself: `check_fwd_amount()` and this fork's
 `liquid_asset_eq()` check in `forward_htlc()`
-(`lightningd/peer_htlcs.c`) are unconditional, run after any plugin hook
+(`../../../lightningd/peer_htlcs.c`) are unconditional, run after any plugin hook
 returns, and have no plugin override point. Making a single HTLC change
 amount/asset mid-route would require patching that core forwarding logic.
 
 Instead, this design uses **two independent, hash-linked LN payments** — the
 standard "submarine swap" pattern — stitched together entirely by a plugin,
-with **no changes to `lightningd`, `gossipd`, `channeld`, or `common/`**. It
+with **no changes to `lightningd`, `gossipd`, `channeld`, or `../../../common`**. It
 relies on the `htlc_accepted` plugin hook's documented ability to hold an
 HTLC and later `resolve`/`fail` it, which *does* bypass the two checks above
 by design (the hook's own schema: "When the plugin resolves, lightningd
@@ -31,7 +31,7 @@ skips the normal checks for a final node... the plugin must make sure these
 values are correct").
 
 The asset requirement also isn't cryptographically bound into the invoice:
-BOLT11 has no asset field (nothing in `common/bolt11.c`), consistent with
+BOLT11 has no asset field (nothing in `../../../common/bolt11.c`), consistent with
 this fork's existing limitation that invoices don't carry the asset — it's
 communicated out-of-band today, and stays out-of-band here too, via a small
 plugin-level wrapper format instead of a BOLT11/core change.
@@ -176,14 +176,14 @@ The provider never resolves leg 1 until leg 2 has actually succeeded and it
 holds the preimage, so it can never pay out leg 2 without being made whole
 on leg 1; if leg 2 fails, leg 1 is simply failed too and no funds move on
 either side. Each leg's own pathfinding reuses the existing
-`askrene`/`xpay` `asset=` filtering (`plugins/askrene/askrene.c`,
+`askrene`/`xpay` `asset=` filtering (`../../../plugins/askrene/askrene.c`,
 `param_liquid_asset_network`) unchanged — nothing new needed there.
 
-## New component: `plugins/assetswap-plugin/` (Rust)
+## New component: `../../../plugins/assetswap-plugin` (Rust)
 
 Written against this repo's own in-tree Rust plugin framework
 (`cln_plugin` + `cln_rpc`, the same stack used by
-`plugins/currencyrate-plugin`, `plugins/lsps-plugin`, `plugins/bip353-plugin`),
+`../../../plugins/currencyrate-plugin`, `plugins/lsps-plugin`, `plugins/bip353-plugin`),
 not Python. One crate, loaded identically on payer, payee, and provider
 nodes — role is driven by which commands/options are used, not by separate
 binaries. Registering it is the same one-line addition every sibling
@@ -200,7 +200,7 @@ stalling every other hook/notification for the duration of leg 2.
 request and `.await` the leg-2 call directly — no manual threading needed.
 This exact "hold now, resolve later" pattern already exists in this repo
 as a working example:
-[`plugins/examples/cln-plugin-reentrant.rs`](../../plugins/examples/cln-plugin-reentrant.rs)
+[`../../../plugins/examples/cln-plugin-reentrant.rs`](../../../plugins/examples/cln-plugin-reentrant.rs)
 holds an `htlc_accepted` hook on a channel and only replies once a
 separate async event fires — the swap provider's hook does the same thing,
 substituting "leg 2 finished" for that event.
@@ -239,7 +239,7 @@ signed bytes.
 Pricing policy — which pairs are quotable, at what reference rate, with
 what tier margins — is deliberately **not** `assetswap-plugin`'s own
 config at all. It lives in a separate, swap-mechanics-agnostic plugin,
-**`plugins/pricetiers-plugin`** (`pricetiers-plugin` binary), which
+**`../../../plugins/pricetiers-plugin`** (`pricetiers-plugin` binary), which
 `assetswap-plugin` calls as a plain local RPC (`pricetiers`, via
 `cln_rpc::ClnRpc::call_raw` — not a core lightningd method, so not
 `call_typed`). This plugin knows nothing about Liquid assets, swaps, or
@@ -266,7 +266,7 @@ required:
   not needed for v1.
 - **Not yet implemented**: a second pricing-policy plugin, implementing
   the same `pricetiers` RPC contract but backed by
-  `plugins/currencyrate-plugin`'s `currencyconvert` RPC (already in this
+  `../../../plugins/currencyrate-plugin`'s `currencyconvert` RPC (already in this
   tree) as a genuine live-price oracle instead of a static configured
   rate. Because pricing is already its own plugin, this needs no change
   to `assetswap-plugin` at all — just loading a different pricing plugin.
@@ -289,7 +289,7 @@ The replacement: the payer packs what the provider needs directly into leg
 1's own HTLC, via `sendpay`/`xpay`'s existing `payment_metadata` field —
 arbitrary bytes riding in the final-hop onion TLV, which `htlc_accepted`'s
 hook payload already surfaces back out (`onion.payment_metadata`, see
-`cln-rpc/src/hooks.rs`'s `HtlcAcceptedOnion`). No new wire protocol, no
+`../../../cln-rpc/src/hooks.rs`'s `HtlcAcceptedOnion`). No new wire protocol, no
 `custommsg` hook, no requirement that payer and provider ever be directly
 peered — leg 1 is routed exactly like any other multi-hop payment, through
 whatever path the asset's announced channels provide.
@@ -343,7 +343,7 @@ lands — the provider decides live:
 How much the payer actually sends for leg 1 is therefore *its own*
 decision, made with no help from the provider: either an explicit
 `(from_asset, from_amount_msat)` the caller already knows (see
-`payassetinvoice`'s own doc comment in `pay.rs` — `contrib/liquid-poc`'s
+`payassetinvoice`'s own doc comment in `pay.rs` — `..`'s
 `lqui.py` computes this from config it reads directly off every node's
 container), or a same-node `pricetiers-plugin` lookup, which only returns
 real numbers if this particular node happens to hold a `pricetiers-pair=`
@@ -434,7 +434,7 @@ invoice is required).
 
 Registered via `.hook("htlc_accepted", on_htlc_accepted)` on the
 `Builder`, same as
-[`plugins/examples/cln-plugin-reentrant.rs`](../../plugins/examples/cln-plugin-reentrant.rs).
+[`../../../plugins/examples/cln-plugin-reentrant.rs`](../../../plugins/examples/cln-plugin-reentrant.rs).
 Must be idempotent across restarts, since the hook's own docs warn that
 lightningd replays HTLCs with no final verdict on startup.
 
@@ -598,7 +598,7 @@ mechanism, exactly the failure mode this section exists to prevent.
 
 The fix is operational, not code: **a swap-provider must load this plugin
 before lightningd can ever replay a pending HTLC**, never only via
-`plugin start`. In `contrib/liquid-poc`, this is now structural rather
+`plugin start`. In `..`, this is now structural rather
 than something an operator has to remember: the Dockerfile's
 `rust-plugins-builder` stage builds both `assetswap-plugin` and
 `pricetiers-plugin` into the `cln` image itself, and
@@ -620,7 +620,7 @@ same image and entrypoint.
 
 ### 8. CLTV margin policy
 
-Reuse this fork's own BOLT2-derived constants (`lightningd/options.c`)
+Reuse this fork's own BOLT2-derived constants (`../../../lightningd/options.c`)
 rather than inventing new numbers:
 
 - `SAFETY_BLOCKS` (`--assetswap-cltv-safety-blocks`, default **18** =
@@ -643,39 +643,39 @@ rather than inventing new numbers:
 
 ## Files
 
-- **New**: `plugins/assetswap-plugin/` — a Cargo crate (`Cargo.toml`,
+- **New**: `../../../plugins/assetswap-plugin` — a Cargo crate (`Cargo.toml`,
   `src/main.rs` + modules for the invoice wrapper (`assetinvoice.rs`), the
   payer-side RPCs (`pay.rs`), the provider-side `htlc_accepted` hook
   (`htlc.rs`), the shared `payment_metadata`/datastore-record types
   (`protocol.rs`), and small RPC/config helpers), with its own `README.md`
   mirroring this directory's.
-- **New**: `plugins/pricetiers-plugin/` (Rust crate `cln-pricetiers`,
+- **New**: `../../../plugins/pricetiers-plugin` (Rust crate `cln-pricetiers`,
   binary `pricetiers-plugin`) — the standalone, swap-agnostic pricing
   policy described in §2, with its own `pricetiers` RPC method. Has no
   `cln-rpc` dependency at all (it never calls back into lightningd) and
   no notion of swaps, Liquid assets, or `htlc_accepted`.
 - **One-line changes**: add `"plugins/assetswap-plugin"` and
-  `"plugins/pricetiers-plugin"` to the root `Cargo.toml`'s `[workspace]
+  `"plugins/pricetiers-plugin"` to the root `../../../Cargo.toml`'s `[workspace]
   members` — the same step every sibling plugin crate required, not a
   behavioral change to anything.
 - **New**: `tests/test_assetswap.py` (pytest, same harness as
-  `tests/test_liquid_asset_gossip.py`/`tests/test_liquid_asset_poc.py`:
+  `../../../tests/test_liquid_asset_gossip.py`/`tests/test_liquid_asset_poc.py`:
   `node_factory`, `fund_asset_channel`, `asset_invoice`,
   `TEST_NETWORK=liquid-regtest` skip-guard, nodes loaded with
   `opts=[{'plugin': os.path.join(os.getcwd(), 'target/debug/assetswap-plugin')}, ...]`
   plus `pricetiers-plugin` and its `--pricetiers-pair=` option — the test
   harness itself stays Python/pytest as this fork already does for its
   Rust-adjacent plugins; only the plugin binaries are Rust).
-- **`contrib/liquid-poc` infra** (this PoC's test harness, not core):
-  - `Dockerfile`: a `rust-plugins-builder` stage (`rust:1-bookworm`,
+- **`..` infra** (this PoC's test harness, not core):
+  - `../../../Dockerfile`: a `rust-plugins-builder` stage (`rust:1-bookworm`,
     building just `cln-rpc`/`cln-grpc`/`plugins` so unrelated C-side
     changes don't invalidate its cache) building both
     `cln-assetswap`/`cln-pricetiers`, and one `COPY --from=` line per
     binary dropping it into the `cln` stage's default plugins directory.
-  - `docker-compose.yml`: two added `--plugin=...` flags on the shared
+  - `../docker-compose.yml`: two added `--plugin=...` flags on the shared
     `x-cln` entrypoint, so alice/bob/carol all load both plugins from
     their very first startup — see §7's restart-idempotency requirement.
-  - `lnpoc.py`: `swap-provider`/`swap-payer`/`assetinvoice`/
+  - `../lnpoc.py`: `swap-provider`/`swap-payer`/`assetinvoice`/
     `quoteassetinvoice`/`payassetinvoice`/`swap`/`swap-demo` subcommands
     (see its own docstring). `swap-provider`/`swap-payer` only ever need
     to write the `pricetiers-pair=`/`assetswap-provider=` config lines —
@@ -687,7 +687,7 @@ rather than inventing new numbers:
     only a provider's own local `pricetiers-plugin` has real pricing —
     `cmd_swap`/`cmd_payassetinvoice` and `lqui.py`'s `payinvoice` action
     all use it.
-- **Unchanged**: everything under `lightningd/`, `gossipd/`, `channeld/`,
+- **Unchanged**: everything under `../../../lightningd`, `gossipd/`, `channeld/`,
   `common/`, `wire/`. The only reuse of existing core features is the
   already-shipped `invoice ... asset=` and `xpay ... asset=` support, plus
   `sendpay`/`xpay`'s existing `payment_metadata` field and
@@ -775,12 +775,12 @@ this as more than a design sketch again.
    ⚠️ Not yet re-verified against the redesigned code.
 9. **(Optional) hand-driven demo** on real `elementsd`-backed
    `liquid-regtest` nodes — effectively what steps 1-8 already were,
-   driven by hand via `lightning-cli` rather than `lnpoc.py` subcommands.
+   driven by hand via `lightning-cli` rather than `../lnpoc.py` subcommands.
 
 ## Verification
 
 - All of the above (pre-redesign) was exercised against a live
-  `contrib/liquid-poc` environment (`./lnpoc.py start`), using `lnpoc.py`'s
+  `..` environment (`./lnpoc.py start`), using `lnpoc.py`'s
   own `swap-provider`/`swap-payer`/`assetinvoice`/`payassetinvoice`/
   `swap`/`swap-demo` subcommands — the plugin itself needs no separate
   build or load step (see Files, below); these subcommands only ever
@@ -791,13 +791,13 @@ this as more than a design sketch again.
   verified only by `cargo check`/`cargo clippy` against the
   `assetswap-plugin` crate, not by a live swap. Re-running
   implementation-sequence steps 2, 4, 5, 7 and 8 against a live
-  `contrib/liquid-poc` stack is the natural next step.
+  `..` stack is the natural next step.
 - **Still to do**: wire up `tests/test_assetswap.py` so this is automated
-  rather than driven via `lnpoc.py` — it needs this fork's own built
+  rather than driven via `../lnpoc.py` — it needs this fork's own built
   `lightningd` and the `pyln` packages installed (`contrib/pyln-client`,
   `contrib/pyln-testing`), neither of which is set up in a fresh checkout.
   (It currently only covers steps 1-2, which the redesign didn't touch.)
-- Confirm no diffs outside `plugins/assetswap-plugin/`, the root
+- Confirm no diffs outside `../../../plugins/assetswap-plugin`, the root
   `Cargo.toml`'s `members` line, `tests/test_assetswap.py`, and
   `contrib/liquid-poc/{Dockerfile,docker-compose.yml,lnpoc.py,lqui.py}` —
   the last four are this PoC's own test harness, not core, so they don't
@@ -820,7 +820,7 @@ this as more than a design sketch again.
   `htlc_accepted` hook's price floor (§3 — no longer a "recheck" against
   an earlier quote, just the one live check that exists) is
   permanently satisfied by construction. Wiring up
-  `plugins/currencyrate-plugin`'s `currencyconvert` RPC as a genuine
+  `../../../plugins/currencyrate-plugin`'s `currencyconvert` RPC as a genuine
   oracle (an `--assetswap-price-source=oracle` option) is the natural next
   step to make this protection real; until then the tiers only differ in
   margin, not in actual risk covered.
@@ -829,7 +829,7 @@ this as more than a design sketch again.
   restart, and a replayed leg-1 HTLC can arrive before a
   dynamically-started plugin reloads, so the idempotency logic in §7
   never gets a chance to run and the provider can be left out of pocket
-  (paid leg 2, never reimbursed on leg 1). `contrib/liquid-poc` closes
+  (paid leg 2, never reimbursed on leg 1). `..` closes
   this structurally (built into the image, `--plugin=` on every node's
   command line — see Files), but it's still worth stating as a hard
   requirement for any other deployment: a `plugin=` line in `config`, not
