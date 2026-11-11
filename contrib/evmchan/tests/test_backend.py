@@ -581,6 +581,26 @@ def test_deposit_withdraw_status(chain, backend):
     assert backend.exitaddr(backend.address)['address'].startswith('bcrt1s')
 
 
+def test_txinfo_finds_the_evm_tx(chain, backend):
+    """evm-txinfo: an indexed tx's height, EVM block and the EVM tx that
+    applied it, read once with eth_getLogs and then remembered."""
+    rc = chain.deposit(A.p2wpkh, 100_000)
+    backend.ix.sync()
+    topic0 = '0x' + evm.keccak256(b'TxApplied(uint32,bytes32,bytes)').hex()
+    log = [x for x in rc['logs'] if x['topics'][0] == topic0][0]
+    txid = btc.display(evm.unhex(log['topics'][2]))
+    info = backend.txinfo(txid.upper())
+    assert info['txid'] == txid and info['evm_tx'] == rc['transactionHash']
+    assert info['evm_block'] == int(rc['blockNumber'], 16) and info['evm_block_hash'] == rc['blockHash']
+    assert info['height'] == int(log['topics'][1], 16) and info['contract'] == backend.contract
+    logs = backend.rpc.calls['eth_getLogs']
+    assert backend.txinfo(txid) == info and backend.rpc.calls['eth_getLogs'] == logs
+    with pytest.raises(eb.UserError, match='64 hex digits'):
+        backend.txinfo('zz')
+    with pytest.raises(eb.UserError, match='not in the index'):
+        backend.txinfo('00' * 32)
+
+
 # ------------------------------------------------------------ hooks
 
 GOOD_CONFIGS = {'watchtime-blocks': {'value_int': 40}, 'cltv-delta': {'value_int': 40},
@@ -880,6 +900,7 @@ def test_option_check_refuses_opens_and_logs_broken(tmp_path):
 
 class FakeIx:
     chain_id = 31337
+    bad_witnesses = []
 
     def __init__(self):
         self.lag_v, self.tag, self.wall = 1, (100, '0x00', 0), 0
@@ -937,6 +958,9 @@ def test_alarms(tmp_path):
     assert 'sync' not in b.check_alarms(t + 30)
     assert 'sync' in b.check_alarms(t + 35)
     assert any('eth_getLogs: URLError' in m for m in log.at('broken'))
+    # A served tx whose witness the provider altered (SPEC 5.2): an alarm naming it.
+    b.ix.bad_witnesses = ['ab' * 32]
+    assert 'last ' + 'ab' * 32 in b.check_alarms(t + 36)['witness']
 
 
 # ------------------------------------------------------------ options, keys and secrets (5.1, 5.2)

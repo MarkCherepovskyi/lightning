@@ -814,7 +814,9 @@ static enum channel_add_err add_htlc(struct channel *channel,
 		 * of 330 sats from the funder (either `to_local` or
 		 * `to_remote`).
 		 */
+		/* (An asset channel's anchors come from its fee reserve.) */
 		if ((option_anchor_outputs || option_anchors_zero_fee_htlc_tx)
+		    && !channel->asset
 		    && channel->opener == sender
 		    && !amount_msat_deduct_sat(&remainder, AMOUNT_SAT(660)))
 			return CHANNEL_ERR_CHANNEL_CAPACITY_EXCEEDED;
@@ -847,6 +849,7 @@ static enum channel_add_err add_htlc(struct channel *channel,
 				return CHANNEL_ERR_CHANNEL_CAPACITY_EXCEEDED;
 
 			if ((option_anchor_outputs || option_anchors_zero_fee_htlc_tx)
+			    && !channel->asset
 			    && channel->opener != sender
 			    && !amount_msat_deduct_sat(&remainder, AMOUNT_SAT(660)))
 				return CHANNEL_ERR_CHANNEL_CAPACITY_EXCEEDED;
@@ -1300,6 +1303,7 @@ u32 approx_max_feerate(const struct channel *channel)
 	 * `to_remote`).
 	 */
 	if ((option_anchor_outputs || option_anchors_zero_fee_htlc_tx)
+	    && !channel->asset
 	    && !amount_msat_deduct_sat(&avail, AMOUNT_SAT(660))) {
 		avail = AMOUNT_MSAT(0);
 	} else {
@@ -1384,6 +1388,7 @@ bool can_opener_afford_feerate(const struct channel *channel, u32 feerate_per_kw
 	 * `to_remote`).
 	 */
 	if ((option_anchor_outputs || option_anchors_zero_fee_htlc_tx)
+	    && !channel->asset
 	    && !amount_sat_add(&fee, fee, AMOUNT_SAT(660)))
 		status_failed(STATUS_FAIL_INTERNAL_ERROR,
 			      "Cannot add 660 sats to %s for anchor",

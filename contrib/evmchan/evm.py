@@ -312,6 +312,9 @@ def decode_log(log, event_signature, indexed_types, data_types):
 
 # --- JSON-RPC ---
 
+# The largest JSON-RPC reply read: a provider can't make the plugin hold more.
+# 10,000 logs (eth_getLogs' result cap) of a 1 kB tx each are about 25 MB of hex.
+MAX_REPLY = 64 * 1024 * 1024
 LOGS_CHUNK = 10000  # SPEC 5.2: eth_getLogs ranges start at 10,000 blocks (Infura's cap)
 SPARSE_LOGS = 1000  # a range with fewer logs than this lets the next one grow back
 
@@ -354,6 +357,19 @@ def classify(message, code=None, http_status=None):
     if code == -32005 and not too_many:
         rate = True
     return too_many, rate
+
+
+def error_kind(e):
+    """A transport error's type, and its cause's type and errno, without any
+    message text (urllib's can hold the URL, and so the API key):
+    'URLError(gaierror 8)' for a failed DNS lookup, 'URLError(TimeoutError)',
+    'URLError(ConnectionRefusedError 61)', 'TimeoutError'."""
+    kind = type(e).__name__
+    reason = getattr(e, 'reason', None)
+    if isinstance(reason, BaseException):
+        errno = getattr(reason, 'errno', None)
+        kind += '({}{})'.format(type(reason).__name__, ' {}'.format(errno) if isinstance(errno, int) else '')
+    return kind
 
 
 class EvmError(Exception):
@@ -407,11 +423,11 @@ class EvmRpc:
         try:
             with urllib.request.urlopen(urllib.request.Request(
                     self.url, req, {'Content-Type': 'application/json'}), timeout=self.timeout) as r:
-                body = r.read()
+                body = r.read(MAX_REPLY + 1)
         except urllib.error.HTTPError as e:
             status = e.code
             try:
-                body = e.read()
+                body = e.read(MAX_REPLY + 1)
             except Exception:
                 body = b''
             finally:
@@ -419,12 +435,14 @@ class EvmRpc:
         except Exception as e:
             # Never str(e): urllib puts the URL (and so the API key) in some of
             # its messages ("unknown url type: ...").
-            raise EvmError('{}: {}'.format(method, type(e).__name__)) from None
+            raise EvmError('{}: {}'.format(method, error_kind(e))) from None
+        if len(body) > MAX_REPLY:
+            raise EvmError('{}: reply over {} bytes'.format(method, MAX_REPLY))
         try:
             resp = json.loads(body.decode())
             if not isinstance(resp, dict):
                 raise ValueError
-        except ValueError:
+        except (ValueError, RecursionError):      # RecursionError: absurdly nested JSON
             too_many, rate = classify('', None, status)
             raise EvmError('{}: bad reply (HTTP {})'.format(method, status or 200),
                            too_many=too_many, rate_limited=rate) from None

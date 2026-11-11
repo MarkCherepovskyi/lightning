@@ -5,6 +5,8 @@
 #include <bitcoin/tx.h>
 #include <ccan/htable/htable_type.h>
 
+struct channel_asset;
+
 struct block;
 struct channel;
 struct chain_topology;
@@ -113,7 +115,7 @@ bool watch_scriptpubkey_(const tal_t *ctx,
 			 const u8 *scriptpubkey TAKES,
 			 const struct bitcoin_outpoint *expected_outpoint,
 			 struct amount_sat expected_amount,
-			 const u8 *expected_asset,
+			 const struct channel_asset *expected_asset,
 			 void (*cb)(struct lightningd *ld,
 				    const struct bitcoin_tx *tx,
 				    u32 outnum,

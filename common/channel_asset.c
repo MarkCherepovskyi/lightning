@@ -130,9 +130,10 @@ void channel_asset_finish_tx(struct bitcoin_tx *tx,
 	if (amount_sat_is_zero(leftover))
 		return;
 
-	/* The opener's balance never drops below the channel reserve, which
-	 * is above the dust limit, so its output is there; the other side's
-	 * may be trimmed. */
+	/* One direct output is always there: each side keeps its channel
+	 * reserve (at least the dust limit) once it has reached it, the
+	 * opener's balance is not cut for anchors (the fee reserve pays
+	 * them), and at open the two balances add up to the funding. */
 	outnum = opener_outnum >= 0 ? opener_outnum : other_outnum;
 	assert(outnum >= 0);
 	amt = bitcoin_tx_output_get_amount(tx, outnum);

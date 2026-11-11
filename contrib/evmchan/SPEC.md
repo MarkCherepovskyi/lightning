@@ -626,7 +626,22 @@ lightningd waits on the backend plugin at startup, as it does with bcli.
     later poll counts as a stale backend.
 - **Secrets:** errors and logs MUST NOT contain the RPC URL or any part of a
   response body. Only the method name and the error's type and code are
-  allowed.
+  allowed; for a transport error, also its cause's type and errno
+  (`URLError(gaierror 8)`), never its message.
+- **What the provider is trusted for.** Checkpoints prove the order and
+  completeness of (height, txid), against the contract's `txCount` and
+  `logHash` read from the same provider: they catch dropped, reordered and
+  reorged logs, not a provider that lies about everything (for that, run your
+  own node). Two more limits:
+  - A reply over 64 MiB, or JSON nested past Python's recursion limit, is an
+    error like any other bad reply, never a crash.
+  - Witnesses are in no txid and not in `logHash`, so a provider could alter
+    one (strip an HTLC preimage) unnoticed by the checkpoints. Every live tx
+    that spends outputs in the index is checked with `reference/pyref.py`
+    against them at its height. One that fails was altered on the way, since
+    the contract validated it: the plugin logs it at BROKEN level and raises
+    the `witness` alarm (switch `evm-rpc` and rebuild the index). It still
+    serves the row: hiding a spend the contract applied would be worse.
 - **Our own submits:** after a successful submit the plugin MUST add the
   receipt's `TxApplied` log to the index at once, before the next poll, marked
   with its EVM block. It replaces an existing row only if the receipt's block
@@ -814,6 +829,12 @@ treats that as fatal.
   - It reads in a SQLite read transaction of its own, so polling goes on.
   - `python3 evmindex.py <index file> [out]` does the same without
     lightningd.
+- **`evm-txinfo txid`:** where an indexed virtual-chain tx is on the EVM chain,
+  for an explorer link: its height, EVM block (number and hash), log index and
+  `evm_tx`, the EVM tx whose `TxApplied` log carried it. `evm_tx` is read with
+  one `eth_getLogs` of that block by hash (topic txid) the first time, then
+  remembered per block hash, so a reorg reads it again. A tx not at the
+  confirmation tag yet is an error.
 - **`evm-status [cached]`:** contract, chain id, the node's ETH address and
   balance, its `withdrawable`, tip, current height, lag `L`, the tag's age,
   pending sends. In token mode also the token, `UNITS_PER_SAT` and the key's

@@ -164,6 +164,12 @@ tr.dim td { opacity: .55; }
 .btn.ghost:hover:not(:disabled) { background: var(--accent); color: var(--on-accent); }
 .link { background: none; border: 0; color: var(--muted); cursor: pointer; padding: 0; font-size: 12px; }
 .link:hover { color: var(--accent-hi); }
+.addr { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 8px; font-size: 12px; color: var(--muted); }
+.addr > span:first-child { min-width: 76px; }
+a.ext { color: var(--accent-hi); text-decoration: none; white-space: nowrap; }
+td .addr { flex-wrap: nowrap; white-space: nowrap; }
+td .addr > span:first-child { min-width: 0; color: var(--dim); }
+a.ext:hover, a.ext:focus-visible { text-decoration: underline; }
 
 .tabs { display: flex; border-bottom: 1px solid var(--line); overflow-x: auto; }
 .tabs button { flex: 1; background: none; border: 0; border-bottom: 2px solid transparent; padding: 12px 8px; cursor: pointer; color: var(--muted);
@@ -172,7 +178,20 @@ tr.dim td { opacity: .55; }
 .tabs button:hover { color: var(--fg); }
 .tabs button[hidden] { display: none; }
 [role=tabpanel][hidden] { display: none; }
-form { display: flex; flex-direction: column; gap: 14px; padding: 16px; }
+form { display: flex; flex-direction: column; gap: 14px; padding: 16px; position: relative; }
+.qi { display: inline-grid; place-items: center; width: 18px; height: 18px; flex: none; padding: 0; border-radius: 50%;
+  border: 1px solid var(--line); background: var(--raised); color: var(--muted); font: 600 11px/1 Inter, sans-serif;
+  cursor: help; vertical-align: middle; }
+.qi:hover, .qi:focus-visible, .qi[aria-expanded="true"] { color: var(--on-accent); background: var(--accent-hi); border-color: var(--accent-hi); outline: none; }
+.qi[hidden] { display: none; }
+form > .qi { position: absolute; top: 14px; right: 16px; }
+.hgroup { display: flex; align-items: center; gap: 8px; }
+.tipsrc { display: none !important; }
+#tip { position: fixed; z-index: 60; max-width: min(340px, calc(100vw - 16px)); max-height: calc(100vh - 16px); overflow: auto; padding: 10px 12px; background: var(--panel);
+  border: 1px solid var(--line); box-shadow: 0 8px 24px rgba(0, 0, 0, .45); color: var(--muted); font-size: 12px; line-height: 1.5; }
+#tip p { margin: 0; } #tip p + p { margin-top: 8px; } #tip .warn { color: var(--warn); }
+#tip ol { margin: 0; padding-left: 18px; display: grid; gap: 6px; }
+#tip b { color: var(--fg); }
 form + form { border-top: 1px solid var(--line); }
 form h3 { font-size: 14px; letter-spacing: .04em; color: var(--muted); }
 .row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
@@ -187,6 +206,7 @@ input:disabled { opacity: .5; }
 label.check { flex-direction: row; align-items: center; gap: 8px; font-size: 13px; }
 input[type=checkbox], input[type=radio] { accent-color: var(--accent); width: 16px; height: 16px; margin: 0; }
 .hint { color: var(--dim); font-size: 12px; margin: 0; }
+.tiprow { display: flex; align-items: center; gap: 8px; margin: 0; padding: 12px 16px; border-top: 1px solid var(--line); color: var(--muted); font-size: 12px; }
 .warnbox { border: 1px solid var(--warn); color: var(--warn); padding: 8px 10px; font-size: 12px; margin: 0; }
 .none { padding: 20px 16px; color: var(--muted); }
 
@@ -244,7 +264,7 @@ pre.log { margin: 12px 0 0; padding: 12px 16px; background: var(--bg); border-to
     </section>
 
     <section class="panel" aria-labelledby="h-evm" id="evm-panel" hidden>
-      <header><h2 id="h-evm">EVM status</h2><span class="hint">Credits priced as Infura's; the free tier is 3M a day.</span></header>
+      <header><span class="hgroup"><h2 id="h-evm">EVM status</h2><button class="qi" type="button" aria-label="About EVM status" aria-expanded="false" data-tip="Each EVM node's plugin: its contract, ETH key and balances, how far its index is behind the chain, and its Infura use, priced in Infura's credits (the free tier is 3M a day).">?</button></span></header>
       <div class="evms" id="evms"></div>
     </section>
 
@@ -257,7 +277,7 @@ pre.log { margin: 12px 0 0; padding: 12px 16px; background: var(--bg); border-to
     </section>
 
     <section class="panel" aria-labelledby="h-sweeps" id="sweeps-panel" hidden>
-      <header><h2 id="h-sweeps">Asset sweeps</h2><span class="hint">assetchan-sweeps: asset outputs after a unilateral close</span></header>
+      <header><span class="hgroup"><h2 id="h-sweeps">Asset sweeps</h2><button class="qi" type="button" aria-label="About asset sweeps" aria-expanded="false" data-tip="assetchan-sweeps: the asset outputs a node sweeps after a unilateral close, from when they can be spent until their deadline.">?</button></span></header>
       <div class="tablewrap"><table>
         <thead><tr><th>Node</th><th>Outpoint</th><th>Asset</th><th>From block</th><th>Deadline</th><th>Sweep tx</th></tr></thead>
         <tbody id="sweeps"></tbody>
@@ -285,7 +305,10 @@ pre.log { margin: 12px 0 0; padding: 12px 16px; background: var(--bg); border-to
           </div>
           <label id="open-asset-l">Asset<select name="asset" id="open-asset"></select></label>
           <label><span id="open-unit">Amount (sat)</span><input name="amount" type="number" min="1" step="1" value="100000" required></label>
-          <label class="check"><input name="announce" type="checkbox"> Announce to the network</label>
+          <label class="check"><input name="announce" type="checkbox" checked> Announce to the network</label>
+          <p class="hint">Announced: after 6 confirmations every node learns it through gossip and can route through it.
+            Private: only these two nodes know it, so other payers can use it only as the last hop of an invoice;
+            routes of 3 hops or more need announced channels.</p>
           <p class="hint" id="open-hint"></p>
           <button class="btn" type="submit">Open channel</button>
         </form>
@@ -322,6 +345,9 @@ pre.log { margin: 12px 0 0; padding: 12px 16px; background: var(--bg); border-to
         <form data-action="close">
           <label>Channel<select name="chan" id="close-chan"></select></label>
           <label class="check"><input name="force" type="checkbox" id="close-force"> Peer is offline (force close)</label>
+          <p class="hint">After a close, each side's share goes to its node's wallet: watch Wallet on the node card.
+            A cooperative close pays both sides as soon as the closing tx confirms. A force close pays the
+            peer at once and the closing node after the to_self_delay (24 h on public chains).</p>
           <p class="warnbox" id="close-warn" hidden>Force close makes the node fail the channel and broadcast its commitment; each side then sweeps its outputs as the timelocks pass. Where the page can mine, it mines those blocks.</p>
           <button class="btn" type="submit">Close channel</button>
         </form>
@@ -385,6 +411,30 @@ pre.log { margin: 12px 0 0; padding: 12px 16px; background: var(--bg); border-to
           <p class="hint" id="wd-hint">evm-withdraw: pays the node's ETH address what the contract holds for it.</p>
           <button class="btn" type="submit">Withdraw</button>
         </form>
+        <form data-action="cashout">
+          <h3>Cash out</h3>
+          <label>Node<select name="node" id="co-node"></select></label>
+          <p class="hint">Exit everything in the wallet, wait until the contract credits it, then Withdraw. The log shows the ETH balance before and after.</p>
+          <button class="btn" type="submit">Cash out to ETH</button>
+        </form>
+        <p class="tiprow">Did the money arrive? <button class="qi" type="button" aria-label="How to check you really got the money" aria-expanded="false" data-src="#money-tips">?</button></p>
+        <div id="money-tips" class="tipsrc"><ol>
+            <li><b>In a channel</b>: the Channels table splits the capacity (left: the first node). After a payment the
+              Activity log shows the route and who forwarded it.</li>
+            <li><b>After a close</b>: the close's log gives your share and the wallet before and after. The node card's
+              <i>Wallet</i> grows when the closing tx is at the <span class="mono">safe</span> block (a few minutes).
+              After a force close the closing node waits the to_self_delay (24 h here); the channel's state column
+              shows onchaind's countdown.</li>
+            <li><b>Exit</b>: the wallet's sat leave Lightning and the card's <i>Withdrawable</i> grows by the same
+              amount (in ETH). CLN keeps 25,000 sat back while it still knows anchor channels.</li>
+            <li><b>Withdraw</b>: the contract pays the ETH address. The log shows the ETH balance before and after,
+              and <i>Gas</i> on the card goes up.</li>
+            <li><b>On the explorer</b>: the ETH address link on the card opens Blockscout: the withdraw shows as a
+              transaction to UtxoChain with an internal transfer to the address. Funding and closing txs link from
+              the channel rows and the logs.</li>
+            <li><b>The sum</b>: gas balance + withdrawable + wallet + channel shares stays what you deposited, less
+              the EVM gas and the Lightning fees paid.</li>
+          </ol></div>
       </div>
 
       <div role="tabpanel" id="p-mine" aria-labelledby="t-mine" hidden>
@@ -400,13 +450,14 @@ pre.log { margin: 12px 0 0; padding: 12px 16px; background: var(--bg); border-to
     </section>
 
     <section class="panel job" aria-labelledby="h-job">
-      <header><h2 id="h-job">Activity</h2><span id="job-state" aria-live="polite"></span></header>
+      <header><span class="hgroup"><h2 id="h-job">Activity</h2><button class="qi" type="button" aria-label="About Activity" aria-expanded="false" data-tip="Every action you start shows here with its log: the route of a payment, where a closed channel's money went, the ETH balance before and after a withdraw. Actions on different networks run side by side; on one network they wait their turn.">?</button></span><span id="job-state" aria-live="polite"></span></header>
       <div id="job"></div>
       <ul class="history" id="history" aria-label="Earlier actions"></ul>
     </section>
   </aside>
 </main>
 <div id="toast" role="status" hidden></div>
+<div id="tip" role="tooltip" hidden></div>
 
 <script>
 const $ = s => document.querySelector(s);
@@ -421,6 +472,17 @@ try { sel = localStorage.getItem('nodeui-net') || 'all'; } catch (e) {}
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]));
 const n = x => Number(x).toLocaleString('en-US');
 const shortAddr = a => a && a.length > 12 ? a.slice(0, 6) + '…' + a.slice(-4) : (a || '');
+/* A ? icon whose tip is `text` (shown on hover, focus or click). */
+const qi = (text, label) => `<button class="qi" type="button" aria-label="${esc(label || 'More')}" aria-expanded="false" data-tip="${esc(text)}">?</button>`;
+/* A value linked to its block explorer (when the server gave a path on the
+   network's explorer), with a copy button. */
+const ext = (value, path, net, text) => {
+  const base = path && S.explorers ? S.explorers[net] : null, url = base ? base + path : null;
+  return (url
+  ? `<a class="ext mono" href="${esc(url)}" target="_blank" rel="noopener noreferrer" title="Open ${esc(value)} in the explorer">${esc(text || shortAddr(value))}&nbsp;↗</a>`
+  : `<span class="mono" title="${esc(value)}">${esc(text || shortAddr(value))}</span>`)
+  + ` <button class="link" type="button" data-copy="${esc(value)}" title="Copy ${esc(value)}" aria-label="Copy ${esc(value)}">copy</button>`;
+};
 const ago = s => s == null ? '–' : s >= 3600 ? `${(s / 3600).toFixed(1)} h` : s >= 60 ? `${Math.round(s / 60)} min` : `${Math.round(s)} s`;
 const assetLabel = a => !a || a === 'lbtc' ? 'L-BTC' : (S.assets[a] || a.slice(0, 8));
 function color(label, kind) {
@@ -456,6 +518,14 @@ async function refresh() {
   try {
     const r = await fetch(demo ? 'demo.json' : 'api/state', {cache: 'no-store', headers: demo ? {} : {'X-NodeUI-Token': TOKEN}});
     if (r.status === 503) { $('#chain').innerHTML = '<span class="dot warn"></span><span>Reading the nodes…</span>'; return; }
+    if (r.status === 403) {
+      /* The server restarted, so this page's token is from its last run: reload once for the new one. */
+      let last = 0;
+      try { last = Number(sessionStorage.getItem('nodeui-reload')) || 0; sessionStorage.setItem('nodeui-reload', Date.now()); } catch (e) {}
+      if (Date.now() - last > 30000) { location.reload(); return; }
+      $('#chain').innerHTML = '<span class="dot bad"></span><span>The page server restarted: reload the page</span>';
+      return;
+    }
     if (!r.ok) throw new Error(r.status);
     S = await r.json();
     render();
@@ -474,9 +544,7 @@ async function post(path, body) {
 async function act(body) {
   if (demo) { toast('Demo data: nothing was sent.'); return; }
   try {
-    const r = await fetch('api/job', {method: 'POST', headers: {'Content-Type': 'application/json', 'X-NodeUI-Token': TOKEN}, body: JSON.stringify(body)});
-    const j = await r.json();
-    if (!r.ok) throw new Error(j.error || r.status);
+    const j = await post('api/job', body);
     if (j.status === 'waiting') toast('Queued: it starts when the action before it on this network ends.');
     refresh();
   } catch (e) { toast(e.message, true); }
@@ -493,7 +561,7 @@ const nodeBy = name => S.nodes.find(x => x.name === name);
 function render() {
   if (sel !== 'all' && !netOf(sel)) sel = 'all';
   renderChain(); renderNets(); renderAlerts(); renderMaps(); renderNodes(); renderEvm(); renderChannels(); renderSweeps();
-  renderForms(); renderJobs();
+  renderForms(); syncTips(); renderJobs();
 }
 
 function renderChain() {
@@ -586,8 +654,7 @@ function renderNodes() {
         <button class="id mono" type="button" data-copy="${esc(nd.id)}" title="Copy node id" aria-label="Copy node id of ${esc(nd.name)}">${nd.id ? esc(nd.id.slice(0, 10)) + '…' : ''}</button></div>
       <div>${badge(nd.net, nd.kind)}</div>`;
     if (!nd.ok) return `<div class="node">${top}<div class="down">Down: ${esc(nd.error || 'not reachable')}</div></div>`;
-    let rows = `<div class="bal"><span>Wallet (${esc(nd.wallet.unit)})</span><b>${n(nd.wallet.confirmed)}${nd.wallet.unconfirmed ? ` <span class="sub">+${n(nd.wallet.unconfirmed)} unconfirmed</span>` : ''}</b></div>`;
-    if (nd.wallet.reserve_hint) rows += `<div class="sub" title="listconfigs min-emergency-msat">${esc(nd.wallet.reserve_hint)}.</div>`;
+    let rows = `<div class="bal"><span class="hgroup">Wallet (${esc(nd.wallet.unit)})${nd.wallet.reserve_hint ? qi(nd.wallet.reserve_hint + '.', 'About the wallet reserve') : ''}</span><b>${n(nd.wallet.confirmed)}${nd.wallet.unconfirmed ? ` <span class="sub">+${n(nd.wallet.unconfirmed)} unconfirmed</span>` : ''}</b></div>`;
     (nd.deposits || []).forEach(d => {
       rows += `<div class="progress" title="${esc(d.txid)}">Deposit of ${n(d.sat)} sat: ${d.in_wallet ? 'in the wallet, unconfirmed'
         : `mined on the EVM chain; CLN at block ${n(nd.blockheight)} of ${n(d.height)}${d.height > nd.blockheight ? ` (${n(d.height - nd.blockheight)} to go)` : ''}`}</div>`;
@@ -603,6 +670,8 @@ function renderNodes() {
       if (e.token) rows += `<div class="bal"><span>${esc(e.token_label || 'Token')}</span><b>${esc(e.token_balance_text || '–')}</b></div>`;
       rows += `<div class="bal"><span>Withdrawable</span><b title="${esc(e.withdrawable_title || '')}">${esc(e.withdrawable_text || '–')}</b></div>`;
     }
+    rows += (nd.links || []).map(l => `<div class="addr"><span>${esc(l.label)}</span>${ext(l.value, l.path, nd.net)}${l.sat != null ? ` <span class="sub">${n(l.sat)} sat</span>` : ''}</div>`).join('');
+    if (nd.links_more) rows += `<div class="sub">+${n(nd.links_more)} more wallet addresses</div>`;
     const peers = nd.peers.filter(p => p.connected).map(p => p.name).join(', ') || 'none';
     return `<div class="node">${top}${rows}
       <div class="peers">Block ${n(nd.blockheight)}${nd.mining ? ' · page mines here' : ''} · connected to ${esc(peers)}</div></div>`;
@@ -621,14 +690,15 @@ function renderEvm() {
     const pend = (e.pending_sends || []).map(p => `${esc(p.kind)} ${esc(shortAddr(p.txid || ''))} nonce ${esc(p.nonce)} · ${ago(p.age_s)}${p.replacements ? ' · ' + esc(p.replacements) + ' bumps' : ''}`).join('<br>') || 'none';
     const dd = (k, v, cls) => `<dt>${k}</dt><dd${cls ? ` class="${cls}"` : ''}>${v}</dd>`;
     const wait = e.refresh_wait_s || 0;
+    const link = label => ((nd.links || []).find(l => l.label === label) || {}).path;
     const read = e.anvil ? 'every ' + ago(e.poll_every_s) : `read ${ago(e.read_age_s)} ago${e.cached ? ' (cached balances)' : ''}, every ${ago(e.poll_every_s)}`;
     return `<div class="evm">
       <div class="top" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap"><h3>${esc(nd.name)}</h3>${badge(nd.net, 'evm')}
         <span class="hint" style="margin-left:auto">${esc(read)}</span><button class="btn ghost" type="button" data-refresh="${esc(nd.name)}" ${wait ? `disabled title="Again in ${wait} s"` : 'title="One fresh evm-status read (an eth_getBalance and an eth_call)"'}>Refresh</button></div>
       <dl>
-        ${dd('Contract', `<span title="${esc(e.contract)}">${esc(shortAddr(e.contract))}</span> · chain ${esc(e.chain_id)}`)}
+        ${dd('Contract', `${ext(e.contract, link('Contract'), nd.net)} · chain ${esc(e.chain_id)}`)}
         ${dd('Asset', asset)}
-        ${dd('ETH address', `<button class="link mono" type="button" data-copy="${esc(e.eth_address)}" title="Copy">${esc(e.eth_address)}</button>`)}
+        ${dd('ETH address', ext(e.eth_address, link('ETH address'), nd.net, e.eth_address))}
         ${dd('Gas balance', `<span title="${esc(e.gas_title || '')}">${esc(e.gas_text || '–')}</span>` + (e.low_gas ? ` · below evm-min-balance ${esc(e.min_balance_text)}` : ''), e.low_gas ? 'warn' : '')}
         ${e.token ? dd('Token balance', esc(e.token_balance_text || '–')) : ''}
         ${dd('Withdrawable', `<span title="${esc(e.withdrawable_title || '')}">${esc(e.withdrawable_text || '–')}</span>`)}
@@ -658,9 +728,9 @@ function renderChannels() {
     const total = c.a_units + c.b_units, pct = total ? c.a_units / total * 100 : 0;
     const closable = !['closed', 'onchain'].includes(c.state) && (nodeBy(c.a) || {}).ok;
     return `<tr class="${c.state === 'closed' ? 'dim' : ''}">
-      <td><span class="pair">${esc(c.a)}<span aria-hidden="true">⇄</span><span class="sr"> and </span>${esc(c.b)}</span>${c.scid ? `<div class="mono" style="color:var(--dim)">${esc(c.scid)}</div>` : ''}</td>
+      <td><span class="pair">${esc(c.a)}<span aria-hidden="true">⇄</span><span class="sr"> and </span>${esc(c.b)}</span>${c.scid ? `<div class="mono" style="color:var(--dim)">${esc(c.scid)}</div>` : ''}${c.funding ? `<div class="addr" title="${esc(c.funding.title)}"><span>funding</span>${ext(c.funding.txid, c.funding.path, c.node_net)}${c.kind === 'evm' && !c.funding.path ? ' <span class="sub">EVM tx not known yet</span>' : ''}</div>` : ''}</td>
       <td>${badge(c.net, c.kind)}</td>
-      <td><span class="pill ${esc(c.state)}">${STATES[c.state] || esc(c.state)}</span>${c.confirm ? `<span class="confirm">${c.confirm.depth ? `confirming ${Math.min(c.confirm.depth, c.confirm.need)}/${c.confirm.need}` : 'funding tx not in a block yet'}</span>` : ''}<span class="raw" title="${esc(c.status)}">${esc(c.raw_state)}${c.status ? ' · ' + esc(c.status) : ''}</span></td>
+      <td><span class="hgroup"><span class="pill ${esc(c.state)}">${STATES[c.state] || esc(c.state)}</span>${qi(c.raw_state + (c.status ? ' · ' + c.status : ''), 'CLN state of ' + c.a + ' and ' + c.b)}</span>${c.confirm ? `<span class="confirm">${c.confirm.depth ? `confirming ${Math.min(c.confirm.depth, c.confirm.need)}/${c.confirm.need}` : 'funding tx not in a block yet'}</span>` : ''}</td>
       <td><div class="split" style="--c:${color(c.asset_label, c.kind)}"><div class="barline"><i style="width:${pct}%"></i></div>
         <div class="nums num"><span>${n(c.a_units)}</span><span>${n(c.b_units)} ${esc(c.unit)}</span></div></div></td>
       <td>${closable ? `<button class="btn ghost" type="button" data-close="${esc(c.id)}" aria-label="Close channel ${esc(c.a)} to ${esc(c.b)}">Close…</button>` : ''}</td>
@@ -772,7 +842,7 @@ function renderForms() {
 
   // EVM
   const evms = up.filter(x => x.kind === 'evm').map(nodeOpt);
-  ['#dep-node', '#exit-node', '#wd-node'].forEach(s => fill(s, evms, 'no EVM node is up'));
+  ['#dep-node', '#exit-node', '#wd-node', '#co-node'].forEach(s => fill(s, evms, 'no EVM node is up'));
   $('#exit-amount').disabled = $('#exit-all').checked;
   const wn = nodeBy($('#wd-node').value);
   $('#wd-hint').textContent = 'evm-withdraw: pays the node\'s ETH address what the contract holds for it'
@@ -802,6 +872,15 @@ function jobResult(j) {
   return Object.entries(j.result || {}).filter(([k]) => k === 'bolt11' || k === 'address')
     .map(([k, v]) => `<button class="btn ghost" type="button" data-copy="${esc(v)}" data-what="${k === 'bolt11' ? 'Invoice' : 'Address'}">Copy ${k === 'bolt11' ? 'invoice' : 'address'}</button>`).join('');
 }
+/* A job log, its tx hashes linked to the network's explorer: 0x hashes on an
+   EVM chain (EVM txs), and hashes after "tx"/"txid" elsewhere. */
+function logHtml(j) {
+  const text = esc(j.log.join('\n') || '–'), base = S.explorers ? S.explorers[(j.net || '').split('/')[0]] : null;
+  if (!base) return text;
+  const a = h => `<a class="ext" href="${esc(base + '/tx/' + h)}" target="_blank" rel="noopener noreferrer">${h}</a>`;
+  return (j.net || '').startsWith('evm:') ? text.replace(/\b0x[0-9a-fA-F]{64}\b/g, a)
+    : text.replace(/\b(txid|tx) ([0-9a-f]{64})\b/g, (m, w, h) => `${w} ${a(h)}`);
+}
 function jobCard(j) {
   const now = Date.now() / 1000, net = netOf(j.net), res = jobResult(j);
   const time = j.status === 'waiting' ? `Waiting ${fmtTime(Math.max(0, now - j.queued))} for ${(j.waiting_for || []).join('; ') || 'its turn'}`
@@ -810,14 +889,14 @@ function jobCard(j) {
       <button class="btn ghost" type="button" data-cancel="${j.id}" ${j.cancelling ? 'disabled' : ''} aria-label="Cancel: ${esc(j.title)}">${j.cancelling ? 'Cancelling…' : 'Cancel'}</button></span></div>
     <div class="meta">${j.net ? badge(j.net) : ''}<span>${esc(time)}</span></div>
     ${res ? `<div class="result">${res}</div>` : ''}
-    ${j.status === 'running' ? `<pre class="log" data-job="${j.id}">${esc(j.log.join('\n') || 'Starting…')}</pre>` : ''}</div>`;
+    ${j.status === 'running' ? `<pre class="log" data-job="${j.id}">${j.log.length ? logHtml(j) : 'Starting…'}</pre>` : ''}</div>`;
 }
 function renderJobs() {
   const active = S.jobs || [], hist = S.history || [];
   const running = active.filter(j => j.status === 'running').length, waiting = active.length - running;
   put('#job-state', active.length ? `<span class="pill running pulse">${running} running${waiting ? ` · ${waiting} waiting` : ''}</span>` : '');
   put('#job', active.length ? active.map(jobCard).join('')
-    : hist.length ? '' : '<div class="empty">Actions you start appear here with their log. Actions on different networks run side by side.</div>');
+    : hist.length ? '' : '<div class="empty">No actions yet.</div>');
   $$('#job pre.log').forEach(l => l.scrollTop = l.scrollHeight);
   /* Finished: the newest one's log is open unless the user closed it; the rest closed unless opened. */
   put('#history', hist.map((h, i) => {
@@ -826,7 +905,7 @@ function renderJobs() {
     return `<li><details data-hist="${h.id}"${open ? ' open' : ''}><summary>${pill(h.status)}<span>${esc(h.title)}</span></summary>
       <div class="meta" style="padding:4px 0 0">${h.net ? badge(h.net) : ''}<span>${h.started ? 'Took ' + fmtTime(Math.max(0, h.ended - h.started)) : 'Never started'}</span></div>
       ${res ? `<div class="result" style="padding:6px 0 0">${res}</div>` : ''}
-      <pre class="log">${esc(h.log.join('\n') || '–')}</pre></details></li>`;
+      <pre class="log">${logHtml(h)}</pre></details></li>`;
   }).join(''));
 }
 
@@ -910,9 +989,70 @@ $$('form[data-action]').forEach(f => f.addEventListener('submit', e => {
     Object.assign(body, {node: v.node, amount: v.all ? 'all' : v.amount});
   }
   else if (action === 'withdraw') body.node = v.node;
+  else if (action === 'cashout') {
+    if (!confirm(`Cash out ${v.node}: exit everything in its wallet and withdraw it to its ETH address? It can't be undone.`)) return;
+    body.node = v.node;
+  }
   else Object.assign(body, v);
   act(body);
 }));
+
+
+/* ------------------------------------------------------------ ? tips */
+/* Each form's hints (and its warning, when shown) become the tip of one ?
+   in its corner; the hints stay in the page, hidden, so renderForms keeps
+   filling them. */
+$$('form[data-action]').forEach(f => {
+  const srcs = [...f.querySelectorAll('.hint, .warnbox')];
+  if (!srcs.length) return;
+  srcs.forEach(e => e.classList.add('tipsrc'));
+  const h = f.querySelector('h3'), b = f.querySelector('[type=submit]');
+  const q = document.createElement('button');
+  Object.assign(q, {type: 'button', className: 'qi', textContent: '?'});
+  q.setAttribute('aria-label', 'About ' + ((h || b || {}).textContent || 'this form').trim());
+  q.setAttribute('aria-expanded', 'false');
+  q.srcs = srcs;
+  f.prepend(q);
+});
+const tip = $('#tip');
+let tipFor = null, tipPinned = false;
+function tipContent(q) {
+  if (q.srcs) return q.srcs.filter(e => !e.hidden && e.textContent.trim())
+    .map(e => `<p${e.classList.contains('warnbox') ? ' class="warn"' : ''}>${e.innerHTML}</p>`).join('');
+  if (q.dataset.src) return $(q.dataset.src).innerHTML;
+  return esc(q.dataset.tip || '');
+}
+function syncTips() { $$('form > .qi').forEach(q => { q.hidden = !tipContent(q); }); }
+function showTip(q, pin) {
+  const html = tipContent(q);
+  if (!html) return;
+  if (tipFor && tipFor !== q) tipFor.setAttribute('aria-expanded', 'false');
+  tip.innerHTML = html; tip.hidden = false; tipFor = q; tipPinned = !!pin;
+  q.setAttribute('aria-expanded', 'true');
+  const r = q.getBoundingClientRect(), w = tip.offsetWidth, ht = tip.offsetHeight;
+  tip.style.left = Math.max(8, Math.min(r.left + r.width / 2 - w / 2, innerWidth - w - 8)) + 'px';
+  /* Below the ?, else above it, else as low as it fits on screen. */
+  const top = r.bottom + 6 + ht <= innerHeight - 8 ? r.bottom + 6 : r.top - 6 - ht >= 8 ? r.top - 6 - ht
+    : Math.max(8, innerHeight - ht - 8);
+  tip.style.top = top + 'px';
+}
+function hideTip() {
+  if (tipFor) tipFor.setAttribute('aria-expanded', 'false');
+  tip.hidden = true; tipFor = null; tipPinned = false;
+}
+document.addEventListener('mouseover', e => {
+  const q = e.target.closest('.qi');
+  if (q) { if (q !== tipFor) showTip(q); } else if (tipFor && !tipPinned && !e.target.closest('#tip')) hideTip();
+});
+document.addEventListener('focusin', e => { const q = e.target.closest('.qi'); if (q) showTip(q); });
+document.addEventListener('focusout', e => { if (e.target.closest('.qi') && !tipPinned) hideTip(); });
+document.addEventListener('click', e => {
+  const q = e.target.closest('.qi');
+  if (q) { if (tipFor === q && tipPinned) hideTip(); else showTip(q, true); }
+  else if (tipFor && !e.target.closest('#tip')) hideTip();
+});
+document.addEventListener('keydown', e => { if (e.key === 'Escape' && tipFor) { const q = tipFor; hideTip(); q.focus(); } });
+addEventListener('scroll', () => { if (tipFor && !tipPinned) hideTip(); }, true);
 
 refresh();
 setInterval(refresh, demo ? 60000 : 3000);

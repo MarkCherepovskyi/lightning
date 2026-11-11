@@ -59,6 +59,19 @@ TOKEN_HEADER = 'X-NodeUI-Token'
 SAT_WEI = 10**10            # 1 sat = 1e10 wei (SPEC 4)
 ETH_DECIMALS = 6            # ETH shows this many decimals at most (the tooltip has all 18)
 ANVIL_CHAIN_ID = 31337
+
+# Block explorers the page links to (none on regtest, liquid-regtest or anvil).
+EVM_EXPLORERS = {1: 'https://eth.blockscout.com', 11155111: 'https://eth-sepolia.blockscout.com',
+                 8453: 'https://base.blockscout.com', 84532: 'https://base-sepolia.blockscout.com',
+                 10: 'https://optimism.blockscout.com', 11155420: 'https://optimism-sepolia.blockscout.com'}
+CHAIN_EXPLORERS = {'bitcoin': 'https://mempool.space', 'testnet': 'https://mempool.space/testnet',
+                   'testnet4': 'https://mempool.space/testnet4', 'signet': 'https://mempool.space/signet',
+                   'liquid': 'https://blockstream.info/liquid',
+                   'liquid-testnet': 'https://blockstream.info/liquidtestnet'}
+ADDRESS = re.compile(r'^[0-9A-Za-z]{20,100}$')
+WALLET_LINKS = 4            # most wallet addresses a node card lists
+TXINFO_RETRY = 60           # s between evm-txinfo tries for a tx not yet indexed
+PAY_RETRY_FOR = 600         # s xpay keeps trying where nobody mines (block heights differ between nodes)
 # Infura credits per call, as contrib/evmchan/smoke_base_sepolia.py prices them.
 CREDITS = {'eth_getLogs': 255, 'eth_estimateGas': 300, 'eth_chainId': 5}
 CREDITS_DEFAULT = 80
@@ -109,10 +122,16 @@ class Scrubber:
         self.secrets = set()
         self.lock = threading.Lock()
 
+    # Words the state is full of: a password equal to one (say, rpcpassword=regtest)
+    # would turn every 'btc:regtest' into 'btc:<secret>'. In a URL it is still
+    # caught by URL and USERINFO.
+    NOT_SECRETS = {'bitcoin', 'mainnet', 'testnet', 'testnet4', 'signet', 'regtest', 'liquid',
+                   'liquid-testnet', 'liquid-regtest'}
+
     def add(self, *values):
         with self.lock:
             for v in values:
-                if isinstance(v, str) and len(v) >= 4:
+                if isinstance(v, str) and len(v) >= 4 and v.lower() not in self.NOT_SECRETS:
                     self.secrets.update({v, urllib.parse.unquote(v), urllib.parse.quote(v, safe='')})
 
     def text(self, s):
@@ -450,7 +469,7 @@ class Node:
                 st = self.call('evm-status')
                 self.evm = {'chain_id': st.get('chain_id'), 'contract': st.get('contract'),
                             'token': st.get('token'), 'interval': st.get('interval'),
-                            'units_per_sat': st.get('units_per_sat')}
+                            'units_per_sat': st.get('units_per_sat'), 'eth_address': st.get('eth_address')}
             except Fail:
                 self.evm = {'chain_id': None, 'contract': config_value(cfg, 'evm-contract')}
                 complete = False
@@ -499,6 +518,8 @@ class App:
         self.fresh = set()          # nodes whose next snapshot reads evm-status afresh
         self.fresh_at = {}          # node -> when its last fresh read was asked for
         self.deposits = {}          # node -> [deposits mined on the EVM chain, not yet confirmed in CLN]
+        self.txinfo = {}            # (network ID, funding txid) -> evm-txinfo
+        self.txinfo_tried = {}      # (network ID, funding txid) -> when evm-txinfo last failed
         self.jobs = Jobs(self)
 
     # ------------------------------------------------ labels
@@ -628,18 +649,21 @@ class App:
         now. Returns 0, or the seconds to wait (one per REFRESH_EVERY)."""
         now = time.time()
         with self.flock:
-            wait = self.REFRESH_EVERY - (now - self.fresh_at.get(name, 0))
-            if wait > 0:
-                return math.ceil(wait)
+            wait = self._wait_locked(name, now)
+            if wait:
+                return wait
             self.fresh_at[name] = now
             self.fresh.add(name)
         self.wake.set()
         return 0
 
+    def _wait_locked(self, name, now):
+        """Seconds before the next Refresh of `name` (0: now); the caller holds flock."""
+        return max(0, math.ceil(self.REFRESH_EVERY - (now - self.fresh_at.get(name, 0))))
+
     def refresh_wait(self, name, now=None):
-        now = time.time() if now is None else now
         with self.flock:
-            return max(0, math.ceil(self.REFRESH_EVERY - (now - self.fresh_at.get(name, 0))))
+            return self._wait_locked(name, time.time() if now is None else now)
 
     def track_deposit(self, node, txid, height, sats):
         with self.flock:
@@ -704,6 +728,8 @@ class App:
                 s['evm_error'] = self.scrub.text(e)
                 hit = self.cache.get((node.name, 'evm'))
                 s['evm'], s['evm_read_at'] = (hit[1], hit[0]) if hit else (None, None)
+        if node.kind == 'evm' and 'evm-txinfo' in node.methods:
+            self.look_up_funding(node, s['chans'])
         try:
             if node.kind == 'liquid' and 'assetchan-listchannels' in node.methods:
                 s['gossip'] = self.cached(node, 'gossip', self.GOSSIP_EVERY,
@@ -714,6 +740,26 @@ class App:
         except Fail:
             s['gossip'] = []
         return s
+
+    def look_up_funding(self, node, chans):
+        """evm-txinfo of each channel's funding tx, once it is indexed (one
+        eth_getLogs each, remembered); a miss is tried again after a minute."""
+        now = time.time()
+        for c in chans:
+            txid = c.get('funding_txid')
+            key = (node.net, txid)
+            with self.flock:
+                if not txid or key in self.txinfo or now - self.txinfo_tried.get(key, 0) < TXINFO_RETRY:
+                    continue
+                self.txinfo_tried[key] = now
+            try:
+                info = node.call('evm-txinfo', txid=txid)
+            except Fail:
+                continue
+            if info.get('evm_tx'):
+                with self.flock:
+                    self.txinfo[key] = info
+                    self.txinfo_tried.pop(key, None)
 
     def poll_once(self):
         """Reads every node at once. A node that hangs keeps its one
@@ -734,6 +780,8 @@ class App:
             except Exception as e:      # noqa: B902 - one node must not break the page
                 snaps[name] = {'error': '{}: {}'.format(name, type(e).__name__)}
         state = self.scrub.deep(build_state(self, snaps))
+        # Our own table's explorer URLs, added after the scrub (which would blank them).
+        state['explorers'] = {nd.net: explorer_of(nd) for nd in self.nodes.values() if nd.net and explorer_of(nd)}
         with self.lock:
             self.state = state
         return state
@@ -786,6 +834,68 @@ def state_name(s):
     if s.startswith(('CHANNELD_AWAITING', 'OPENINGD', 'DUALOPEND')):
         return 'opening'
     return 'closing'
+
+
+def explorer_of(nd):
+    """The block explorer of a node's chain, or None."""
+    if nd.kind == 'evm':
+        return EVM_EXPLORERS.get(nd.evm.get('chain_id'))
+    return CHAIN_EXPLORERS.get(nd.network)
+
+
+def explorer_path(base, what, value):
+    """/address/{value} or /tx/{value} on the explorer `base`, for a value
+    that looks like one (an address, or a 32-byte hex hash), else None. Only
+    the path goes into the state, which is scrubbed of anything like a URL;
+    the page joins it to the network's entry in state['explorers']."""
+    if not base or not isinstance(value, str):
+        return None
+    v = value[2:] if value.startswith('0x') else value
+    ok = ADDRESS.match(value) if what == 'address' else re.fullmatch(r'[0-9a-fA-F]{64}', v)
+    return '/{}/{}'.format(what, value) if ok else None
+
+
+def node_links(nd, outs):
+    """What to look a node up by in an explorer: on EVM its ETH address, the
+    contract and the token; elsewhere the wallet addresses holding funds,
+    largest first."""
+    base = explorer_of(nd)
+    if nd.kind == 'evm':
+        out = []
+        for label, value in (('ETH address', nd.evm.get('eth_address')), ('Contract', nd.evm.get('contract')),
+                             ('Token', nd.evm.get('token'))):
+            if value:
+                out.append({'label': label, 'value': value, 'path': explorer_path(base, 'address', value)})
+        return out, 0
+    held = collections.Counter()
+    for o in outs:
+        if o.get('address'):
+            held[o['address']] += msat(o.get('amount_msat')) // 1000
+    top = held.most_common()
+    return [{'label': 'Wallet', 'value': a, 'sat': v, 'path': explorer_path(base, 'address', a)}
+            for a, v in top[:WALLET_LINKS]], max(0, len(top) - WALLET_LINKS)
+
+
+def funding_link(app, nd, c):
+    """The channel's funding tx and where to see it: the tx itself on Bitcoin
+    and Liquid, the EVM tx that applied it on an EVM chain (evm-txinfo)."""
+    txid = c.get('funding_txid')
+    if not txid:
+        return None
+    out = {'txid': txid, 'outnum': c.get('funding_outnum'), 'path': None, 'title': 'funding tx ' + txid}
+    base = explorer_of(nd)
+    if nd.kind != 'evm':
+        out['path'] = explorer_path(base, 'tx', txid)
+        return out
+    info = app.txinfo.get((nd.net, txid))
+    if info and info.get('evm_tx'):
+        out['path'] = explorer_path(base, 'tx', info['evm_tx'])
+        out['evm_tx'] = info['evm_tx']
+        out['title'] = 'funding tx {} (virtual height {}), applied by EVM tx {} in block {}'.format(
+            txid, info.get('height'), info['evm_tx'], info.get('evm_block'))
+    else:
+        out['title'] += ' (not yet applied at the confirmation tag)'
+    return out
 
 
 def parse_evm_status(st, cfg, now=None, label=None):
@@ -891,7 +1001,8 @@ def build_state(app, snaps):
         if s['chans'] and 0 < conf + unconf <= reserve:
             wallet['reserve'] = reserve
             wallet['reserve_hint'] = reserve_text(reserve)
-        entry = dict(base, ok=True, id=info['id'], alias=info.get('alias', ''),
+        links, more = node_links(nd, outs)
+        entry = dict(base, ok=True, id=info['id'], alias=info.get('alias', ''), links=links, links_more=more,
                      blockheight=info.get('blockheight', 0),
                      syncing=bool(info.get('warning_bitcoind_sync') or info.get('warning_lightningd_sync')),
                      wallet=wallet,
@@ -952,7 +1063,7 @@ def build_state(app, snaps):
                 'status': status[-1] if status else '', 'a_units': ours, 'b_units': total - ours,
                 'scid': c.get('short_channel_id'), 'opener': c.get('opener'),
                 'private': bool(c.get('private')), 'peer_connected': bool(c.get('peer_connected')),
-                'confirm': confirm,
+                'confirm': confirm, 'funding': funding_link(app, nd, c),
             }
         app.chans[name] = {c.get('channel_id'): c for c in s['chans'] if c.get('channel_id')}
 
@@ -1239,7 +1350,7 @@ def peer_node(app, peer_id):
     return next((nd for nd in app.nodes.values() if nd.info.get('id') == peer_id), None)
 
 
-def unit_name(node, asset):
+def unit_name(asset):
     return 'units' if asset else 'sat'
 
 
@@ -1260,6 +1371,12 @@ def cmd_open(ctx, frm, to, amount, asset, announce):
             res['txid'], res['outnum'], res['fee_reserve']))
     cid = res['channel_id']
     ctx.result['channel_id'] = cid
+    if announce:
+        ctx.say('announced: once it has 6 confirmations both nodes gossip it, and every node on {} can route '
+                'payments through it'.format(app.channel_net(a, asset)))
+    else:
+        ctx.say('private: only {} and {} know it; another payer can use it only as the last hop, from an '
+                'invoice\'s route hint, so multi-hop routes need announced channels'.format(frm, to))
     if ctx.miner is None:
         # Nobody mines here: the job ends; the Channels table shows the depth.
         need = int(a.config('funding-confirms', 1))
@@ -1269,42 +1386,159 @@ def cmd_open(ctx, frm, to, amount, asset, announce):
             pass
         ctx.say('{} channel {} -> {} funded with {} {}: it opens after {} confirmation{}; '
                 'the Channels table shows the depth'.format(app.channel_net(a, asset), frm, to, n(amount),
-                                                            unit_name(a, asset), need, '' if need == 1 else 's'))
+                                                            unit_name(asset), need, '' if need == 1 else 's'))
         return
     ctx.mine(int(a.config('funding-confirms', 1)))
     ctx.wait_for('the channel to open', lambda: chan_state(a, cid) == 'CHANNELD_NORMAL'
                  and chan_state(b, cid) == 'CHANNELD_NORMAL', mine_between=True)
     c = channel_of(a, cid) or {}
     ctx.say('{} channel {} -> {} ready: {} {} ({})'.format(
-        app.channel_net(a, asset), frm, to, n(amount), unit_name(a, asset), c.get('short_channel_id')))
+        app.channel_net(a, asset), frm, to, n(amount), unit_name(asset), c.get('short_channel_id')))
+
+
+NO_ROUTE = re.compile(r'no connection between source and destination|unknown destination|no path|'
+                      r'no route|could not find a route', re.I)
+
+
+def explain_no_route(ctx, node):
+    """After a routing failure: what the payer knows of the network."""
+    try:
+        chans = node.call('listchannels')['channels']
+        mine = [c for c in node.call('listpeerchannels')['channels'] if c.get('state') == 'CHANNELD_NORMAL']
+    except Fail:
+        return
+    known = {c.get('short_channel_id') for c in chans}
+    ctx.say('{} knows {} channel{} through gossip and has {} open channel{} of its own ({} private). A route can '
+            'only use channels the payer knows: announced ones (gossiped about 6 confirmations after they open), '
+            'its own, and the last hop from the invoice\'s route hint. Open the channels along the way with '
+            '"Announce to the network" ticked and wait for gossip (the network map draws gossiped channels).'
+            .format(node.name, len(known), '' if len(known) == 1 else 's', len(mine), '' if len(mine) == 1 else 's',
+                    sum(1 for c in mine if c.get('private'))))
+
+
+def settled_forwards(node):
+    try:
+        return [f for f in node.call('listforwards', status='settled')['forwards']]
+    except Fail:
+        return []
+
+
+def pay_route(app, payer, before):
+    """The page nodes a payment went through, in order: the settled forwards
+    that appeared on the payer's network since `before` ({node: count}),
+    chained by channel (a job holds the network, so they are this payment's)."""
+    hops = []
+    for nd in app.nodes.values():
+        if nd.net == payer.net and nd.name != payer.name and app.up.get(nd.name):
+            new = settled_forwards(nd)[before.get(nd.name, 0):]
+            hops += [(nd.name, f.get('in_channel'), f.get('out_channel'), msat(f.get('fee_msat'))) for f in new]
+    ours = {c.get('short_channel_id') for c in payer.call('listpeerchannels')['channels']}
+    route, chan = [], None
+    while hops:
+        nxt = next((h for h in hops if (h[1] in ours if chan is None else h[1] == chan)), None)
+        if nxt is None:
+            break
+        hops.remove(nxt)
+        route.append(nxt)
+        chan = nxt[2]
+    return route
 
 
 def pay_bolt11(ctx, node, bolt11, asset):
-    if node.kind == 'liquid':
-        res = node.call('assetchan-pay', bolt11=bolt11, asset=asset or 'lbtc')
-    elif 'xpay' in node.methods:
-        res = node.call('xpay', invstring=bolt11)
-    else:
-        res = node.call('pay', bolt11=bolt11)
+    # Where nobody mines, nodes' block heights differ by a block or more (an
+    # EVM node is up to an evm-poll behind): a payee ahead of us rejects our
+    # CLTV, and xpay waits for our height to catch up, but only for retry_for.
+    retry = None if ctx.miner is not None else PAY_RETRY_FOR
+    try:
+        if node.kind == 'liquid':
+            res = node.call('assetchan-pay', bolt11=bolt11, asset=asset or 'lbtc')
+        elif 'xpay' in node.methods:
+            res = node.call('xpay', invstring=bolt11, retry_for=retry)
+        else:
+            res = node.call('pay', bolt11=bolt11, retry_for=retry)
+    except Fail as e:
+        if NO_ROUTE.search(str(e)):
+            ctx.say('error: {}'.format(e))
+            explain_no_route(ctx, node)
+        raise
     fee = (msat(res.get('amount_sent_msat')) - msat(res.get('amount_msat'))) // 1000
     ctx.say('paid: preimage {}, {} part(s), fee {} {}'.format(
         res.get('payment_preimage'), res.get('successful_parts', res.get('parts', 1)), n(fee),
-        unit_name(node, asset)))
+        unit_name(asset)))
 
 
-def make_invoice(app, node, amount, asset, description):
+def private_hints(node, amount):
+    """The channels to name in exposeprivatechannels, or None for CLN's own
+    choice. When all of the payee's open channels are private, CLN leaves out
+    every hint whose peer looks like a dead end (a peer with no announced
+    channels), so a payer without gossip can't find the payee at all. Then
+    every private channel that can receive the amount is named, which CLN
+    always hints."""
+    chans = [c for c in node.call('listpeerchannels').get('channels', [])
+             if c.get('state') == 'CHANNELD_NORMAL' and c.get('short_channel_id') and c.get('peer_connected')]
+
+    def can_take(c):
+        return receivable_msat(c) >= amount * 1000
+    # An announced channel that can take the amount: CLN's own choice works.
+    # Otherwise (none announced, or all of them full on our side, as a
+    # channel we just opened is) CLN would hint no private channel either.
+    if any(not c.get('private') and can_take(c) for c in chans):
+        return None
+    return [c['short_channel_id'] for c in chans if c.get('private') and can_take(c)] or None
+
+
+def receivable_msat(c):
+    """What a channel can still receive (CLN's receivable_msat, or the peer's side)."""
+    if c.get('receivable_msat') is not None:
+        return msat(c['receivable_msat'])
+    return msat(c.get('total_msat')) - msat(c.get('to_us_msat'))
+
+
+def receivable_sat(node):
+    """The most the node can receive in one channel, in sat."""
+    return max([receivable_msat(c) // 1000 for c in node.call('listpeerchannels').get('channels', [])
+                if c.get('state') == 'CHANNELD_NORMAL' and c.get('peer_connected')] or [0])
+
+
+def make_invoice(ctx, node, amount, asset, description):
+    """An invoice on node; says which private channels it hints, and CLN's
+    warnings (warning_capacity, warning_deadends, ...)."""
     label = 'nodeui-{}'.format(time.time_ns())
     if node.kind == 'liquid':
-        return node.call('assetchan-invoice', amount=amount, asset=asset or 'lbtc', label=label,
-                         description=description)
-    return node.call('invoice', amount_msat=amount * 1000, label=label, description=description)
+        inv = node.call('assetchan-invoice', amount=amount, asset=asset or 'lbtc', label=label,
+                        description=description)
+    else:
+        hints = private_hints(node, amount)
+        inv = node.call('invoice', amount_msat=amount * 1000, label=label, description=description,
+                        exposeprivatechannels=hints)
+        if hints:
+            ctx.say('{} can receive this only on private channels: the invoice hints {}'.format(
+                node.name, ', '.join(hints)))
+        elif node.kind != 'liquid':
+            most = receivable_sat(node)
+            if most < amount:
+                ctx.say('{} can receive at most {} sat in one channel: a channel\'s funds start on the side that '
+                        'opened it, so pay into {} first, or have a peer open a channel to it'.format(
+                            node.name, n(most), node.name))
+    for k in sorted(inv):
+        if k.startswith('warning_'):
+            ctx.say('CLN {}: {}'.format(k, inv[k]))
+    return inv
 
 
 def cmd_pay(ctx, frm, to, amount, asset):
     a, b = ctx.app.nodes[frm], ctx.app.nodes[to]
-    inv = make_invoice(ctx.app, b, amount, asset, 'nodeui payment {} -> {}'.format(frm, to))
-    ctx.say('invoice on {} for {} {}: {}…'.format(to, n(amount), unit_name(b, asset), inv['bolt11'][:40]))
+    inv = make_invoice(ctx, b, amount, asset, 'nodeui payment {} -> {}'.format(frm, to))
+    ctx.say('invoice on {} for {} {}: {}…'.format(to, n(amount), unit_name(asset), inv['bolt11'][:40]))
+    before = {nd.name: len(settled_forwards(nd)) for nd in ctx.app.nodes.values()
+              if nd.net == a.net and nd.name != frm and ctx.app.up.get(nd.name)}
     pay_bolt11(ctx, a, inv['bolt11'], asset)
+    route = pay_route(ctx.app, a, before)
+    names = [frm] + [h[0] for h in route] + [to]
+    ctx.say('route: {} ({} hop{}{})'.format(
+        ' -> '.join(names), len(names) - 1, '' if len(names) == 2 else 's',
+        ', forwarded by ' + ', '.join('{} over {} -> {} (fee {} msat)'.format(h[0], h[1], h[2], n(h[3]))
+                                      for h in route) if route else ', direct'))
 
 
 def cmd_pay_invoice(ctx, frm, bolt11, asset):
@@ -1313,9 +1547,9 @@ def cmd_pay_invoice(ctx, frm, bolt11, asset):
 
 def cmd_invoice(ctx, node, amount, asset, description):
     nd = ctx.app.nodes[node]
-    inv = make_invoice(ctx.app, nd, amount, asset, description)
+    inv = make_invoice(ctx, nd, amount, asset, description)
     net = ctx.app.channel_net(nd, asset)
-    ctx.say('invoice on {} for {} {} ({}):'.format(node, n(amount), unit_name(nd, asset), net))
+    ctx.say('invoice on {} for {} {} ({}):'.format(node, n(amount), unit_name(asset), net))
     ctx.say(inv['bolt11'])
     ctx.result['bolt11'] = inv['bolt11']
 
@@ -1327,6 +1561,29 @@ def elements_assets(node):
         return {}
 
 
+def wallet_sat(node):
+    """Confirmed sat in the node's wallet."""
+    try:
+        return sum(msat(o.get('amount_msat')) // 1000 for o in node.call('listfunds')['outputs']
+                   if o.get('status') == 'confirmed' and not o.get('reserved'))
+    except Fail:
+        return 0
+
+
+def say_evm_tx(ctx, nd, txid, what):
+    """On an EVM chain: the EVM tx that applied a virtual-chain tx (the
+    Activity log links 0x hashes to the explorer)."""
+    if nd.kind != 'evm' or not txid or 'evm-txinfo' not in nd.methods:
+        return
+    try:
+        info = nd.call('evm-txinfo', txid=txid)
+    except Fail:
+        ctx.say('{} {} is not at the confirmation tag yet: its channel row links it later'.format(what, txid))
+        return
+    ctx.say('{} {} was applied by EVM tx {} (block {}, virtual height {})'.format(
+        what, txid, info.get('evm_tx'), n(info.get('evm_block') or 0), n(info.get('height') or 0)))
+
+
 def cmd_close(ctx, node, channel_id, force):
     app = ctx.app
     a = app.nodes[node]
@@ -1335,6 +1592,9 @@ def cmd_close(ctx, node, channel_id, force):
         raise Fail('{} has no such channel'.format(node))
     peer = peer_node(app, c['peer_id'])
     before = elements_assets(a) if a.kind == 'liquid' else {}
+    share = msat(c.get('to_us_msat')) // 1000
+    wallet0 = wallet_sat(a)
+    ctx.say('{}\'s share of the channel: {} {}'.format(node, n(share), 'units' if c.get('asset') else 'sat'))
     if not force:
         if a.kind == 'liquid':
             res = a.call('assetchan-close', id=channel_id)
@@ -1346,7 +1606,19 @@ def cmd_close(ctx, node, channel_id, force):
         ctx.mine(1)
         ctx.wait_for('the close to confirm', lambda: chan_state(a, channel_id) in GONE_STATES + (None,),
                      mine_between=True)
-        ctx.say('closed; the funds are back in the wallets once onchaind is done')
+        txid = res.get('txid') or (res.get('txids') or [None])[0]
+        if a.kind != 'liquid' and ctx.miner is None and share:
+            got = ctx.wait_for('{}\'s share to reach its wallet'.format(node),
+                               lambda: wallet_sat(a) > wallet0, timeout=20 * 60, soft=True)
+            if got:
+                ctx.say('{}\'s wallet: {} -> {} sat (+{}; the opener pays the closing fee)'.format(
+                    node, n(wallet0), n(wallet_sat(a)), n(wallet_sat(a) - wallet0)))
+        else:
+            ctx.say('closed; the funds are back in the wallets once onchaind is done')
+        say_evm_tx(ctx, a, txid, 'closing tx')
+        if a.kind == 'evm':
+            ctx.say('next, to get ETH: Exit moves wallet sat into the contract as withdrawable, Withdraw pays it '
+                    'to {}\'s ETH address (or Cash out does both); the node card shows each balance'.format(node))
     else:
         outs = confirmed_outputs(a)
         try:
@@ -1361,6 +1633,14 @@ def cmd_close(ctx, node, channel_id, force):
         ctx.wait_for('the commitment to confirm',
                      lambda: chan_state(a, channel_id) in ('ONCHAIN', 'CLOSED', None), mine_between=True)
         ctx.say('commitment tx confirmed; each side sweeps its outputs as the timelocks pass')
+        if ctx.miner is None:
+            delay = int(peer.config('watchtime-blocks', 6)) if peer is not None and app.up.get(peer.name) else None
+            interval = a.evm.get('interval') if a.kind == 'evm' else None
+            ctx.say('{}\'s own share ({} sat) is locked for the to_self_delay the peer set{}, then onchaind sweeps '
+                    'it to the wallet; the peer\'s share is in its wallet as soon as the commitment confirms. The '
+                    'channel\'s state column shows onchaind\'s countdown.'.format(
+                        node, n(share), ' ({} blocks{})'.format(n(delay), ', about {:.1f} h'.format(
+                            delay * interval / 3600) if interval else '') if delay else ''))
         if ctx.miner is not None:
             delay = int(a.config('watchtime-blocks', 6))
             if peer is not None and app.up.get(peer.name):
@@ -1527,9 +1807,26 @@ def cmd_exit(ctx, node, amount):
 
 def cmd_withdraw(ctx, node):
     nd = ctx.app.nodes[node]
+    st = evm_status_of(nd, cached=False)
+    gas0 = st.get('balance_wei')
     res = nd.call('evm-withdraw')
     ctx.say('withdrew {} to {}: EVM tx {}, {}'.format(
         evm_amount_text(ctx.app, nd, res), res.get('address'), res.get('evm_tx'), res.get('status')))
+    after = evm_status_of(nd, cached=False)
+    if gas0 is not None and after.get('balance_wei') is not None and not st.get('token'):
+        got, paid = int(res.get('amount_wei') or 0), int(after['balance_wei']) - int(gas0)
+        ctx.say('ETH balance of {}: {} -> {} ({}{}; the EVM tx\'s gas: {})'.format(
+            res.get('address'), fmt_eth(gas0), fmt_eth(after['balance_wei']), '+' if paid >= 0 else '',
+            fmt_eth(paid), fmt_eth(got - paid)))
+    elif st.get('token'):
+        ctx.say('token balance of {}: {}'.format(res.get('address'), after.get('token_balance_units')))
+    ctx.say('check it on the explorer: the ETH address on the node card links there, and the EVM tx above')
+
+
+def cmd_cashout(ctx, node):
+    """Exit everything, wait until the contract credits it, withdraw."""
+    cmd_exit(ctx, node, 'all')
+    cmd_withdraw(ctx, node)
 
 
 def cmd_mine(ctx, blocks):
@@ -1681,7 +1978,7 @@ def build_job(app, body):
         same_net(a, b)
         amount, asset, announce = amount_arg(body), asset_arg(body, a, b), bool(body.get('announce'))
         net = app.channel_net(a, asset)
-        return ('Open {} channel {} to {}, {} {}'.format(net, a.name, b.name, n(amount), unit_name(a, asset)),
+        return ('Open {} channel {} to {}, {} {}'.format(net, a.name, b.name, n(amount), unit_name(asset)),
                 a.net, lambda ctx: cmd_open(ctx, a.name, b.name, amount, asset, announce), (a.name, b.name))
     if action == 'pay':
         a = node_arg(app, body, 'frm')
@@ -1695,14 +1992,14 @@ def build_job(app, body):
         same_net(a, b)
         asset = asset_arg(body, a, b)
         amount = amount_arg(body)
-        return ('Pay {} {} from {} to {} ({})'.format(n(amount), unit_name(a, asset), a.name, b.name,
+        return ('Pay {} {} from {} to {} ({})'.format(n(amount), unit_name(asset), a.name, b.name,
                                                       app.channel_net(a, asset)),
                 a.net, lambda ctx: cmd_pay(ctx, a.name, b.name, amount, asset), (a.name, b.name))
     if action == 'invoice':
         nd = node_arg(app, body, 'node')
         amount, asset = amount_arg(body), asset_arg(body, nd)
         desc = text_arg(body, 'description', 'nodeui invoice')
-        return ('Invoice on {} for {} {}'.format(nd.name, n(amount), unit_name(nd, asset)), nd.net,
+        return ('Invoice on {} for {} {}'.format(nd.name, n(amount), unit_name(asset)), nd.net,
                 lambda ctx: cmd_invoice(ctx, nd.name, amount, asset, desc), (nd.name,))
     if action == 'close':
         nd = node_arg(app, body, 'node')
@@ -1749,6 +2046,10 @@ def build_job(app, body):
         amount = amount_arg(body, allow_all=True)
         return ('Exit {} sat from {} to its ETH address'.format(amount if amount == 'all' else n(amount), nd.name),
                 nd.net, lambda ctx: cmd_exit(ctx, nd.name, amount), (nd.name,))
+    if action == 'cashout':
+        nd = node_arg(app, body, 'node', ('evm',))
+        return ('Cash out {}: exit its whole wallet and withdraw to its ETH address'.format(nd.name), nd.net,
+                lambda ctx: cmd_cashout(ctx, nd.name), (nd.name,))
     if action == 'withdraw':
         nd = node_arg(app, body, 'node', ('evm',))
         return ('Withdraw the withdrawable of {} from the contract'.format(nd.name), nd.net,

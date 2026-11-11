@@ -317,6 +317,100 @@ def test_no_mining_off_anvil():
     assert real.make_miner(b) is None
 
 
+def test_explorer_path_takes_only_addresses_and_hashes():
+    base = 'https://base-sepolia.blockscout.com'
+    assert ui.explorer_path(base, 'tx', '0x' + 'ab' * 32) == '/tx/0x' + 'ab' * 32
+    assert ui.explorer_path(base, 'address', CONTRACT) == '/address/' + CONTRACT
+    for what, value in (('tx', 'zz' * 32), ('tx', 'ab' * 31), ('address', 'tex1q"><b>x</b>' + 'q' * 20),
+                        ('address', 'short'), ('address', None)):
+        assert ui.explorer_path(base, what, value) is None
+    assert ui.explorer_path(None, 'tx', 'ab' * 32) is None
+
+
+def test_explorer_links_for_addresses_and_funding_txs(monkeypatch):
+    """Node cards link the ETH address, contract and token (EVM) or the
+    wallet addresses (Bitcoin, Liquid) to the chain's explorer; channels link
+    their funding tx, on an EVM chain through evm-txinfo's EVM tx. The state
+    carries paths, and each network's explorer in state['explorers'] (added
+    after the scrub, which blanks URLs). Regtest has no explorer."""
+    monkeypatch.setattr(ui, 'TXINFO_RETRY', 0)
+    e1, e2 = fakes.evm(1, chain_id=84532, contract=CONTRACT, token=TOKEN), fakes.evm(2, chain_id=84532,
+                                                                                     contract=CONTRACT, token=TOKEN)
+    info = {'txid': 'f0' * 32, 'height': 4013, 'evm_block': 56450000, 'evm_tx': None}
+    e1.methods.append('evm-txinfo')
+    e1.r['evm-txinfo'] = lambda p: dict(info, txid=p['txid'])
+    connect(e1, e2, 'cc' * 32, scid='106x1x0')
+    l1, l2 = fakes.liquid(3, 'liquid-testnet'), fakes.liquid(4, 'liquid-testnet')
+    connect(l1, l2, 'bb' * 32, asset=ASSET, scid='105x1x0')
+    for f, txid in ((e1, 'f0' * 32), (e2, 'f0' * 32), (l1, 'f1' * 32), (l2, 'f1' * 32)):
+        for c in f.r['listpeerchannels']['channels']:
+            c.update(funding_txid=txid, funding_outnum=0)
+    l1.r['listfunds']['outputs'] = [{'txid': '%02x' % i * 32, 'output': 0, 'amount_msat': (i + 1) * 1000_000,
+                                     'status': 'confirmed', 'address': 'tex1q' + chr(97 + i) * 38} for i in range(6)]
+    b1 = fakes.bitcoin(5)
+    b1.r['listfunds']['outputs'][0]['address'] = 'bcrt1q' + 'q' * 38
+    app = make_app({'e1': e1, 'e2': e2, 'l1': l1, 'l2': l2, 'b1': b1})
+
+    bs, liq = 'https://base-sepolia.blockscout.com', 'https://blockstream.info/liquidtestnet'
+    ex = app.state['explorers']
+    assert ex == {node_of(app, 'e1')['net']: bs, 'liquid:testnet': liq}       # none for btc:regtest
+    links = {x['label']: x['path'] for x in node_of(app, 'e1')['links']}
+    assert links == {'ETH address': '/address/0x70997970C51812dc3A010C7d01b50e0d17dc79C8',
+                     'Contract': '/address/' + CONTRACT, 'Token': '/address/' + TOKEN}
+    wl = node_of(app, 'l1')['links']
+    assert [x['sat'] for x in wl] == [6000, 5000, 4000, 3000] and node_of(app, 'l1')['links_more'] == 2
+    assert ex[node_of(app, 'l1')['net']] + wl[0]['path'] == liq + '/address/tex1q' + 'f' * 38
+    assert [(x['label'], x['path']) for x in node_of(app, 'b1')['links']] == [('Wallet', None)]
+
+    chans = {c['scid']: c for c in app.state['channels']}
+    assert ex[chans['105x1x0']['node_net']] + chans['105x1x0']['funding']['path'] == liq + '/tx/' + 'f1' * 32
+    # Not applied yet at the tag: no link, asked again on the next poll.
+    assert chans['106x1x0']['funding']['path'] is None and 'not yet' in chans['106x1x0']['funding']['title']
+    info['evm_tx'] = '0x' + 'ab' * 32
+    app.poll_once()
+    f = {c['scid']: c for c in app.state['channels']}['106x1x0']['funding']
+    assert f['path'] == '/tx/0x' + 'ab' * 32 and 'block 56450000' in f['title']
+    asked = len(e1.called('evm-txinfo'))
+    app.poll_once()
+    assert len(e1.called('evm-txinfo')) == asked       # remembered
+
+
+def test_invoice_hints_private_channels_and_shows_warnings():
+    """A payee whose channels are all private gets them named in
+    exposeprivatechannels (CLN drops dead-end hints otherwise); one with an
+    announced channel, or none that can take the amount, is left to CLN.
+    CLN's warning_* fields go to the log."""
+    app, f = full_app()
+    e2 = f['e2']
+    for c in e2.r['listpeerchannels']['channels']:
+        c['private'] = True
+    st, log, _ = run(app, {'action': 'pay', 'frm': 'e1', 'to': 'e2', 'amount': 1000})
+    assert st == 'done'
+    assert e2.called('invoice')[-1]['exposeprivatechannels'] == ['106x1x0']
+    assert any('e2 can receive this only on private channels: the invoice hints 106x1x0' in x for x in log)
+
+    # More than the channel can receive (600,000 sat is on e1's side): CLN's choice, and the log says why.
+    st, log, _ = run(app, {'action': 'invoice', 'node': 'e2', 'amount': 700_000})
+    assert st == 'done' and 'exposeprivatechannels' not in e2.called('invoice')[-1]
+    assert any('e2 can receive at most 600,000 sat in one channel' in x for x in log)
+
+    # An announced channel that can't take it (all ours, as when we opened it): the private one is hinted.
+    e2.r['listpeerchannels']['channels'].append(dict(e2.r['listpeerchannels']['channels'][0], private=False,
+                                                     short_channel_id='107x1x0', to_us_msat=10**9,
+                                                     total_msat=10**9))
+    st, log, _ = run(app, {'action': 'invoice', 'node': 'e2', 'amount': 1000})
+    assert e2.called('invoice')[-1]['exposeprivatechannels'] == ['106x1x0']
+
+    # One announced channel that can take it: CLN's choice, and its warnings are shown.
+    e2.r['listpeerchannels']['channels'][-1].update(to_us_msat=0)
+    warning = 'Insufficient incoming capacity, once dead-end peers were excluded'
+    e2.r['invoice'] = lambda p: {'bolt11': e2.bolt11(p), 'payment_hash': '11' * 32, 'warning_deadends': warning}
+    st, log, res = run(app, {'action': 'invoice', 'node': 'e2', 'amount': 1000})
+    assert st == 'done' and 'exposeprivatechannels' not in e2.called('invoice')[-1]
+    assert any('CLN warning_deadends: Insufficient incoming capacity' in x for x in log)
+    assert res['bolt11'].startswith('lnbcrt')
+
+
 def test_run_pay_invoice_send_newaddr_mine():
     app, f = full_app()
     st, log, _ = run(app, {'action': 'pay', 'frm': 'b1', 'to': 'b2', 'amount': 1000})
@@ -361,6 +455,86 @@ def test_run_evm_deposit_exit_withdraw():
     assert st == 'done' and any('≈0.001 ETH · 100,001 sat' in x for x in log)
     st, log, _ = run(app, {'action': 'withdraw', 'node': 't1'})
     assert any('1,234,500 {} units · 12,345 sat'.format(TOKEN[:8]) in x for x in log)
+
+
+def test_pay_shows_its_route_and_explains_a_missing_one():
+    """A page-to-page payment logs its route from the forwards that appeared
+    on the page's nodes; a routing failure says what the payer knows."""
+    e1, e2, e3 = fakes.evm(1), fakes.evm(2), fakes.evm(3)
+    connect(e1, e2, 'c1' * 32, scid='201x1x0')
+    connect(e2, e3, 'c2' * 32, scid='202x1x0')
+    paid = dict(e1.r['xpay'])
+
+    def xpay(p):
+        e2.r['listforwards']['forwards'].append({'in_channel': '201x1x0', 'out_channel': '202x1x0',
+                                                 'status': 'settled', 'fee_msat': 1001})
+        return paid
+    e1.r['xpay'] = xpay
+    app = make_app({'e1': e1, 'e2': e2, 'e3': e3})
+    st, log, _ = run(app, {'action': 'pay', 'frm': 'e1', 'to': 'e3', 'amount': 1000})
+    assert st == 'done', log
+    assert any('route: e1 -> e2 -> e3 (2 hops, forwarded by e2 over 201x1x0 -> 202x1x0 (fee 1,001 msat))' in x
+               for x in log)
+    assert 'retry_for' not in e1.called('xpay')[-1]          # anvil: the page mines, heights agree
+    st, log, _ = run(app, {'action': 'pay', 'frm': 'e2', 'to': 'e3', 'amount': 1000})
+    assert any('route: e2 -> e3 (1 hop, direct)' in x for x in log)
+
+    e1.r['xpay'] = ui.RpcError('xpay', {}, {'code': 203, 'message':
+                                            'Failed: There is no connection between source and destination at all'})
+    st, log, _ = run(app, {'action': 'pay', 'frm': 'e1', 'to': 'e3', 'amount': 1000})
+    assert st == 'error'
+    assert any('e1 knows 0 channels through gossip and has 1 open channel of its own' in x for x in log)
+    assert any('"Announce to the network" ticked' in x for x in log)
+
+
+def test_close_on_a_public_chain_reports_the_share_and_the_wallet():
+    """No mining: the close waits for the share to reach the wallet, says
+    how much, links the EVM tx that applied the closing tx, and says what
+    turns it into ETH."""
+    e1, e2 = fakes.evm(1, chain_id=84532, contract=CONTRACT), fakes.evm(2, chain_id=84532, contract=CONTRACT)
+    connect(e1, e2, 'cc' * 32, scid='106x1x0', to_us=600_000)
+    e1.methods.append('evm-txinfo')
+    e1.r['evm-txinfo'] = lambda p: {'txid': p['txid'], 'evm_tx': '0x' + 'cd' * 32, 'evm_block': 56_000_000,
+                                    'height': 4100}
+
+    def close(p):
+        e1.r['listpeerchannels']['channels'][0]['state'] = 'ONCHAIN'
+        e1.r['listfunds']['outputs'].append({'txid': 'ab' * 32, 'output': 0, 'amount_msat': 599_000_000,
+                                             'status': 'confirmed'})
+        return {'type': 'mutual', 'txid': 'ab' * 32}
+    e1.r['close'] = close
+    app = make_app({'e1': e1, 'e2': e2})
+    st, log, _ = run(app, {'action': 'pay', 'frm': 'e1', 'to': 'e2', 'amount': 1000})
+    assert st == 'done' and e1.called('xpay')[-1]['retry_for'] == ui.PAY_RETRY_FOR    # nobody mines here
+    st, log, _ = run(app, {'action': 'close', 'node': 'e1', 'chan': 'cc' * 32})
+    assert st == 'done', log
+    text = '\n'.join(log)
+    assert "e1's share of the channel: 600,000 sat" in text
+    assert "e1's wallet: 5,000,000 -> 5,599,000 sat (+599,000" in text
+    assert 'closing tx {} was applied by EVM tx 0x{} (block 56,000,000, virtual height 4,100)'.format(
+        'ab' * 32, 'cd' * 32) in text
+    assert 'Exit moves wallet sat into the contract' in text
+
+
+def test_cash_out_exits_withdraws_and_shows_the_eth_balance():
+    e1 = fakes.evm(1, chain_id=84532, contract=CONTRACT)
+
+    def exit_(p):
+        e1.status['withdrawable_wei'] = 10**15
+        return {'txid': 'ee' * 32, 'tx': '00'}
+
+    def withdraw(p):
+        e1.status.update(withdrawable_wei=0, balance_wei=e1.status['balance_wei'] + 10**15 - 10**12)
+        return {'address': e1.status['eth_address'], 'evm_tx': '0x' + 'cd' * 32, 'status': 'mined',
+                'amount_wei': 10**15}
+    e1.r['withdraw'], e1.r['evm-withdraw'] = exit_, withdraw
+    app = make_app({'e1': e1})
+    st, log, _ = run(app, {'action': 'cashout', 'node': 'e1'})
+    assert st == 'done', log
+    assert e1.called('withdraw')[-1]['satoshi'] == 'all' and e1.called('evm-withdraw')
+    line = next(x for x in log if x.startswith('ETH balance of'))
+    assert '{} -> {}'.format(ui.fmt_eth(10**18), ui.fmt_eth(10**18 + 10**15 - 10**12)) in line
+    assert "the EVM tx's gas: {}".format(ui.fmt_eth(10**12)) in line
 
 
 def test_jobs_run_in_parallel_across_networks_and_in_turn_on_one():
@@ -831,3 +1005,19 @@ def test_review_fixes_for_jobs_and_refresh():
     finally:
         srv.shutdown()
         srv.server_close()
+
+
+def test_a_password_that_is_a_network_name_does_not_poison_the_state():
+    """rpcpassword=regtest must not turn every 'btc:regtest' into 'btc:<secret>';
+    inside a URL the password is still removed."""
+    sc = ui.Scrubber()
+    sc.add('regtest', 's3cretpw')
+    assert sc.deep({'net': 'btc:regtest', 'e': 'bad s3cretpw'}) == {'net': 'btc:regtest', 'e': 'bad <secret>'}
+    assert 'regtest' not in sc.text('see http://u:regtest@127.0.0.1:18443/') and '<' in sc.text('u:regtest@h')
+
+
+@pytest.mark.parametrize('amount', [0, -5, '0', 10**16])
+def test_amounts_outside_one_to_max_are_refused(amount):
+    app, _ = full_app()
+    with pytest.raises(ui.BadRequest, match='amount'):
+        ui.build_job(app, {'action': 'pay', 'frm': 'b1', 'to': 'b2', 'amount': amount})

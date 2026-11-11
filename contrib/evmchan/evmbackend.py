@@ -46,6 +46,7 @@ import json
 import os
 import queue
 import random
+import re
 import stat
 import sys
 import threading
@@ -737,6 +738,7 @@ class Backend:
         self.contract = cfg.contract
         self.stop_event = threading.Event()
         self.ix = None
+        self.evm_tx_cache = {}   # evm-txinfo: (txid, EVM block hash, log index) -> EVM tx hash
         self.rpc = None          # the poll thread's and the read RPCs'
         self.srpc = None         # the send worker's (short timeouts)
         self.interval = None
@@ -1887,6 +1889,10 @@ class Backend:
         if self.balance is not None and self.balance < self.cfg.min_balance_wei:
             found['balance'] = 'ETH balance of {} is {} wei, below evm-min-balance ({} wei): new channels refused' \
                 .format(self.address, self.balance, self.cfg.min_balance_wei)
+        if self.ix is not None and self.ix.bad_witnesses:
+            found['witness'] = '{} applied tx(s) arrived with a witness that does not validate (last {}): the EVM ' \
+                'provider altered log data; switch evm-rpc and rebuild the index'.format(
+                    len(self.ix.bad_witnesses), self.ix.bad_witnesses[-1])
         if self.sync_error_since is not None and now - self.sync_error_since > 5 * self.interval:
             found['sync'] = 'index sync failing for {:.0f} s (last: {})'.format(
                 now - self.sync_error_since, self.last_sync_error)
@@ -2254,6 +2260,32 @@ class Backend:
         except ValueError:
             raise UserError('not a 20-byte hex ETH address') from None
 
+    def txinfo(self, txid):
+        """evm-txinfo: where a virtual-chain tx is on the EVM chain, for an
+        explorer link. Its height, EVM block, and the EVM tx whose TxApplied
+        log carried it: one eth_getLogs of that block by hash, the first time
+        (remembered per EVM block hash, so a reorg reads it again)."""
+        if not isinstance(txid, str) or not re.fullmatch(r'[0-9a-fA-F]{64}', txid):
+            raise UserError('txid must be 64 hex digits')
+        txid = txid.lower()
+        t = self.ix.tx(txid)
+        if t is None:
+            raise UserError('{} is not in the index (not applied, or not yet at the confirmation tag)'.format(txid))
+        out = {'txid': txid, 'height': t['height'], 'evm_block': t['evm_block'], 'evm_block_hash': t['evm_hash'],
+               'log_index': t['log_index'], 'contract': self.contract}
+        key = (txid, t['evm_hash'], t['log_index'])
+        evm_tx = self.evm_tx_cache.get(key)
+        if evm_tx is None:
+            logs = self.rpc.request('eth_getLogs', {'blockHash': t['evm_hash'], 'address': self.contract,
+                                                    'topics': [evmindex.TOPIC0, None,
+                                                               '0x' + btc.internal(txid).hex()]})
+            for lg in logs or []:
+                if int(lg['logIndex'], 16) == t['log_index']:
+                    evm_tx = lg['transactionHash']
+                    self.evm_tx_cache[key] = evm_tx
+        out['evm_tx'] = evm_tx
+        return out
+
     def status(self, cached=False):
         """evm-status. cached: no fresh reads for the balances. The ETH
         balance is the one the poll keeps (refresh_balance's rules), the
@@ -2499,6 +2531,12 @@ def main():
     def evm_withdraw(plugin, request, **kwargs):
         """Withdraws the node key's withdrawable ETH or token (fees and exits) from the contract."""
         rpc_in_thread('evm-withdraw', lambda: backend().withdraw(), request)
+
+    @plugin.async_method('evm-txinfo')
+    def evm_txinfo(plugin, request, txid, **kwargs):
+        """Where virtual-chain tx {txid} is on the EVM chain: its height, EVM block and the EVM tx
+        that applied it (for an explorer link)."""
+        rpc_in_thread('evm-txinfo', lambda: backend().txinfo(txid), request)
 
     @plugin.async_method('evm-snapshot')
     def evm_snapshot(plugin, request, path=None, **kwargs):

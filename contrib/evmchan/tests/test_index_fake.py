@@ -521,3 +521,29 @@ def test_catchup_resumes_after_429s_give_up(tmp_path):
     assert again[0][0] == done[-1][1] + 1, 'resumed at the cursor'
     assert len(again) == 6
     assert_caught_up(ix, node, raws)
+
+
+def test_live_witness_that_does_not_validate_is_flagged_not_dropped(tmp_path):
+    """No checkpoint covers a witness (logHash chains height and txid), so a
+    provider could alter one, e.g. strip a preimage. The index checks every
+    live spend against the outputs it spends: a valid one passes, an altered
+    one (same txid) is flagged for the plugin's alarm and still served."""
+    from conftest import Key, sign
+    node = FakeChain()
+    ix = fresh(tmp_path, node)
+    k = Key(0xB0B)
+    d = node.deposit(50_000, k.p2wpkh)
+    node.add_block(node.T(1), [d])
+    good = sign(btc.Tx(2, [btc.TxIn(btc.Tx.parse(d).txid(), 0)], [(49_000, k.p2wpkh)], 0),
+                [k], [(50_000, k.p2wpkh, 1)])
+    node.add_block(node.T(3), [good.serialize()])
+    bad = sign(btc.Tx(2, [btc.TxIn(good.txid(), 0)], [(48_000, k.p2wpkh)], 0), [k], [(49_000, k.p2wpkh, 3)])
+    sig = bad.witnesses[0][0]
+    bad.witnesses[0] = [sig[:-2] + bytes([sig[-2] ^ 1]) + sig[-1:], bad.witnesses[0][1]]
+    node.add_block(node.T(5), [bad.serialize()])
+    node.add_block(node.T(8))
+    node.add_block(node.T(8) + 1)
+    ix.sync()
+    assert ix.bad_witnesses == [bad.txid_hex()]
+    served = [t.serialize() for t in btc.parse_block(ix.block(5)[1])[1][1:]]
+    assert served == [bad.serialize()]

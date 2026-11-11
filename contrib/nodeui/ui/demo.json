@@ -72,6 +72,8 @@
    "ok": true,
    "id": "020101010101010101010101010101010101010101010101010101010101010101",
    "alias": "alice",
+   "links": [],
+   "links_more": 0,
    "blockheight": 112,
    "syncing": false,
    "wallet": {
@@ -99,6 +101,8 @@
    "ok": true,
    "id": "020202020202020202020202020202020202020202020202020202020202020202",
    "alias": "bob",
+   "links": [],
+   "links_more": 0,
    "blockheight": 112,
    "syncing": false,
    "wallet": {
@@ -126,6 +130,8 @@
    "ok": true,
    "id": "020303030303030303030303030303030303030303030303030303030303030303",
    "alias": "carol",
+   "links": [],
+   "links_more": 0,
    "blockheight": 2690766,
    "syncing": false,
    "wallet": {
@@ -176,6 +182,8 @@
    "ok": true,
    "id": "020404040404040404040404040404040404040404040404040404040404040404",
    "alias": "dave",
+   "links": [],
+   "links_more": 0,
    "blockheight": 2690766,
    "syncing": false,
    "wallet": {
@@ -215,6 +223,19 @@
    "ok": true,
    "id": "020505050505050505050505050505050505050505050505050505050505050505",
    "alias": "erin",
+   "links": [
+    {
+     "label": "ETH address",
+     "value": "0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
+     "path": null
+    },
+    {
+     "label": "Contract",
+     "value": "0x5FbDB2315678afecb367f032d93F642f64180aa3",
+     "path": null
+    }
+   ],
+   "links_more": 0,
    "blockheight": 131,
    "syncing": false,
    "wallet": {
@@ -292,6 +313,19 @@
    "ok": true,
    "id": "020606060606060606060606060606060606060606060606060606060606060606",
    "alias": "frank",
+   "links": [
+    {
+     "label": "ETH address",
+     "value": "0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC",
+     "path": null
+    },
+    {
+     "label": "Contract",
+     "value": "0x5FbDB2315678afecb367f032d93F642f64180aa3",
+     "path": null
+    }
+   ],
+   "links_more": 0,
    "blockheight": 131,
    "syncing": false,
    "wallet": {
@@ -371,6 +405,24 @@
    "ok": true,
    "id": "020707070707070707070707070707070707070707070707070707070707070707",
    "alias": "gina",
+   "links": [
+    {
+     "label": "ETH address",
+     "value": "0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
+     "path": "/address/0x70997970C51812dc3A010C7d01b50e0d17dc79C8"
+    },
+    {
+     "label": "Contract",
+     "value": "0xB82000000000000000000000000000000000940E",
+     "path": "/address/0xB82000000000000000000000000000000000940E"
+    },
+    {
+     "label": "Token",
+     "value": "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238",
+     "path": "/address/0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238"
+    }
+   ],
+   "links_more": 0,
    "blockheight": 4410211,
    "syncing": false,
    "wallet": {
@@ -429,9 +481,9 @@
     "anvil": false,
     "rpc_calls_total": 12563,
     "credits": 1172815,
-    "credits_per_day": 1497184,
-    "credits_pct": 49.9,
-    "credits_hours": 18.8,
+    "credits_per_day": 700014,
+    "credits_pct": 23.3,
+    "credits_hours": 40.21,
     "token_label": "USDC",
     "read_age_s": 0,
     "refresh_wait_s": 0,
@@ -456,6 +508,24 @@
    "ok": true,
    "id": "020808080808080808080808080808080808080808080808080808080808080808",
    "alias": "hank",
+   "links": [
+    {
+     "label": "ETH address",
+     "value": "0x90F79bf6EB2c4f870365E785982E1f101E93b906",
+     "path": "/address/0x90F79bf6EB2c4f870365E785982E1f101E93b906"
+    },
+    {
+     "label": "Contract",
+     "value": "0xB82000000000000000000000000000000000940E",
+     "path": "/address/0xB82000000000000000000000000000000000940E"
+    },
+    {
+     "label": "Token",
+     "value": "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238",
+     "path": "/address/0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238"
+    }
+   ],
+   "links_more": 0,
    "blockheight": 4410211,
    "syncing": false,
    "wallet": {
@@ -528,9 +598,9 @@
     "anvil": false,
     "rpc_calls_total": 12563,
     "credits": 1172815,
-    "credits_per_day": 1497184,
-    "credits_pct": 49.9,
-    "credits_hours": 18.8,
+    "credits_per_day": 700014,
+    "credits_pct": 23.3,
+    "credits_hours": 40.21,
     "token_label": "USDC",
     "read_age_s": 0,
     "refresh_wait_s": 0,
@@ -561,7 +631,8 @@
    "opener": "local",
    "private": false,
    "peer_connected": true,
-   "confirm": null
+   "confirm": null,
+   "funding": null
   },
   {
    "id": "c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1",
@@ -584,7 +655,8 @@
    "opener": "local",
    "private": false,
    "peer_connected": true,
-   "confirm": null
+   "confirm": null,
+   "funding": null
   },
   {
    "id": "d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4",
@@ -607,7 +679,8 @@
    "opener": "local",
    "private": false,
    "peer_connected": true,
-   "confirm": null
+   "confirm": null,
+   "funding": null
   },
   {
    "id": "5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b",
@@ -630,7 +703,8 @@
    "opener": "local",
    "private": false,
    "peer_connected": true,
-   "confirm": null
+   "confirm": null,
+   "funding": null
   },
   {
    "id": "a43d57113597e25b773c94de882c6d857bb8edb589689abd598b491f57db544d",
@@ -653,7 +727,8 @@
    "opener": "local",
    "private": false,
    "peer_connected": true,
-   "confirm": null
+   "confirm": null,
+   "funding": null
   },
   {
    "id": "d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5",
@@ -679,7 +754,8 @@
    "confirm": {
     "depth": 2,
     "need": 3
-   }
+   },
+   "funding": null
   },
   {
    "id": "c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2",
@@ -702,7 +778,8 @@
    "opener": "local",
    "private": false,
    "peer_connected": true,
-   "confirm": null
+   "confirm": null,
+   "funding": null
   }
  ],
  "maps": {
@@ -868,6 +945,9 @@
   "ddc8da3f868bd193d25e3bbdd3e3c075d6629fa45dee1c3d829682d82094ba50": "TEST"
  },
  "now": 1794100000,
+ "explorers": {
+  "evm:84532:0xB82000000000000000000000000000000000940E": "https://base-sepolia.blockscout.com"
+ },
  "jobs": [
   {
    "id": 6,

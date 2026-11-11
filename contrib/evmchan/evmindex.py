@@ -203,6 +203,7 @@ class Index:
         self.ibd = True             # until a sync of this process records a checkpoint
         self.last_sync = None       # time.time() of the last completed (not skipped) sync
         self.undecodable = 0        # undecodable events seen by this process
+        self.bad_witnesses = []     # txids (display) served with a witness that does not validate
         self._latest = None         # (number, hash hex, timestamp) of `latest` at the last sync
         self._tagblock = None       # the same for the tag
         self._rev = 0               # bumped on every row change (under the lock)
@@ -345,8 +346,36 @@ class Index:
                             for i, (amount, spk) in enumerate(tx.outputs)])
             db.executemany('INSERT INTO spends (tx_id, vin, prev_txid, prev_vout) VALUES (?, ?, ?, ?)',
                            [(row_id, i, txin.prev_txid, txin.vout) for i, txin in enumerate(tx.inputs)])
+            if not self._meta('snapshot_import'):       # an import checks every witness itself
+                self._check_live_witness(tx, ev)
         self._row_changed(ev['block'], ev['height'])
         return 'new'
+
+    def _check_live_witness(self, tx, ev):
+        """Neither a txid nor the contract's logHash commits to a witness, so
+        the provider could alter one (strip an HTLC preimage) unnoticed by the
+        checkpoints. The contract validated every applied tx: one whose
+        witness fails the reference validator against the outputs it spends
+        was altered on the way. Detection only (SPEC 5.2): the row is still
+        served, since hiding a spend the contract applied would be worse; the
+        plugin raises an alarm (switch evm-rpc and rebuild the index)."""
+        prevouts = []
+        for txin in tx.inputs:
+            row = self._db.execute('SELECT amount, script, height FROM outputs WHERE txid = ? AND vout = ? '
+                                   'ORDER BY tx_id LIMIT 1', (txin.prev_txid, txin.vout)).fetchone()
+            if row is None:
+                return          # a deposit, or a prevout outside this index: nothing to check against
+            prevouts.append([row[0], bytes(row[1]), row[2]])
+        try:
+            ok = _tx_validator()(ev['raw'], prevouts, ev['height'], self.genesis_time, self.interval)[0]
+        except Exception:       # noqa: B902 - the validator failing to load or crash is not proof of tampering
+            return
+        if not ok:
+            txid = btc.display(ev['txid'])
+            self.bad_witnesses.append(txid)
+            self.log('broken', 'tx {} in EVM block {} carries a witness that does not validate: the EVM provider '
+                     'altered it (no checkpoint covers witnesses); switch evm-rpc and rebuild the index'
+                     .format(txid, ev['block']))
 
     def _other_hash_blocks(self, events):
         """{block number: the events' hash} for the events' blocks where the

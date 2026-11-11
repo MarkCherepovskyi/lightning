@@ -33,8 +33,13 @@ import json
 # Asset channels' feature bit (common/features.h OPT_CHANNEL_ASSET, odd:
 # optional).  Plugins can only set feature bits at startup.
 CHANNEL_ASSET_FEATURE = 1 << 233
-plugin = Plugin(dynamic=False, init_features=CHANNEL_ASSET_FEATURE,
-                node_features=CHANNEL_ASSET_FEATURE)
+# Asset channels are built on option_anchors_zero_fee_htlc_tx (optional,
+# bit 23), which lightningd turns off on Elements: we turn it back on.  (On
+# Bitcoin, where it is already on, lightningd refuses to load this plugin.)
+ANCHORS_FEATURE = 1 << 23
+plugin = Plugin(dynamic=False,
+                init_features=CHANNEL_ASSET_FEATURE | ANCHORS_FEATURE,
+                node_features=CHANNEL_ASSET_FEATURE | ANCHORS_FEATURE)
 plugin.elements = None       # ElementsRpc, built on first use
 plugin.lbtc = None           # L-BTC's asset id
 plugin.invoice_assets = {}   # payment_hash -> asset of that invoice of ours
@@ -246,9 +251,9 @@ def allowed_assets(plugin):
     return plugin.get_option('assetchan-asset') or []
 
 
-def channel_asset(plugin, scid):
+def channel_asset(plugin, scid, channels=None):
     """The asset of our channel with this scid (or local alias)."""
-    for c in our_channels(plugin):
+    for c in channels if channels is not None else our_channels(plugin):
         if scid in (c.get('short_channel_id'), c.get('alias', {}).get('local')):
             return c.get('asset', LBTC)
     return LBTC
@@ -501,12 +506,45 @@ def on_openchannel(plugin, openchannel, **kwargs):
     return res
 
 
+def forward_channel(channels, cid, asset, amount_msat):
+    """Where to forward an HTLC that arrived in asset: core's choice (the
+    channel cid), if it is in that asset; else the channel to the same peer
+    in that asset, at the same fees, that can send the most; None if there
+    is none."""
+    chosen = next((c for c in channels if c.get('channel_id') == cid), None)
+    if chosen is None or chosen.get('asset', LBTC) == asset:
+        return cid
+    fees = ('fee_base_msat', 'fee_proportional_millionths')
+    same = [c for c in channels
+            if c['peer_id'] == chosen['peer_id']
+            and c.get('asset', LBTC) == asset
+            and c['state'] == 'CHANNELD_NORMAL'
+            and all(c.get(f) == chosen.get(f) for f in fees)
+            and c.get('spendable_msat', 0) >= amount_msat]
+    if not same:
+        return None
+    return max(same, key=lambda c: c['spendable_msat'])['channel_id']
+
+
 @plugin.hook('htlc_accepted')
-def on_htlc_accepted(plugin, htlc, onion, **kwargs):
-    """Final hop: the HTLC must arrive in the invoice's asset, that is by a
-    channel in that asset."""
+def on_htlc_accepted(plugin, htlc, onion, forward_to=None, **kwargs):
+    """A forward must leave in the asset it arrived in (amounts are in each
+    channel's asset: another one would swap them 1:1).  At the final hop
+    the HTLC must arrive in the invoice's asset, that is by a channel in
+    that asset."""
     if 'short_channel_id' in onion or 'next_node_id' in onion:
-        return {'result': 'continue'}  # a forward: core keeps the asset
+        if forward_to is None:
+            return {'result': 'continue'}  # core fails it: no such channel
+        channels = our_channels(plugin)
+        asset = channel_asset(plugin, htlc['short_channel_id'], channels)
+        cid = forward_channel(channels, forward_to, asset, int(onion['forward_msat']))
+        if cid == forward_to:
+            return {'result': 'continue'}
+        if cid is not None:
+            return {'result': 'continue', 'forward_to': cid}
+        plugin.log('Refusing to forward {} from {} to channel {}: not in {}'
+                   .format(htlc['payment_hash'], htlc['short_channel_id'], forward_to, asset))
+        return {'result': 'fail', 'failure_message': '400a'}  # unknown_next_peer
     want = plugin.invoice_assets.get(htlc['payment_hash'], LBTC)
     got = channel_asset(plugin, htlc['short_channel_id'])
     if got == want:

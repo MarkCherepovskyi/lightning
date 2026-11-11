@@ -1817,6 +1817,20 @@ bool peer_start_channeld(struct channel *channel,
 	struct inflight **inflights;
 	struct bitcoin_txid txid;
 
+	/* Asset channels need the asset channel plugin (which sets the
+	 * feature bit): it keeps them from forwarding into another asset and
+	 * pays for their sweeps. */
+	if (channel->asset
+	    && !feature_offered(ld->our_features->bits[INIT_FEATURE],
+				OPT_CHANNEL_ASSET)) {
+		log_broken(channel->log,
+			   "Asset channel, but no asset channel plugin:"
+			   " not starting it");
+		force_peer_disconnect(ld, channel->peer,
+				      "Asset channel needs its plugin");
+		return false;
+	}
+
 	hsmfd = hsm_get_client_fd(ld, &channel->peer->id,
 				  channel->dbid,
 				  HSM_PERM_SIGN_GOSSIP

@@ -40,7 +40,7 @@ class FakeRpc:
         self.calls = []
         self.methods = ['getinfo', 'listfunds', 'listpeers', 'listpeerchannels', 'listconfigs', 'listchannels',
                         'fundchannel', 'connect', 'close', 'invoice', 'xpay', 'withdraw', 'newaddr', 'decode',
-                        'dev-fail'] + list(methods)
+                        'dev-fail', 'listforwards'] + list(methods)
         cfg = {'funding-confirms': 1, 'watchtime-blocks': 6}
         cfg.update(configs or {})
         self.r = {
@@ -53,6 +53,7 @@ class FakeRpc:
             'listpeers': {'peers': []},
             'listpeerchannels': {'channels': []},
             'listchannels': {'channels': []},
+            'listforwards': {'forwards': []},
             'newaddr': lambda p: {p.get('addresstype', 'bech32'): self.address(p.get('addresstype'))},
             'invoice': lambda p: {'bolt11': self.bolt11(p), 'payment_hash': '11' * 32},
             'xpay': {'payment_preimage': '22' * 32, 'amount_msat': 1_000_000, 'amount_sent_msat': 1_001_000,

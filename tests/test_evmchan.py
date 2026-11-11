@@ -890,6 +890,42 @@ def test_restart_mid_close(node_factory, chain, htlc):
         assert n.evm_status()['pending_sends'] == []
 
 
+def test_restart_rescan_htlc_success(node_factory, chain):
+    """The Base Sepolia force-close run's failure: the payee restarts and
+    rescans from before its close, so the funding spend starts a new
+    onchaind and the HTLC-success tx comes straight after. onchaind must
+    hear of that spend only once it knows the preimage, or it takes it for
+    the payer's timeout and never sweeps the HTLC-success output."""
+    l1, l2 = node_factory.get_nodes(2, opts=[{}, {'may_reconnect': True, 'plugin': HOLD, 'hold-all': False}])
+    l1.deposit(1_000_000)
+    l2.deposit(300_000)
+    open_channel(chain, l1, l2, 800_000)
+    msat = 50_000_000
+    inv = l2.rpc.invoice(msat, 'h', 'h')
+    phash = inv['payment_hash']
+    l2.rpc.call('hold-add', {'payment_hash': phash})
+    send_direct(l1, l2, msat, phash, inv['payment_secret'], 90)
+    htlcs_held(l1, l2, 1)
+    disconnect(l2, l1)
+    commit = chain.wait_event(l2.rpc.close(l1.info['id'], unilateraltimeout=1)['txids'][0])
+    wait_for(lambda: l1.state(l2) == 'ONCHAIN' and l2.state(l1) == 'ONCHAIN')
+    assert l2.rpc.call('hold-release', {'payment_hash': phash})['released'] == [phash]
+    tx = wait_resolved(chain, l2, 'OUR_UNILATERAL', 'THEIR_HTLC', 'OUR_HTLC_SUCCESS_TX')
+
+    # Negative: rescan from that height.
+    l2.daemon.opts['rescan'] = -(commit.height - 1)
+    mark = log_mark(l2)
+    l2.restart()
+    l2.daemon.logsearch_start = mark
+    assert not l2.daemon.is_in_log('Restarting onchaind', start=mark)
+    l2.daemon.wait_for_log('Resolved OUR_UNILATERAL/THEIR_HTLC by our proposal OUR_HTLC_SUCCESS_TX')
+    second = wait_resolved(chain, l2, 'OUR_HTLC_SUCCESS_TX', 'DELAYED_OUTPUT_TO_US',
+                           'OUR_DELAYED_RETURN_TO_WALLET')
+    assert second.spends()[0][0] == tx.txid
+    wait_for(lambda: ends_in_wallet(chain, l2, second.txid))
+    wait_forgotten(chain, l1, l2)
+
+
 @pytest.mark.parametrize('restart', [False, pytest.param(True, marks=pytest.mark.xfail(
     reason=REPLAY_BUG, strict=True, raises=AssertionError))])
 def test_restart_replay_two_spends(node_factory, chain, restart):

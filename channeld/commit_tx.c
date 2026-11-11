@@ -189,7 +189,11 @@ struct bitcoin_tx *commit_tx(const tal_t *ctx,
 	 * of 330 sats from the funder (either `to_local` or
 	 * `to_remote`).
 	 */
-	if ((option_anchor_outputs || option_anchors_zero_fee_htlc_tx)
+	/* (Not for asset channels: their fee reserve pays the anchors, as in
+	 * initial_commit_tx(), so commitment 0 and the later ones agree and no
+	 * opener balance is trimmed for anchor outputs it does not pay.) */
+	if (!asset
+	    && (option_anchor_outputs || option_anchors_zero_fee_htlc_tx)
 	    && !amount_sat_add(&base_fee, base_fee, AMOUNT_SAT(660)))
 		/* Can't overflow: feerate is u32. */
 		abort();

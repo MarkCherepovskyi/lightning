@@ -252,31 +252,45 @@ static struct bitcoin_tx *sign_last_tx(const tal_t *ctx,
 				       const struct bitcoin_signature *last_sig)
 {
 	struct lightningd *ld = channel->peer->ld;
-	struct bitcoin_signature sig, *reserve_sig, *their_reserve_sig;
+	struct bitcoin_signature sig, reserve_sig, *their_reserve_sig;
+	bool ok;
 	const u8 *msg;
 	u8 **witness;
 	u64 commit_index = channel->next_index[LOCAL] - 1;
 	struct bitcoin_tx *tx = clone_bitcoin_tx(ctx, last_tx);
 
 	assert(!tx->wtx->inputs[0].witness);
-	msg = towire_hsmd_sign_commitment_tx(NULL,
-					     &channel->peer->id,
-					     channel->dbid,
-					     tx,
-					     &channel->channel_info
-					     .remote_fundingkey,
-					     commit_index,
-					     channel->asset);
+	if (channel->asset)
+		msg = towire_hsmd_sign_asset_commitment_tx(NULL,
+							   &channel->peer->id,
+							   channel->dbid,
+							   tx,
+							   &channel->channel_info
+							   .remote_fundingkey,
+							   commit_index,
+							   channel->asset);
+	else
+		msg = towire_hsmd_sign_commitment_tx(NULL,
+						     &channel->peer->id,
+						     channel->dbid,
+						     tx,
+						     &channel->channel_info
+						     .remote_fundingkey,
+						     commit_index);
 
 	msg = hsm_sync_req(tmpctx, ld, take(msg));
-	if (!fromwire_hsmd_sign_commitment_tx_reply(tmpctx, msg, &sig, &reserve_sig))
+	if (channel->asset)
+		ok = fromwire_hsmd_sign_asset_tx_reply(msg, &sig, &reserve_sig);
+	else
+		ok = fromwire_hsmd_sign_commitment_tx_reply(msg, &sig);
+	if (!ok)
 		fatal("HSM gave bad sign_commitment_tx_reply %s",
 		      tal_hex(tmpctx, msg));
 
 	/* Asset channel txs also spend the fee reserve (input 1).  hsmd
 	 * signed it for us; the peer's signature is in the PSBT, where
 	 * channeld/closingd put it when it checked it. */
-	if (reserve_sig) {
+	if (channel->asset) {
 		if (!psbt_input_get_ecdsa_sig(tmpctx, tx->psbt, 1,
 					      &channel->channel_info.remote_fundingkey,
 					      &their_reserve_sig)
@@ -289,7 +303,7 @@ static struct bitcoin_tx *sign_last_tx(const tal_t *ctx,
 			bitcoin_tx_input_set_witness(tx, 1,
 				take(bitcoin_witness_2of2(NULL,
 							  their_reserve_sig,
-							  reserve_sig,
+							  &reserve_sig,
 							  &channel->channel_info.remote_fundingkey,
 							  &channel->local_funding_pubkey)));
 	}
@@ -2870,7 +2884,7 @@ void channel_watch_funding(struct lightningd *ld, struct channel *channel)
 				   take(scriptpubkey_p2wsh(NULL, funding_wscript)),
 				   &channel->funding,
 				   channel->funding_sats,
-				   channel_asset_tag(channel->asset),
+				   channel->asset,
 				   channel_funding_found,
 				   channel);
 	}

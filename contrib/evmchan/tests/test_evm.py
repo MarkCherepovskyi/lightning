@@ -159,3 +159,55 @@ def test_get_logs_other_errors_propagate():
     node = Down('http://fake.invalid')
     with pytest.raises(evm.EvmError):
         list(node.get_logs_chunked('0x' + '00' * 20, None, 0, 100000))
+
+
+def test_transport_errors_name_their_cause_without_the_url():
+    """A failed request says what failed (DNS, refused, timeout) by type and
+    errno only: urllib's messages can hold the URL and so the API key."""
+    import socket
+    key = 'k3yk3yk3yk3yk3yk3yk3yk3yk3yk3y00'
+    with socket.socket() as s:          # a port nobody listens on
+        s.bind(('127.0.0.1', 0))
+        port = s.getsockname()[1]
+    with pytest.raises(evm.EvmError) as e:
+        evm.EvmRpc('http://127.0.0.1:{}/v3/{}'.format(port, key), timeout=5).call('eth_chainId')
+    assert str(e.value).startswith('eth_chainId: URLError(ConnectionRefusedError') and key not in str(e.value)
+    with pytest.raises(evm.EvmError) as e:
+        evm.EvmRpc('http://{}.invalid/v3/{}'.format(key, key), timeout=5).call('eth_chainId')
+    assert str(e.value).startswith('eth_chainId: URLError(gaierror') and key not in str(e.value)
+    with pytest.raises(evm.EvmError) as e:            # urllib's message here is the whole URL
+        evm.EvmRpc('nope://x/v3/' + key).call('eth_chainId')
+    assert str(e.value) == 'eth_chainId: URLError' and key not in str(e.value)
+    assert evm.error_kind(TimeoutError()) == 'TimeoutError'
+
+
+def test_oversized_or_absurdly_nested_replies_are_errors(monkeypatch):
+    """A provider can't make the plugin hold an unbounded reply, or crash it
+    with JSON nested past the recursion limit: both are EvmErrors."""
+    import http.server
+    import threading
+    bodies = [b'{"jsonrpc":"2.0","id":1,"result":"' + b'a' * 2000 + b'"}', b'[' * 100000]
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            self.rfile.read(int(self.headers['Content-Length']))
+            body = bodies.pop(0)
+            self.send_response(200)
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+    srv = http.server.HTTPServer(('127.0.0.1', 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        monkeypatch.setattr(evm, 'MAX_REPLY', 1000)
+        rpc = evm.EvmRpc('http://127.0.0.1:{}'.format(srv.server_address[1]), timeout=5)
+        with pytest.raises(evm.EvmError, match='eth_chainId: reply over 1000 bytes'):
+            rpc.call('eth_chainId')
+        monkeypatch.setattr(evm, 'MAX_REPLY', 10**6)
+        with pytest.raises(evm.EvmError, match='eth_chainId: bad reply'):
+            rpc.call('eth_chainId')
+    finally:
+        srv.shutdown()

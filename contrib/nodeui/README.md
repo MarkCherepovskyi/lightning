@@ -22,6 +22,42 @@ python3 $W/contrib/nodeui/ui.py --network liquid-regtest --elements-rpc http://p
 Open http://127.0.0.1:8765. To see the page with sample data and no nodes, open
 `/?demo`.
 
+### The whole test environment: `testnet.sh`
+
+`contrib/nodeui/testnet.sh` starts, stops and checks the nodes this page was tested
+with, and the page itself:
+
+| Network | Nodes | Where |
+|---|---|---|
+| Base Sepolia, ETH UtxoChain (`contrib/evmchan`) | P Q R S T U | `~/.evmchan-testnet/<name>`, ports 20781-20786 |
+| Liquid testnet, asset channels (`contrib/assetchan`) | LA … LF | `~/.assetchan-testnet/<A-F>`, ports 20761-20766 |
+| Bitcoin regtest (its own bitcoind) | X Y | `~/.btc-regtest/<name>`, ports 20791-20792 |
+
+```sh
+INFURA_API_KEY=... contrib/nodeui/testnet.sh start     # all, or: evm | liquid | btc | ui
+contrib/nodeui/testnet.sh status                       # heights, EVM lag, gas and alarms
+contrib/nodeui/testnet.sh cli P listpeerchannels       # lightning-cli of any node
+contrib/nodeui/testnet.sh stop                         # all, or one group
+```
+
+- `start` skips what already runs, and writes the page's `nodes.json` from the node
+  directories that exist. The page is at http://127.0.0.1:8780.
+- EVM nodes start one at a time, 10 s apart. One with an empty index starts from
+  `~/.evmchan-testnet/snap/eth-index.jsonl.gz`, so fresh nodes don't trip Infura's
+  per-second limit with a full catch-up.
+- They poll every 180 s and keep 0.003 ETH for gas (`EVM_POLL`, `EVM_MIN_BALANCE`):
+  six nodes then use about 0.9M of Infura's 3M free credits a day.
+- The Infura key is read from the environment only; the page gets none.
+- Liquid needs the liquid-ln-testnet docker stack and its socat proxy on 127.0.0.1:7039
+  (see `contrib/assetchan/nodes.sh`). `start` restarts a stopped proxy container and
+  loads the elementsd wallet.
+- Bitcoin regtest gets a wallet with 101 blocks mined on first start.
+- A new EVM node needs gas at the ETH address `status` prints (from a faucet or another
+  key), and a Deposit on the page before it can open channels. A new Liquid node gets
+  L-BTC with the page's "Fund node".
+- Names, directories, ports and the contract are environment variables: run the script
+  without arguments for the list.
+
 `--node NAME=DIR` takes the lightning dir. The page finds `DIR/<network>/lightning-rpc`
 itself; `--network` pins the subdirectory. `nodes.json` looks like this:
 
@@ -75,17 +111,62 @@ channels and maps.
 
 ## What the page does
 
+Explanations stay out of the way: every form, section and channel state has a **?** icon
+whose tip shows on hover, focus or click (Escape or a click elsewhere closes it). A form's
+tip is built from its hints, which the page keeps up to date as you pick nodes. After the
+server restarts, an open page's token is stale (HTTP 403): the page reloads itself once to
+get the new one.
+
 For every node it shows:
 - info, peers, the wallet balance;
 - every channel, with its split, its state and onchaind's latest status after a
   force close;
 - a map per network ID, from `listchannels` (gossip) plus the local channels.
 
+Explorer links (Blockscout for the EVM chains in `EVM_EXPLORERS`, mempool.space for
+Bitcoin, blockstream.info for Liquid; none on regtest, liquid-regtest or anvil):
+- each node card lists what to look the node up by, with a copy button: on EVM its
+  ETH address, the contract and the token; elsewhere the wallet addresses holding
+  funds, largest first (four, then "+N more");
+- each channel shows its funding tx. On Bitcoin and Liquid it links the tx itself.
+  On an EVM chain the funding tx exists only inside the contract, so it links the
+  EVM tx that applied it, from the plugin's `evm-txinfo` (one `eth_getLogs` per
+  channel, once it is at the confirmation tag; remembered).
+- The state carries only paths (`/tx/…`, `/address/…`): it is scrubbed of anything
+  like a URL. The explorers' base URLs come from the page's own table, in
+  `state['explorers']`.
+
 Actions:
-- open, pay (between page nodes, or a pasted bolt11), invoice;
-- close, force close;
+- open, with "Announce to the network" ticked by default (CLN's own default). Only
+  announced channels are gossiped, 6 confirmations after they open; a private one can be
+  used by other payers only as the invoice's last hop, so routes of 3 hops or more need
+  announced channels. The open's log says which it is;
+- pay (between page nodes, or a pasted bolt11), invoice:
+  - an invoice whose payee can take the amount on no announced channel (none, or all
+    full on its side, as a channel it opened itself is) names its private channels that
+    can in `exposeprivatechannels`. CLN would otherwise hint none of them, and a payer
+    can't find the payee ("Unknown destination node", "no connection"). When no channel
+    can take it, the log says how much the payee can receive. CLN's `warning_*` fields go
+    to the log too;
+  - a payment between page nodes logs its route, e.g. `P -> Q -> R -> S -> T -> U (5 hops,
+    forwarded by Q over 4127x1x0 -> 4127x2x0 ...)`, from the settled forwards that
+    appeared on the page's nodes during it;
+  - a routing failure logs how many channels the payer knows through gossip and what to
+    do about it;
+  - where nobody mines, xpay gets `retry_for` 600 s: nodes' block heights differ there (an
+    EVM node is up to an `evm-poll` behind), a payee ahead of the payer rejects its CLTV,
+    and xpay waits for its own height to catch up only while it retries;
+- close, force close. A close's log gives the node's share, and where nobody mines it
+  waits for the share to reach the wallet and gives the wallet before and after; on EVM it
+  also gives the EVM tx that applied the closing tx. A force close says how long the
+  closing node's share stays locked (the peer's `watchtime-blocks`, in hours on EVM);
 - send on-chain, new address, fund;
-- deposit, exit, withdraw (EVM only);
+- deposit, exit, withdraw, and cash out (exit everything, wait for the contract to credit
+  it, withdraw) (EVM only). Withdraw logs the ETH address's balance before and after and
+  the gas the EVM tx cost. The EVM tab's "Did the money arrive?" has a checklist from the
+  channel to the explorer;
+- the Activity logs link tx hashes to the network's explorer (0x hashes on EVM chains;
+  hashes after `tx`/`txid` elsewhere);
 - mine (only on the networks listed under Mining below).
 
 Actions run one at a time per network ID, and side by side on different networks.
