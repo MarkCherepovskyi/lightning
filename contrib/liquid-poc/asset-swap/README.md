@@ -1,5 +1,53 @@
 # Asset-swap quick guide
 
+## On this branch: Liquid -> EVM swaps on master's asset channels
+
+The plugins were written on `liquid-merged`, whose Liquid asset channels
+were in core (`invoice`/`xpay`/`getroutes asset=`). Master replaced that
+with `contrib/assetchan` and added EVM channels (`contrib/evmchan`), so
+here `assetswap-plugin` works with those instead:
+
+- **Asset names.** An issued Liquid asset is its 64-hex id; anything else
+  names a node's native coin (`lbtc` on Liquid, `eth` on an EVM node). A
+  native coin is invoiced and paid plainly; an issued asset goes through
+  assetchan (`assetchan-invoice`, and an askrene layer `assetswap.<asset>`
+  that keeps routes on channels in that asset, as `assetchan-pay` does).
+- **A provider across two chains** is two nodes of one operator, one per
+  chain. The one that receives leg 1 loads both plugins and names the
+  other with `assetswap-remote=<asset>:<its lightning-rpc>`; leg 2 is
+  decoded and paid there:
+
+  ```
+  plugin=/path/to/assetswap-plugin
+  plugin=/path/to/pricetiers-plugin
+  pricetiers-pair=lbtc:eth:1000000:0
+  assetswap-remote=eth:/path/to/evm-node/regtest/lightning-rpc
+  ```
+
+  The payer sets `assetswap-provider=<that Liquid node's id>`; the payee
+  (the EVM node) makes the invoice with `assetinvoice ... asset=eth`.
+- **Hook order.** `htlc_accepted` runs before `assetchan.py`'s, which
+  would otherwise fail a leg 1 that arrives in an asset no invoice asks for.
+- **Tests:** `contrib/liquid-poc/asset-swap/run-tests.sh` runs
+  `plugins/assetswap-plugin/tests/test_liquid_evm_swap.py` in Docker
+  (elementsd + anvil): L-BTC -> ETH, issued asset -> ETH, leg 2 failing,
+  and an underpaid leg 1.
+
+Not done yet:
+
+- **CLTVs across chains are compared as raw block counts.** The provider
+  checks leg 1's expiry (Liquid blocks) against leg 2's (EVM blocks) and
+  passes `xpay` a `maxdelay` derived from Liquid blocks. That is only safe
+  if an EVM block is no longer than a Liquid one; it needs a conversion by
+  block time before real funds.
+- The Liquid-only tests (`test_cross_asset_swap.py` and the others here)
+  still use `liquid-merged`'s `fund_asset_channel` and need porting to
+  assetchan.
+- Sections 2-7 below describe `liquid-merged`'s `lnpoc.py` network and UI,
+  which this branch doesn't have.
+
+## On liquid-merged
+
 Step-by-step for running a cross-asset swap-provider ("server") and a payer
 ("client") on top of the `contrib/liquid-poc` network, and for creating and
 paying invoices, same-asset or cross-asset. Design background:

@@ -2,7 +2,7 @@
 //! RPC into one self-contained string that also carries the asset it
 //! requires, since that asset isn't part of the signed bolt11 bytes.
 
-use crate::protocol::is_lbtc;
+use crate::protocol::is_asset_id;
 use crate::rpc::{new_rpc, param};
 use crate::State;
 use anyhow::{anyhow, Error};
@@ -48,29 +48,52 @@ pub(crate) async fn assetinvoice(p: Plugin<State>, args: Value) -> Result<Value,
         .to_owned();
     let asset = param(&args, 3, "asset")
         .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("Missing asset ('lbtc', or the id of the asset you want to be paid in)"))?
+        .ok_or_else(|| anyhow!("Missing asset (this node's native coin, e.g. 'lbtc' or 'eth', or the id of the asset you want to be paid in)"))?
         .to_owned();
 
     let mut rpc = new_rpc(&p).await?;
-    let inv = rpc
-        .call_typed(&InvoiceRequest {
-            amount_msat: AmountOrAny::Amount(Amount::from_msat(amount_msat)),
-            description,
-            label,
-            asset: if is_lbtc(&asset) { None } else { Some(asset.clone()) },
-            cltv: None,
-            deschashonly: None,
-            expiry: None,
-            preimage: None,
-            exposeprivatechannels: None,
-            fallbacks: None,
-        })
-        .await?;
+    // A native coin: an ordinary invoice. An issued asset: contrib/
+    // assetchan's, which remembers the asset so its htlc_accepted hook only
+    // takes the payment over a channel in it, and hints only at those.
+    let (bolt11, payment_hash) = if is_asset_id(&asset) {
+        if amount_msat % 1000 != 0 {
+            return Err(anyhow!("amount_msat must be whole units of {asset}"));
+        }
+        let inv: Value = rpc
+            .call_raw(
+                "assetchan-invoice",
+                &json!({"amount": amount_msat / 1000, "asset": asset, "label": label, "description": description}),
+            )
+            .await
+            .map_err(|e| anyhow!("assetchan-invoice: {e}"))?;
+        let field = |k: &str| {
+            inv[k]
+                .as_str()
+                .map(str::to_string)
+                .ok_or_else(|| anyhow!("assetchan-invoice returned no {k}"))
+        };
+        (field("bolt11")?, field("payment_hash")?)
+    } else {
+        let inv = rpc
+            .call_typed(&InvoiceRequest {
+                amount_msat: AmountOrAny::Amount(Amount::from_msat(amount_msat)),
+                description,
+                label,
+                cltv: None,
+                deschashonly: None,
+                expiry: None,
+                preimage: None,
+                exposeprivatechannels: None,
+                fallbacks: None,
+            })
+            .await?;
+        (inv.bolt11, inv.payment_hash.to_string())
+    };
 
     let wrapper = AssetInvoiceWrapper {
         v: 1,
-        bolt11: inv.bolt11,
-        payment_hash: inv.payment_hash.to_string(),
+        bolt11,
+        payment_hash,
         asset,
         amount_msat,
     };

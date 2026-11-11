@@ -28,7 +28,7 @@ mod protocol;
 mod rpc;
 
 use anyhow::{anyhow, Error};
-use cln_plugin::Builder;
+use cln_plugin::{Builder, HookBuilder};
 use cln_rpc::primitives::PublicKey;
 use std::str::FromStr;
 
@@ -44,9 +44,15 @@ async fn main() -> Result<(), Error> {
     let Some(plugin) = Builder::new(tokio::io::stdin(), tokio::io::stdout())
         .dynamic()
         .option(config::OPT_PROVIDER)
+        .option(config::OPT_REMOTE)
         .option(config::OPT_SAFETY_BLOCKS)
         .option(config::OPT_MIN_HOP_BUDGET)
-        .hook("htlc_accepted", htlc::on_htlc_accepted)
+        // Before contrib/assetchan's hook: a leg 1 that lands here in an
+        // issued asset has no invoice of ours, so assetchan's final-hop
+        // check would fail it as being in the wrong asset.
+        .hook_from_builder(
+            HookBuilder::new("htlc_accepted", htlc::on_htlc_accepted).before(vec!["assetchan.py".into()]),
+        )
         .rpcmethod(
             "assetinvoice",
             "Create an invoice and package it with the asset it requires \
@@ -80,8 +86,16 @@ async fn main() -> Result<(), Error> {
         .map(|s| PublicKey::from_str(s).map_err(|e| anyhow!("bad assetswap-provider {s}: {e}")))
         .collect::<Result<_, _>>()?;
 
+    let remotes = config::parse_remotes(
+        &plugin
+            .option_str("assetswap-remote")?
+            .and_then(|v| v.as_str_arr().cloned())
+            .unwrap_or_default(),
+    )?;
+
     let config = config::Config {
         providers,
+        remotes,
         safety_blocks: plugin.option_str("assetswap-cltv-safety-blocks")?.and_then(|v| v.as_i64()).unwrap_or(18) as u32,
         min_hop_budget: plugin.option_str("assetswap-min-hop-budget")?.and_then(|v| v.as_i64()).unwrap_or(34) as u32,
     };

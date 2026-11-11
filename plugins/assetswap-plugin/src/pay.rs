@@ -26,8 +26,8 @@
 //! its own doc comment).
 
 use crate::assetinvoice::decode_wrapper;
-use crate::protocol::{asset_sha, encode_swap_metadata, fetch_price_tiers, SwapMetadata};
-use crate::rpc::{getroutes_path_to_sendpay_route, new_rpc, param};
+use crate::protocol::{encode_swap_metadata, fetch_price_tiers, SwapMetadata};
+use crate::rpc::{asset_layers, getroutes_path_to_sendpay_route, new_rpc, param};
 use crate::State;
 use anyhow::{anyhow, Error};
 use cln_plugin::Plugin;
@@ -103,23 +103,28 @@ pub(crate) async fn payassetinvoice(p: Plugin<State>, args: Value) -> Result<Val
 
     let want_direct = from_asset.as_deref().is_none_or(|a| a == wrapper.asset);
     let direct_err = if want_direct {
-        match rpc
-            .call_typed(&XpayRequest {
-                invstring: wrapper.bolt11.clone(),
-                asset: asset_sha(&wrapper.asset)?,
-                amount_msat: None,
-                dev_use_shadow: None,
-                label: None,
-                localinvreqid: None,
-                maxdelay: None,
-                maxfee: None,
-                partial_msat: None,
-                payer_note: None,
-                retry_for: None,
-                layers: None,
-            })
-            .await
-        {
+        // (An invoice of another chain's node fails here too: xpay refuses
+        // an invoice for another network.)
+        let direct = match asset_layers(&mut rpc, &wrapper.asset).await {
+            Ok(layers) => rpc
+                .call_typed(&XpayRequest {
+                    invstring: wrapper.bolt11.clone(),
+                    amount_msat: None,
+                    dev_use_shadow: None,
+                    label: None,
+                    localinvreqid: None,
+                    maxdelay: None,
+                    maxfee: None,
+                    partial_msat: None,
+                    payer_note: None,
+                    retry_for: None,
+                    layers: Some(layers),
+                })
+                .await
+                .map_err(Error::from),
+            Err(e) => Err(e),
+        };
+        match direct {
             Ok(res) => return Ok(json!(res)),
             Err(e) => {
                 // An explicit from_asset == the invoice's own asset means
@@ -195,16 +200,18 @@ pub(crate) async fn payassetinvoice(p: Plugin<State>, args: Value) -> Result<Val
 
     let my_id = rpc.call_typed(&GetinfoRequest {}).await?.id;
     let maxfee_msat = from_amount_msat / 100; // 1% leg-1 routing-fee budget
+    let mut layers: Vec<String> = vec!["auto.localchans".into(), "auto.sourcefree".into()];
+    layers.extend(asset_layers(&mut rpc, &from_asset).await?);
     let routes = rpc
         .call_typed(&GetroutesRequest {
             source: my_id,
             destination: provider,
             amount_msat: Amount::from_msat(from_amount_msat),
-            asset: asset_sha(&from_asset)?,
             final_cltv,
-            layers: vec!["auto.localchans".into(), "auto.sourcefree".into()],
+            layers,
             maxfee_msat: Amount::from_msat(maxfee_msat),
             maxdelay: None,
+            maxhops: None,
             maxparts: None,
         })
         .await

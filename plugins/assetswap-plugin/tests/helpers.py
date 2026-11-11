@@ -3,7 +3,6 @@ for the design these exercise). conftest.py in this directory puts
 tests/ on sys.path so the plain `from fixtures import *` convention used
 by every test_*.py here, and the imports below, both resolve.
 """
-from test_liquid_asset_poc import fund_asset_channel
 from utils import wait_for, sync_blockheight
 
 import base64
@@ -54,7 +53,11 @@ def setup_swap_topology(node_factory, bitcoind, rate_ppm=DEFAULT_RATE_PPM,
     without a restart, so it has to be known up front.
 
     Returns (l1, l2, l3, asset_a, asset_b, lbtc).
+
+    Not ported yet: fund_asset_channel is the old core Liquid asset
+    channels' (liquid-merged), which master replaced with contrib/assetchan.
     """
+    from test_liquid_asset_poc import fund_asset_channel
     lbtc = bitcoind.rpc.dumpassetlabels()['bitcoin']
     asset_a = bitcoind.rpc.issueasset(1000, 0, False)['asset']
     asset_b = bitcoind.rpc.issueasset(1000, 0, False)['asset']

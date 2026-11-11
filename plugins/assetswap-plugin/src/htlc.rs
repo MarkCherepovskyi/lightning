@@ -6,27 +6,27 @@
 //! provider decides live, on arrival, whether this HTLC is profitable at
 //! its current price (see pay.rs's doc comment for why).
 
-use crate::protocol::{
-    asset_sha, decode_swap_metadata, fetch_price_tiers, is_lbtc, quote_key, QuoteRecord,
-};
-use crate::rpc::new_rpc;
+use crate::protocol::{decode_swap_metadata, fetch_price_tiers, is_asset_id, quote_key, QuoteRecord};
+use crate::rpc::{asset_layers, channel_asset, leg2_rpc, new_rpc};
 use crate::State;
 use anyhow::{anyhow, Error};
 use cln_plugin::Plugin;
 use cln_rpc::model::requests::{
-    DatastoreMode, DatastoreRequest, DecodeRequest, ListdatastoreRequest,
-    ListpeerchannelsRequest, ListsendpaysRequest, WaitsendpayRequest, XpayRequest,
+    DatastoreMode, DatastoreRequest, DecodeRequest, ListdatastoreRequest, ListsendpaysRequest,
+    WaitsendpayRequest, XpayRequest,
 };
 use cln_rpc::model::responses::ListsendpaysPaymentsStatus;
-use cln_rpc::primitives::{Secret, ShortChannelId};
+use cln_rpc::primitives::Secret;
 use cln_rpc::ClnRpc;
 use serde_json::{json, Value};
-use std::str::FromStr;
 
 /// How long to wait on a still-`pending` leg-2 payment during restart-replay
 /// idempotency handling before giving up and failing leg 1. See
 /// `resolve_from_leg2_status`.
 const RESTART_LEG2_WAIT_SECS: u32 = 30;
+
+/// How often a restart replay retries reaching the node that paid leg 2.
+const REMOTE_RETRY_SECS: u64 = 5;
 
 /// incorrect_or_unknown_payment_details (BOLT4 0x400f), with a zeroed
 /// htlc_msat+height tail — real nodes accept a bogus tail here (see
@@ -57,18 +57,6 @@ async fn lookup_quote(rpc: &mut ClnRpc, payment_hash: &str) -> Result<Option<Quo
         }
         None => Ok(None),
     }
-}
-
-async fn channel_asset(rpc: &mut ClnRpc, scid: &str) -> Result<Option<String>, Error> {
-    let short = ShortChannelId::from_str(scid)?;
-    let res = rpc
-        .call_typed(&ListpeerchannelsRequest {
-            channel_id: None,
-            id: None,
-            short_channel_id: Some(short),
-        })
-        .await?;
-    Ok(res.channels.into_iter().next().and_then(|c| c.liquid_asset))
 }
 
 /// Atomic claim via datastore's generation CAS: only the first HTLC for a
@@ -257,7 +245,19 @@ pub(crate) async fn on_htlc_accepted(p: Plugin<State>, v: Value) -> Result<Value
     // bigger amount) fall through and be judged again from scratch.
     match lookup_quote(&mut rpc, &payment_hash).await {
         Ok(Some(r)) if r.state == "claimed" => {
-            return Ok(resolve_from_leg2_status(&mut rpc, &r).await);
+            // Leg 2's outcome is on the node that paid it. Until it can be
+            // asked, hold leg 1: failing it while leg 2 may have been paid
+            // would lose us that payment.
+            let mut rpc2 = loop {
+                match leg2_rpc(&p, &r.to_asset).await {
+                    Ok(r2) => break r2,
+                    Err(e) => {
+                        log::warn!("assetswap: replaying {payment_hash}, retrying in {REMOTE_RETRY_SECS}s: {e}");
+                        tokio::time::sleep(std::time::Duration::from_secs(REMOTE_RETRY_SECS)).await;
+                    }
+                }
+            };
+            return Ok(resolve_from_leg2_status(&mut rpc2, &r).await);
         }
         Ok(_) => {}
         Err(e) => {
@@ -277,11 +277,24 @@ pub(crate) async fn on_htlc_accepted(p: Plugin<State>, v: Value) -> Result<Value
         return Ok(json!({"result": "continue"}));
     };
 
-    let decoded = rpc
+    // Leg 2 is paid by this node, or, for an asset on another chain, by
+    // the node of ours `assetswap-remote` names (its invoice is for that
+    // chain's network, its CLTVs in that chain's blocks).
+    let mut rpc2 = match leg2_rpc(&p, &meta.to_asset).await {
+        Ok(r) => r,
+        Err(e) => {
+            log::warn!("assetswap: {e}");
+            return Ok(fail_incorrect_details());
+        }
+    };
+    let Ok(decoded) = rpc2
         .call_typed(&DecodeRequest {
             string: meta.final_bolt11.clone(),
         })
-        .await?;
+        .await
+    else {
+        return Ok(fail_incorrect_details());
+    };
     let (Some(to_amount_msat), Some(final_payment_hash), Some(leg2_final_cltv)) = (
         decoded.amount_msat.map(|a| a.msat()),
         decoded.payment_hash.map(|h| h.to_string()),
@@ -311,10 +324,12 @@ pub(crate) async fn on_htlc_accepted(p: Plugin<State>, v: Value) -> Result<Value
         return Ok(fail_incorrect_details()); // we'd lose money at our own current price
     }
 
-    // CLN's own `liquid_asset` field is `None` for an L-BTC channel, not
-    // the literal "lbtc" our own protocol uses — bridge the two here.
-    let chan_asset = channel_asset(&mut rpc, &scid).await.ok().flatten();
-    let expected_chan_asset = if is_lbtc(&priced.from_asset) { None } else { Some(priced.from_asset.as_str()) };
+    // Leg 1 must have come in the asset we priced it in: listpeerchannels
+    // shows no asset for a channel in the native coin.
+    let Ok(chan_asset) = channel_asset(&mut rpc, &scid).await else {
+        return Ok(fail_incorrect_details());
+    };
+    let expected_chan_asset = is_asset_id(&priced.from_asset).then_some(priced.from_asset.as_str());
     let budget = leg2_final_cltv + p.state().config.safety_blocks + p.state().config.min_hop_budget;
     if chan_asset.as_deref() != expected_chan_asset || cltv_expiry_relative < budget {
         return Ok(fail_incorrect_details());
@@ -334,18 +349,18 @@ pub(crate) async fn on_htlc_accepted(p: Plugin<State>, v: Value) -> Result<Value
     };
 
     let maxdelay = cltv_expiry_relative.saturating_sub(leg2_final_cltv + p.state().config.safety_blocks);
-    let to_asset_sha = match asset_sha(&rec.to_asset) {
-        Ok(a) => a,
-        Err(_) => {
+    let layers = match asset_layers(&mut rpc2, &rec.to_asset).await {
+        Ok(l) => l,
+        Err(e) => {
+            log::warn!("assetswap: leg 2 for {payment_hash}: {e}");
             mark_quote_failed(&mut rpc, &payment_hash, &rec, claimed_generation).await;
             return Ok(fail_incorrect_details());
         }
     };
-    match rpc
+    match rpc2
         .call_typed(&XpayRequest {
             invstring: rec.final_bolt11.clone(),
             amount_msat: None,
-            asset: to_asset_sha,
             dev_use_shadow: None,
             label: None,
             localinvreqid: None,
@@ -354,7 +369,7 @@ pub(crate) async fn on_htlc_accepted(p: Plugin<State>, v: Value) -> Result<Value
             partial_msat: None,
             payer_note: None,
             retry_for: None,
-            layers: None,
+            layers: Some(layers),
         })
         .await
     {

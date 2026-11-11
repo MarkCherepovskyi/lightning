@@ -4,30 +4,17 @@
 //! datastore-backed record of a swap the provider has committed to.
 
 use anyhow::{anyhow, Error};
-use cln_rpc::primitives::Sha256;
 use cln_rpc::ClnRpc;
 use serde::{Deserialize, Serialize};
-use std::str::FromStr;
 
-/// Every asset string this plugin's own protocol/config carries (quote
-/// messages, datastore records, `--assetswap-pair`/`-provider`, the
-/// `assetinvoice`/`payassetinvoice` RPCs) uses the literal string `"lbtc"`
-/// for L-BTC, never a resolved asset id — `xpay`/`getroutes`/`invoice`'s
-/// own `asset` parameter needs `None` (omitted) for L-BTC, not an explicit
-/// hash (L-BTC has no Liquid asset tag; passing one is a different,
-/// unrelated id and breaks routing/invoice matching). `asset_sha` is the
-/// single point doing that translation before any such RPC call.
-pub(crate) fn is_lbtc(s: &str) -> bool {
-    s.eq_ignore_ascii_case("lbtc")
-}
-
-pub(crate) fn asset_sha(s: &str) -> Result<Option<Sha256>, Error> {
-    if is_lbtc(s) {
-        return Ok(None);
-    }
-    Ok(Some(
-        Sha256::from_str(s).map_err(|e| anyhow!("invalid asset id {s}: {e}"))?,
-    ))
+/// How this plugin names what a payment is in: an issued Liquid asset by
+/// its 32-byte hex id (as elements-cli prints it), anything else ("lbtc",
+/// "eth", ...) by a label for the coin native to some node's chain.  A
+/// native coin needs nothing special to invoice or pay in; an issued asset
+/// goes through contrib/assetchan (see `rpc::asset_layers`).  On a Liquid
+/// node the native coin's label must be "lbtc", as assetchan calls it.
+pub(crate) fn is_asset_id(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
