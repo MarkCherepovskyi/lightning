@@ -597,22 +597,47 @@ static u8 *funder_channel_start(struct state *state, u8 channel_flags,
 						  state->channel_type);
 }
 
-/* Read hsmd's reply to hsmd_sign_remote_commitment_tx.  For asset channels
- * hsmd also signs the fee reserve input; that signature goes to the peer in
- * a TLV. */
-static void read_remote_commitment_sigs(const tal_t *ctx,
-					struct bitcoin_signature *sig,
-					secp256k1_ecdsa_signature **fee_reserve_sig)
+/* Ask hsmd to sign their first commitment tx.  For asset channels hsmd also
+ * signs the fee reserve input; that signature goes to the peer in a TLV. */
+static void sign_remote_commitment(const tal_t *ctx,
+				   const struct state *state,
+				   const struct bitcoin_tx *tx,
+				   struct bitcoin_signature *sig,
+				   secp256k1_ecdsa_signature **fee_reserve_sig)
 {
-	const u8 *msg = wire_sync_read(tmpctx, HSM_FD);
-	struct bitcoin_signature *reserve_sig;
+	const struct pubkey *remote_fundingkey
+		= &state->channel->funding_pubkey[REMOTE];
+	const struct pubkey *remote_point
+		= &state->first_per_commitment_point[REMOTE];
+	bool static_remotekey = channel_has(state->channel,
+					    OPT_STATIC_REMOTEKEY);
+	struct bitcoin_signature reserve_sig;
+	const u8 *msg;
+	bool ok;
 
-	if (!fromwire_hsmd_sign_commitment_tx_reply(tmpctx, msg, sig, &reserve_sig))
+	/* No htlcs, so commit_num and feerate are 0. */
+	if (state->asset)
+		msg = towire_hsmd_sign_asset_remote_commitment_tx(NULL, tx,
+					remote_fundingkey, remote_point,
+					static_remotekey, 0, NULL, 0,
+					state->asset);
+	else
+		msg = towire_hsmd_sign_remote_commitment_tx(NULL, tx,
+					remote_fundingkey, remote_point,
+					static_remotekey, 0, NULL, 0);
+	wire_sync_write(HSM_FD, take(msg));
+
+	msg = wire_sync_read(tmpctx, HSM_FD);
+	if (state->asset)
+		ok = fromwire_hsmd_sign_asset_tx_reply(msg, sig, &reserve_sig);
+	else
+		ok = fromwire_hsmd_sign_tx_reply(msg, sig);
+	if (!ok)
 		status_failed(STATUS_FAIL_HSM_IO,
-			      "Bad sign_commitment_tx_reply %s",
+			      "Bad sign_remote_commitment_tx reply %s",
 			      tal_hex(tmpctx, msg));
-	*fee_reserve_sig = reserve_sig
-		? tal_dup(ctx, secp256k1_ecdsa_signature, &reserve_sig->s)
+	*fee_reserve_sig = state->asset
+		? tal_dup(ctx, secp256k1_ecdsa_signature, &reserve_sig.s)
 		: NULL;
 }
 
@@ -722,21 +747,8 @@ static bool funder_finalize_channel_setup(struct state *state,
 	 * witness script.  It also needs the amount of the funding output,
 	 * as segwit signatures commit to that as well, even though it doesn't
 	 * explicitly appear in the transaction itself. */
-	u32 feerate = 0; // unused since there are no htlcs
-	u64 commit_num = 0;
-	msg = towire_hsmd_sign_remote_commitment_tx(NULL,
-						   *tx,
-						   &state->channel->funding_pubkey[REMOTE],
-						   &state->first_per_commitment_point[REMOTE],
-						    channel_has(state->channel,
-								OPT_STATIC_REMOTEKEY),
-						    commit_num,
-						    NULL, /* No htlcs */
-						    feerate, state->asset);
-
-	wire_sync_write(HSM_FD, take(msg));
-	read_remote_commitment_sigs(created_tlvs, sig,
-				    &created_tlvs->fee_reserve_sig);
+	sign_remote_commitment(created_tlvs, state, *tx, sig,
+			       &created_tlvs->fee_reserve_sig);
 
 	/* You can tell this has been a problem before, since there's a debug
 	 * message here: */
@@ -1393,22 +1405,9 @@ static u8 *fundee_channel(struct state *state, const u8 *open_channel_msg)
 	}
 
 	/* Make HSM sign it */
-	u32 feerate = 0; // unused since there are no htlcs
-	u64 commit_num = 0;
-	msg = towire_hsmd_sign_remote_commitment_tx(NULL,
-						   remote_commit,
-						   &state->channel->funding_pubkey[REMOTE],
-						   &state->first_per_commitment_point[REMOTE],
-						    channel_has(state->channel,
-								OPT_STATIC_REMOTEKEY),
-						   commit_num,
-						    NULL, /* No htlcs */
-						   feerate, state->asset);
-
-	wire_sync_write(HSM_FD, take(msg));
 	signed_tlvs = tlv_funding_signed_tlvs_new(tmpctx);
-	read_remote_commitment_sigs(signed_tlvs, &sig,
-				    &signed_tlvs->fee_reserve_sig);
+	sign_remote_commitment(signed_tlvs, state, remote_commit, &sig,
+			       &signed_tlvs->fee_reserve_sig);
 
 	/* We don't send this ourselves: channeld does, because master needs
 	 * to save state to disk before doing so. */

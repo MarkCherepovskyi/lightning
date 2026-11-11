@@ -1,5 +1,5 @@
-"""elementsd's JSON-RPC and its amounts, shared by the plugin, ui.py and the
-tests: the standard library only, positional params."""
+"""elementsd's JSON-RPC and its amounts, shared by the plugin and the tests:
+the standard library only, positional params."""
 from decimal import Decimal
 from pyln.client import RpcException
 

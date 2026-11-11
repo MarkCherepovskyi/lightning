@@ -243,14 +243,9 @@ msgdata,hsmd_sign_commitment_tx,channel_dbid,u64,
 msgdata,hsmd_sign_commitment_tx,tx,bitcoin_tx,
 msgdata,hsmd_sign_commitment_tx,remote_funding_key,pubkey,
 msgdata,hsmd_sign_commitment_tx,commit_num,u64,
-# Asset channels: the tx also spends the L-BTC fee reserve (input 1,
-# same 2-of-2 as the funding input), which hsmd signs too.
-msgdata,hsmd_sign_commitment_tx,asset,?channel_asset,
 
-# Also the reply to hsmd_sign_remote_commitment_tx and hsmd_sign_mutual_close_tx.
 msgtype,hsmd_sign_commitment_tx_reply,105
 msgdata,hsmd_sign_commitment_tx_reply,sig,bitcoin_signature,
-msgdata,hsmd_sign_commitment_tx_reply,fee_reserve_sig,?bitcoin_signature,
 
 #include <common/htlc_wire.h> // For enum side and towire_side
 subtype,hsm_htlc
@@ -322,7 +317,6 @@ msgdata,hsmd_sign_remote_commitment_tx,commit_num,u64,
 msgdata,hsmd_sign_remote_commitment_tx,num_htlcs,u16,
 msgdata,hsmd_sign_remote_commitment_tx,htlcs,hsm_htlc,num_htlcs
 msgdata,hsmd_sign_remote_commitment_tx,feerate,u32,
-msgdata,hsmd_sign_remote_commitment_tx,asset,?channel_asset,
 
 # channeld asks HSM to sign remote HTLC tx.
 msgtype,hsmd_sign_remote_htlc_tx,20
@@ -336,7 +330,39 @@ msgdata,hsmd_sign_remote_htlc_tx,option_anchor_outputs,bool,
 msgtype,hsmd_sign_mutual_close_tx,21
 msgdata,hsmd_sign_mutual_close_tx,tx,bitcoin_tx,
 msgdata,hsmd_sign_mutual_close_tx,remote_funding_key,pubkey,
-msgdata,hsmd_sign_mutual_close_tx,asset,?channel_asset,
+
+# Asset channels (common/channel_asset.h): hsmd_sign_commitment_tx,
+# hsmd_sign_remote_commitment_tx and hsmd_sign_mutual_close_tx for a tx that
+# also spends the channel's L-BTC fee reserve (input 1: the output after the
+# funding one, same 2-of-2), which hsmd signs too.  Same permissions.
+msgtype,hsmd_sign_asset_commitment_tx,4100
+msgdata,hsmd_sign_asset_commitment_tx,peer_id,node_id,
+msgdata,hsmd_sign_asset_commitment_tx,channel_dbid,u64,
+msgdata,hsmd_sign_asset_commitment_tx,tx,bitcoin_tx,
+msgdata,hsmd_sign_asset_commitment_tx,remote_funding_key,pubkey,
+msgdata,hsmd_sign_asset_commitment_tx,commit_num,u64,
+msgdata,hsmd_sign_asset_commitment_tx,asset,channel_asset,
+
+msgtype,hsmd_sign_asset_remote_commitment_tx,4101
+msgdata,hsmd_sign_asset_remote_commitment_tx,tx,bitcoin_tx,
+msgdata,hsmd_sign_asset_remote_commitment_tx,remote_funding_key,pubkey,
+msgdata,hsmd_sign_asset_remote_commitment_tx,remote_per_commit,pubkey,
+msgdata,hsmd_sign_asset_remote_commitment_tx,option_static_remotekey,bool,
+msgdata,hsmd_sign_asset_remote_commitment_tx,commit_num,u64,
+msgdata,hsmd_sign_asset_remote_commitment_tx,num_htlcs,u16,
+msgdata,hsmd_sign_asset_remote_commitment_tx,htlcs,hsm_htlc,num_htlcs
+msgdata,hsmd_sign_asset_remote_commitment_tx,feerate,u32,
+msgdata,hsmd_sign_asset_remote_commitment_tx,asset,channel_asset,
+
+msgtype,hsmd_sign_asset_mutual_close_tx,4102
+msgdata,hsmd_sign_asset_mutual_close_tx,tx,bitcoin_tx,
+msgdata,hsmd_sign_asset_mutual_close_tx,remote_funding_key,pubkey,
+msgdata,hsmd_sign_asset_mutual_close_tx,asset,channel_asset,
+
+# The reply to all three: the funding input's and the fee reserve's.
+msgtype,hsmd_sign_asset_tx_reply,4200
+msgdata,hsmd_sign_asset_tx_reply,sig,bitcoin_signature,
+msgdata,hsmd_sign_asset_tx_reply,fee_reserve_sig,bitcoin_signature,
 
 # channeld asks HSM to sign splice tx.
 msgtype,hsmd_sign_splice_tx,29

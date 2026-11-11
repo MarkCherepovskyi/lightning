@@ -154,7 +154,8 @@ static void send_offer(struct per_peer_state *pps,
 		       struct amount_sat max_fee_to_accept)
 {
 	struct bitcoin_tx *tx;
-	struct bitcoin_signature our_sig, *our_reserve_sig;
+	struct bitcoin_signature our_sig, our_reserve_sig;
+	bool ok;
 	struct tlv_closing_signed_tlvs *close_tlvs;
 	u8 *msg;
 
@@ -190,14 +191,22 @@ static void send_offer(struct per_peer_state *pps,
 	 *   - MAY eliminate its own output.
 	 */
 	/* (We don't do this). */
-	wire_sync_write(HSM_FD,
-			take(towire_hsmd_sign_mutual_close_tx(NULL,
-							     tx,
+	if (chan_asset)
+		msg = towire_hsmd_sign_asset_mutual_close_tx(NULL, tx,
 							     &funding_pubkey[REMOTE],
-							     chan_asset)));
+							     chan_asset);
+	else
+		msg = towire_hsmd_sign_mutual_close_tx(NULL,
+						       tx,
+						       &funding_pubkey[REMOTE]);
+	wire_sync_write(HSM_FD, take(msg));
 	msg = wire_sync_read(tmpctx, HSM_FD);
-	if (!fromwire_hsmd_sign_commitment_tx_reply(tmpctx, msg, &our_sig,
-						    &our_reserve_sig))
+	if (chan_asset)
+		ok = fromwire_hsmd_sign_asset_tx_reply(msg, &our_sig,
+						       &our_reserve_sig);
+	else
+		ok = fromwire_hsmd_sign_tx_reply(msg, &our_sig);
+	if (!ok)
 		status_failed(STATUS_FAIL_HSM_IO,
 			      "Bad hsm_sign_mutual_close_tx reply %s",
 			      tal_hex(tmpctx, msg));
@@ -219,12 +228,12 @@ static void send_offer(struct per_peer_state *pps,
 		close_tlvs = NULL;
 
 	/* Asset channels: hsmd also signed the fee reserve input. */
-	if (our_reserve_sig) {
+	if (chan_asset) {
 		if (!close_tlvs)
 			close_tlvs = tlv_closing_signed_tlvs_new(tmpctx);
 		close_tlvs->fee_reserve_sig
 			= tal_dup(close_tlvs, secp256k1_ecdsa_signature,
-				  &our_reserve_sig->s);
+				  &our_reserve_sig.s);
 	}
 
 	assert(our_sig.sighash_type == SIGHASH_ALL);

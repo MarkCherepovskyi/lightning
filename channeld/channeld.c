@@ -1072,14 +1072,18 @@ static struct bitcoin_signature *calc_commitsigs(const tal_t *ctx,
 	size_t i;
 	struct pubkey local_htlckey;
 	const u8 *msg;
-	struct bitcoin_signature *htlc_sigs, *reserve_sig;
+	struct bitcoin_signature *htlc_sigs, reserve_sig;
+	bool ok;
 
 	status_debug("calc_commitsigs(%p, %p, %p, %p, %p, %d, %p, %p)",
 		     ctx, peer, txs, funding_wscript, htlc_map,
 		     (int)commit_index, remote_per_commit, commit_sig);
 
 	htlcs = collect_htlcs(tmpctx, htlc_map);
-	msg = towire_hsmd_sign_remote_commitment_tx(NULL, txs[0],
+	/* For asset channels hsmd also signs the fee reserve input, and
+	 * that signature goes to the peer in a TLV. */
+	if (peer->channel->asset)
+		msg = towire_hsmd_sign_asset_remote_commitment_tx(NULL, txs[0],
 						    &remote_funding_pubkey,
 						    remote_per_commit,
 						    channel_has(peer->channel,
@@ -1088,17 +1092,28 @@ static struct bitcoin_signature *calc_commitsigs(const tal_t *ctx,
 						    htlcs,
 						    channel_feerate(peer->channel, REMOTE),
 						    peer->channel->asset);
+	else
+		msg = towire_hsmd_sign_remote_commitment_tx(NULL, txs[0],
+						    &remote_funding_pubkey,
+						    remote_per_commit,
+						    channel_has(peer->channel,
+								OPT_STATIC_REMOTEKEY),
+						    commit_index,
+						    htlcs,
+						    channel_feerate(peer->channel, REMOTE));
 
 	msg = hsm_req(tmpctx, take(msg));
-	if (!fromwire_hsmd_sign_commitment_tx_reply(tmpctx, msg, commit_sig,
-						    &reserve_sig))
+	if (peer->channel->asset)
+		ok = fromwire_hsmd_sign_asset_tx_reply(msg, commit_sig,
+						       &reserve_sig);
+	else
+		ok = fromwire_hsmd_sign_tx_reply(msg, commit_sig);
+	if (!ok)
 		status_failed(STATUS_FAIL_HSM_IO,
 			      "Reading sign_remote_commitment_tx reply: %s",
 			      tal_hex(tmpctx, msg));
-	/* For asset channels hsmd also signs the fee reserve input, and
-	 * that signature goes to the peer in a TLV. */
-	*fee_reserve_sig = reserve_sig
-		? tal_dup(ctx, secp256k1_ecdsa_signature, &reserve_sig->s)
+	*fee_reserve_sig = peer->channel->asset
+		? tal_dup(ctx, secp256k1_ecdsa_signature, &reserve_sig.s)
 		: NULL;
 
 	status_debug("Creating commit_sig signature %"PRIu64" %s for tx %s wscript %s key %s",

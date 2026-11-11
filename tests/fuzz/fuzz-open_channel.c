@@ -178,7 +178,6 @@ static bool test_sync_write(int fd, const void *msg TAKES)
 			u64 commit_num;
 			struct hsm_htlc *htlcs;
 			u32 feerate;
-			struct channel_asset *asset;
 
 			assert(fromwire_hsmd_sign_remote_commitment_tx(tmpctx, msg,
 								&tx,
@@ -187,8 +186,7 @@ static bool test_sync_write(int fd, const void *msg TAKES)
 								&option_static_remotekey,
 								&commit_num,
 								&htlcs,
-								&feerate,
-								&asset));
+								&feerate));
 		}
 		else
 			assert(false && "Too many HSMD writes!");

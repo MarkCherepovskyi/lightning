@@ -1221,6 +1221,37 @@ NULL,
 	       option_anchors_zero_fee_htlc_tx,
 	       htlc_map,
 	       tal_count(htlcs));
+
+	/* An asset channel: its fee reserve pays the anchors, so an opener
+	 * holding a little over the dust limit keeps its whole balance in its
+	 * own output (before, 660 units were cut for anchors, the output was
+	 * trimmed and the balance went to the other side). */
+	{
+		static const char id[] = "144c654344aa716d6f3abcc1ca90e5641e4e2a7f633bc09fe3baf64585819a49";
+		const u8 *tag = channel_asset_from_hex(tmpctx, id, strlen(id));
+		const struct channel_asset *asset
+			= channel_asset_new(tmpctx, tag, AMOUNT_SAT(2000));
+		struct amount_sat total = AMOUNT_SAT(0);
+		bool opener_whole = false;
+
+		chainparams = chainparams_for_network("liquid-regtest");
+		tx = commit_tx(tmpctx, &funding, AMOUNT_SAT(100000),
+			       &local_funding_pubkey, &remote_funding_pubkey,
+			       LOCAL, to_self_delay, 0, 0, &keyset, 253,
+			       AMOUNT_SAT(546), AMOUNT_MSAT(700000),
+			       AMOUNT_MSAT(99300000), NULL, &htlc_map, NULL,
+			       commitment_number ^ cn_obscurer, false, true,
+			       asset, LOCAL, &local_anchor);
+		for (size_t i = 0; i < tx->wtx->num_outputs; i++) {
+			struct amount_asset amt = bitcoin_tx_output_get_amount(tx, i);
+			if (!memeq(amt.asset, ELEMENTS_ASSET_LEN, tag, ELEMENTS_ASSET_LEN))
+				continue;
+			opener_whole |= amt.value == 700;
+			assert(amount_sat_add(&total, total, amount_sat(amt.value)));
+		}
+		assert(opener_whole);
+		assert(amount_sat_eq(total, AMOUNT_SAT(100000)));
+	}
 	common_shutdown();
 
 	/* FIXME: Do BOLT comparison! */

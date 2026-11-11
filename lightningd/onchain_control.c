@@ -132,6 +132,8 @@ static bool tell_if_missing(const struct channel *channel,
 	return true;
 }
 
+static void onchaind_replay(struct channel *channel);
+
 static void handle_onchain_init_reply(struct channel *channel, const u8 *msg)
 {
 	struct htlc_stub *stubs;
@@ -167,6 +169,11 @@ static void handle_onchain_init_reply(struct channel *channel, const u8 *msg)
 
 	/* Tell it about any preimages we know. */
 	onchaind_tell_fulfill(channel);
+
+	/* Now it can hear about spends (see onchaind_funding_spent). */
+	if (channel->onchaind_replay_watches
+	    && channel->num_onchain_spent_calls == 0)
+		onchaind_replay(channel);
 }
 
 /**
@@ -233,7 +240,6 @@ static enum watch_result onchain_tx_watched(struct lightningd *ld,
 
 static void watch_tx_and_outputs(struct channel *channel,
 				 const struct bitcoin_tx *tx);
-static void onchaind_replay(struct channel *channel);
 
 static void replay_unwatch_txid(struct channel *channel,
 				const struct bitcoin_txid *txid)
@@ -384,7 +390,15 @@ static void replay_watch_tx(struct channel *channel,
 	struct replay_tx *rtx = tal(channel->onchaind_replay_watches, struct replay_tx);
 	bitcoin_txid(tx, &rtx->txid);
 	rtx->blockheight = blockheight;
-	rtx->tx = clone_bitcoin_tx(rtx, tx);
+	if (tx->psbt)
+		rtx->tx = clone_bitcoin_tx(rtx, tx);
+	else {
+		/* A tx straight from a block has no PSBT (see replay_block) */
+		const u8 *p = linearize_tx(tmpctx, tx);
+		size_t len = tal_bytelen(p);
+		rtx->tx = pull_bitcoin_tx(rtx, &p, &len);
+		tal_free_if_taken(tx);
+	}
 
 	/* We might already be watching, in which case don't re-add! */
 	if (replay_tx_hash_get(channel->onchaind_replay_watches, &rtx->txid))
@@ -425,6 +439,12 @@ static void replay_block(struct bitcoind *bitcoind,
 	if (!channel->owner)
 		return;
 
+	/* A live spend's reply can ask for the block we already asked for:
+	 * only the first answer counts. */
+	if (!channel->onchaind_replay_watches
+	    || height != channel->onchaind_replay_height)
+		return;
+
 	/* There's no such block: the chain got shorter than the tip we were
 	 * replaying towards (a reorg while we replay).  We've seen everything
 	 * there is, so go live. */
@@ -456,6 +476,11 @@ static void replay_block(struct bitcoind *bitcoind,
 				 * PSBTs, so add one now */
 				if (!blk->tx[i]->psbt)
 					blk->tx[i]->psbt = new_psbt(blk->tx[i], blk->tx[i]->wtx);
+				/* Topology may have passed this block before
+				 * anyone watched the tx: record its height, as
+				 * filter_block_txs() does, or its depth stays 0 */
+				wallet_transaction_add(channel->peer->ld->wallet,
+						       blk->tx[i]->wtx, height, i);
 				onchain_txo_spent(channel, blk->tx[i], j, height);
 				/* Watch this and all the children too. */
 				replay_watch_tx(channel, height, blk->tx[i]);
@@ -483,7 +508,8 @@ static void onchaind_replay(struct channel *channel)
 	assert(channel->onchaind_replay_watches);
 	assert(channel->num_onchain_spent_calls == 0);
 
-	bitcoind_getrawblockbyheight(channel,
+	/* A new replay frees the table, which cancels this request. */
+	bitcoind_getrawblockbyheight(channel->onchaind_replay_watches,
 				     channel->peer->ld->topology->bitcoind,
 				     channel->onchaind_replay_height,
 				     replay_block, channel);
@@ -916,30 +942,6 @@ onchain_witness_htlc_tx(const tal_t *ctx, u8 **witness)
 	return cast_const2(const struct onchain_witness_element **, welements);
 }
 
-/* The key our sweeps pay to: BIP86 (P2TR) where we have it, else BIP32. */
-static bool channel_final_key(struct channel *channel,
-			      struct pubkey *final_key,
-			      struct ext_key *final_wallet_ext_key)
-{
-	struct lightningd *ld = channel->peer->ld;
-	const struct ext_key *base = ld->bip86_base ? ld->bip86_base
-		: ld->bip32_base;
-
-	if (ld->bip86_base)
-		bip86_pubkey(ld, final_key, channel->final_key_idx);
-	else
-		bip32_pubkey(ld, final_key, channel->final_key_idx);
-	if (bip32_key_from_parent(base, channel->final_key_idx,
-				  BIP32_FLAG_KEY_PUBLIC,
-				  final_wallet_ext_key) != WALLY_OK) {
-		channel_internal_error(channel,
-				       "Could not derive final_wallet_ext_key %"PRIu64,
-				       channel->final_key_idx);
-		return false;
-	}
-	return true;
-}
-
 /* Asset channels (common/channel_asset.h): the output is in the asset,
  * which can't pay the fee, and our wallet can't hold it.  So the sweep
  * pays all of it to our close script (where a mutual close would have paid
@@ -973,7 +975,7 @@ static struct bitcoin_tx *asset_sweep_unsigned(const tal_t *ctx,
 */
 static struct bitcoin_tx *onchaind_tx_unsigned(const tal_t *ctx,
 					       struct channel *channel,
-					       struct onchain_signing_info *info,
+					       const struct onchain_signing_info *info,
 					       struct amount_sat *fee,
 					       bool *worthwhile)
 {
@@ -986,13 +988,35 @@ static struct bitcoin_tx *onchaind_tx_unsigned(const tal_t *ctx,
 	struct lightningd *ld = channel->peer->ld;
 	bool keypath_ok;
 
-	if (!channel_final_key(channel, &final_key, &final_wallet_ext_key))
-		return NULL;
-
 	if (channel->asset) {
 		if (worthwhile)
 			*worthwhile = true;
 		return asset_sweep_unsigned(ctx, channel, info, fee);
+	}
+
+	/* Use BIP86 derivation for P2TR if available, otherwise BIP32 */
+	if (ld->bip86_base) {
+		bip86_pubkey(ld, &final_key, channel->final_key_idx);
+		if (bip32_key_from_parent(ld->bip86_base,
+					  channel->final_key_idx,
+					  BIP32_FLAG_KEY_PUBLIC,
+					  &final_wallet_ext_key) != WALLY_OK) {
+			channel_internal_error(channel,
+					       "Could not derive final_wallet_ext_key (bip86) %"PRIu64,
+					       channel->final_key_idx);
+			return NULL;
+		}
+	} else {
+		bip32_pubkey(ld, &final_key, channel->final_key_idx);
+		if (bip32_key_from_parent(ld->bip32_base,
+					  channel->final_key_idx,
+					  BIP32_FLAG_KEY_PUBLIC,
+					  &final_wallet_ext_key) != WALLY_OK) {
+			channel_internal_error(channel,
+					       "Could not derive final_wallet_ext_key %"PRIu64,
+					       channel->final_key_idx);
+			return NULL;
+		}
 	}
 
 	tx = bitcoin_tx(ctx, chainparams, 1, 1, info->locktime);
@@ -1155,7 +1179,7 @@ static void sign_asset_to_remote(struct channel *channel,
  */
 static struct bitcoin_tx *onchaind_tx(const tal_t *ctx,
 				      struct channel *channel,
-				      struct onchain_signing_info *info,
+				      const struct onchain_signing_info *info,
 				      struct amount_sat *fee,
 				      bool *worthwhile,
 				      const struct onchain_witness_element ***welements)
@@ -1188,13 +1212,17 @@ static bool consider_onchain_rebroadcast(struct channel *channel,
 	struct bitcoin_tx *newtx;
 	struct amount_sat newfee;
 	struct bitcoin_txid oldtxid, newtxid;
-	const struct onchain_witness_element **welements;
+	u8 **witness;
 
-	newtx = onchaind_tx(tmpctx, channel, info, &newfee, NULL, &welements);
+	newtx = onchaind_tx_unsigned(tmpctx, channel, info, &newfee, NULL);
 	if (!newtx)
 		return true;
 
 	/* FIXME: Don't RBF if fee is not sufficiently increased? */
+
+	/* OK!  RBF time! */
+	witness = sign_and_get_witness(NULL, channel, newtx, info);
+	bitcoin_tx_input_set_witness(newtx, 0, take(witness));
 
 	bitcoin_txid(newtx, &newtxid);
 	bitcoin_txid(*tx, &oldtxid);
@@ -1298,11 +1326,13 @@ static bool consider_onchain_htlc_tx_rebroadcast(struct channel *channel,
 	if (!amount_sat_eq(change, AMOUNT_SAT(0))) {
 		/* Append change output. */
 		struct pubkey final_key;
-		struct ext_key final_wallet_ext_key;
-
-		if (!channel_final_key(channel, &final_key,
-				       &final_wallet_ext_key))
-			return true;
+		/* Use BIP86 derivation for P2TR if available, otherwise BIP32 */
+		if (ld->bip86_base) {
+			bip86_pubkey(ld, &final_key, channel->final_key_idx);
+		} else {
+			bip32_pubkey(ld, &final_key, channel->final_key_idx);
+		}
+		/* Elements has no P2TR. */
 		psbt_append_output(psbt,
 				   chainparams->is_elements
 				   ? scriptpubkey_p2wpkh(tmpctx, &final_key)
@@ -2107,12 +2137,18 @@ enum watch_result onchaind_funding_spent(struct channel *channel,
 				  channel->asset);
 	subd_send_msg(channel->owner, take(msg));
 
-	/* If we're replaying, we just watch this */
-	if (channel->onchaind_replay_watches) {
-		replay_watch_tx(channel, blockheight, tx);
-	} else {
-		watch_tx_and_outputs(channel, tx);
-	}
+	/* onchaind gets the HTLCs and the preimages we know after it replies
+	 * to init.  A spend it hears of before that (eg. our own HTLC-success
+	 * tx, met again while rescanning blocks after a restart) looks like
+	 * the peer's, and the output it creates is never swept.  So always
+	 * replay from this block, starting once onchaind has all that.  This
+	 * onchaind needs all of it: drop any replay left by an earlier one,
+	 * and the replies it owed us died with it. */
+	tal_free(channel->onchaind_replay_watches);
+	channel->onchaind_replay_watches = new_htable(channel, replay_tx_hash);
+	channel->onchaind_replay_height = blockheight;
+	channel->num_onchain_spent_calls = 0;
+	replay_watch_tx(channel, blockheight, tx);
 
 	/* We keep watching until peer finally deleted, for reorgs. */
 	return KEEP_WATCHING;
@@ -2139,13 +2175,7 @@ static bool onchaind_restart(struct channel *channel)
 		 "Restarting onchaind (%s): closed in block %u",
 		 channel_state_name(channel), blockheight);
 
-	/* We're in replay mode (discard any left by an aborted one) */
-	tal_free(channel->onchaind_replay_watches);
-	channel->onchaind_replay_watches = new_htable(channel, replay_tx_hash);
-	channel->onchaind_replay_height = blockheight;
-	/* Any replies we were waiting for died with the previous onchaind. */
-	channel->num_onchain_spent_calls = 0;
-
+	/* This sets up the replay, too. */
 	onchaind_funding_spent(channel, tx, blockheight);
 
 	/* It logs the reason itself.  Don't leave the channel in replay mode,
@@ -2156,7 +2186,7 @@ static bool onchaind_restart(struct channel *channel)
 		return false;
 	}
 
-	onchaind_replay(channel);
+	/* The replay starts once onchaind replies to init. */
 	return true;
 }
 

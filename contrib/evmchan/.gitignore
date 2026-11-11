@@ -1,0 +1,7 @@
+# Build output
+out/
+cache/
+__pycache__/
+# Regenerable test data (deterministic; see contracts/evm/README.md):
+#   reference/fuzz.py writes reference/cases/ (~11 MB)
+reference/cases/

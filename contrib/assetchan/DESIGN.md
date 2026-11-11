@@ -32,7 +32,9 @@ This file is the spec the POC follows. Step 0 commits it verbatim as
    that emulates a UTXO set.
 5. **Safe without the plugin.** Core only negotiates asset channels when a plugin
    offers their feature bit, and the plugin decides which assets; a node without it
-   never takes one. Cross-asset forwarding is refused in core.
+   never takes one. Cross-asset forwarding is refused by the plugin's `htlc_accepted`
+   hook; core won't start an asset channel unless the plugin's feature bit is set, so an
+   asset channel never runs without it.
 
 ## 2. Chain primitives (what a chain must provide)
 
@@ -87,8 +89,10 @@ Explicit (unblinded) outputs only.
 
 - **Negotiation**: feature `option_channel_asset` (odd bit in the custom range: 233 in
   the POC, `OPT_CHANNEL_ASSET` = 232, provisional until upstream assigns one), advertised
-  by the plugin (plugins can set feature bits at startup); on Elements it also turns
-  anchors back on. `open_channel` TLVs
+  by the plugin (plugins can set feature bits at startup), which also sets the
+  `option_anchors_zero_fee_htlc_tx` bit (23) that lightningd clears on Elements; on
+  Bitcoin, where that bit is already set, lightningd refuses to load the plugin.
+  `open_channel` TLVs
   `channel_asset` (4243, 33-byte explicit asset tag) and `fee_reserve` (4245, sats);
   `accept_channel` echoes `channel_asset` or the open fails. Channel type must be
   `anchors_zero_fee_htlc_tx`. v2 (dual-fund) and splicing: refused for asset channels.
@@ -126,8 +130,12 @@ Explicit (unblinded) outputs only.
   assets). Anchors:
   `anchorspend.c` is off for asset channels (the commitment pays its own fee; it isn't
   Elements-aware).
-- **Invariants (core)**: one asset per channel; `forward_htlc` refuses a different asset
-  in/out and `best_channel` matches the asset (`lightningd/peer_htlcs.c`, ~20 lines).
+- **Invariants**: one asset per channel (core). A forward leaves in the asset it arrived
+  in: the plugin's `htlc_accepted` hook keeps core's outgoing channel (`forward_to`) if
+  it is in that asset, else picks the peer's channel in that asset with the same fees
+  that can send the most, else fails it `unknown_next_peer`. Core starts no asset
+  channel without the plugin's feature bit (`peer_start_channeld`), so this can't be
+  skipped by running without the plugin.
 - **Operational**: every node holding asset channels needs some unblinded L-BTC in its
   elementsd wallet (the plugin pays sweeps and HTLC txs with it; CLN's own wallet needs
   none) and sets a close address (its elementsd wallet) so swept assets are spendable.
@@ -138,8 +146,8 @@ Explicit (unblinded) outputs only.
 |---|---|---|---|---|
 | C1 | Channel asset identity: feature bit (set by the plugin); TLVs; `channel->asset`, `fee_reserve`; DB columns; `channeld/closingd/onchaind` init fields; `fundchannel_start asset= fee_reserve=`; `listpeerchannels.asset`, `fee_reserve_msat`; `openchannel` hook payload fields; `common/channel_asset.[ch]` (from `common/liquid_asset.c`) | `wire/peer_wire.csv`, `common/features.[ch]`, `openingd/*`, `lightningd/{options,channel,opening_control,peer_control,channel_control,closing_control}.c`, `wallet/{wallet,migrations}.c`, `*_wire.csv`, `doc/schemas` | 450 | daemons must know the asset |
 | C2 | Asset tags on channel tx outputs; fee computation counts only the fee asset; tx parser reads asset amounts instead of asserting L-BTC | `bitcoin/{tx,psbt,tx_parts}.c`, `common/{initial_commit_tx,htlc_tx,close_tx}.c`, `channeld/commit_tx.c` | 150 | tx builders live in daemons |
-| C3 | Reserve input + second signature + `hsmd` signing both inputs; `sign_last_tx` | `openingd`, `channeld`, `closingd`, `hsmd/{hsmd,libhsmd}.c`, `hsmd_wire.csv`, `lightningd/peer_control.c` | 400 | protocol + signer |
-| C4 | Allow anchors on Elements for asset channels (`lightningd/options.c:1854`); skip fee subtraction; fee output = reserve − anchors; ignore `update_fee` | `lightningd/options.c`, `channeld/{commit_tx,channeld}.c` | 40 | |
+| C3 | Reserve input + second signature + `hsmd` signing both inputs; `sign_last_tx`. hsmd gets its own messages for asset channels (`hsmd_sign_asset_commitment_tx`, `_asset_remote_commitment_tx`, `_asset_mutual_close_tx`, reply `hsmd_sign_asset_tx_reply`), with the permissions of their upstream siblings, so ordinary channels and external signers see upstream's messages unchanged | `openingd`, `channeld`, `closingd`, `hsmd/{hsmd,libhsmd}.c`, `hsmd_wire.csv`, `lightningd/peer_control.c` | 400 | protocol + signer |
+| C4 | Anchors on Elements come from the plugin's feature bits (no core change); skip fee subtraction; fee output = reserve − anchors; ignore `update_fee` | `channeld/{commit_tx,channeld}.c` | 30 | |
 | C5 | Asset sweeps: `onchaind_tx_unsigned` builds a zero-fee 1-in-1-out spend (asset in → asset out to the close script), hsmd signs inputs not in the fee asset `SIGHASH_SINGLE\|ANYONECANPAY`, and lightningd hands it and our HTLC txs to the plugin (`asset_sweep` notification) instead of broadcasting; `to_remote` swept from the upstream `add_utxo` notification; `anchorspend` off. Funding, broadcast and fee bumping: the plugin | `lightningd/{onchain_control,notification}.c`, `hsmd/libhsmd.c`, `onchaind/onchaind.c`, `lightningd/anchorspend.c` | 250 | `onchaind` + channel keys |
 | C6 | `fundchannel_complete` verifies output n (asset, amount, explicit) and n+1 (L-BTC, reserve); funding watch by asset | `lightningd/opening_control.c`, `lightningd/watch.c` | 60 | safety |
 | C7 | `liquid-testnet` chainparams | `bitcoin/chainparams.c` | 35 | |
@@ -152,11 +160,12 @@ common +563, lightningd +562 (C5's sweeps ≈ 230 of it), openingd +172, bitcoin
 hsmd +104, channeld +100, onchaind +99, closingd +65, doc +37, wire +34, wallet +27.
 
 **What stays in core, and what the plugin owns.** Core keeps only what builds, signs,
-watches or forwards transactions: the daemons need the asset to produce valid
-Elements transactions (C2, C3, C5), hsmd must check what it signs (C3), and the
-cross-asset forwarding refusal must hold without any plugin. Everything else is the
-plugin's: it turns asset channels on (it offers the feature bit; core negotiates them
-only then), picks the assets (`assetchan-asset`), polices fee reserves, funds channels
+or watches transactions: the daemons need the asset to produce valid Elements
+transactions (C2, C3, C5) and hsmd must check what it signs (C3); plus one guard, that
+an asset channel only runs while the plugin's feature bit is set. Everything else is the
+plugin's: it turns asset channels on (it offers the feature bit, and the anchors bit on
+Elements; core negotiates them only then), keeps forwards within an asset, picks the
+assets (`assetchan-asset`), polices fee reserves, funds channels
 from elementsd, ties invoices to assets, checks the asset of incoming payments, routes
 payments over channels of the right asset, and pays for, broadcasts and bumps the
 sweeps of asset outputs after a unilateral close (core signs them, the plugin can't:
@@ -222,8 +231,9 @@ build context and in `run-tests.sh`.
     off asset channels. `assetchan-listchannels [asset]` is `listchannels` with that
     classification.
 - **Hooks**: `openchannel` — reject if asset not allowed or reserve outside
-  [min,max], else `continue` with `close_to`; `htlc_accepted` — final hop only: incoming
-  channel's asset (cache from `listpeerchannels` by scid/alias) must equal the invoice's
+  [min,max], else `continue` with `close_to`; `htlc_accepted` — on a forward, the
+  outgoing channel must be in the incoming one's asset (§3 Invariants); at the final hop
+  the incoming channel's asset (cache from `listpeerchannels` by scid/alias) must equal the invoice's
   asset, else `fail` with `temporary_channel_failure` (no `channel_update`): the payer
   then disables the channel it used for the last hop and tries other paths, where
   `incorrect_or_unknown_payment_details` would make it give up on the invoice.
@@ -289,11 +299,12 @@ Reuse map (`git show liquid-merged:<path>`): `common/liquid_asset.[ch]`,
   also mines); `contrib/assetchan/TESTNET.md` records the run of all the cases above
   (open, payments, cooperative close, force closes with every sweep kind, an HTLC
   claimed on chain with its preimage, a penalty) with the testnet txids.
-- By hand: `contrib/assetchan/ui.py` serves a web page (http://127.0.0.1:8765) for those
-  nodes, or any `--node name=lightning-dir` running the plugin: the nodes, peers,
-  wallets and channels, with forms to open (asset or L-BTC), pay, close, force close,
-  send on-chain and fund a node, all through the nodes' RPCs (`assetchan-*` for the
-  asset side); it mines on regtest when given `--elements-rpc`.
+- By hand: `contrib/nodeui/ui.py` serves a web page (http://127.0.0.1:8765) for those
+  nodes (`--network liquid-regtest --elements-rpc ...` as before), or any
+  `--node name=lightning-dir`, also Bitcoin and EVM nodes: the nodes, peers, wallets,
+  channels and asset sweeps, with forms to open (asset or L-BTC), pay, close, force
+  close, send on-chain and fund a node, all through the nodes' RPCs (`assetchan-*`
+  for the asset side); it mines on liquid-regtest. See `contrib/nodeui/README.md`.
 
 ## 7. Verify first (day 1 spikes), risks
 
@@ -329,7 +340,7 @@ Reuse map (`git show liquid-merged:<path>`): `common/liquid_asset.[ch]`,
   payment when gossip makes it look cheapest: its units travel asset-to-asset through
   the intermediates, the recipient's hook fails the HTLC as a temporary failure of the
   last channel, and the payer routes around it (one failed part); a wrong-asset forward
-  is refused by core (`unknown_next_peer`), so funds never cross assets. A node with no
+  is refused by the plugin (`unknown_next_peer`), so funds never cross assets. A node with no
   channel in the asset cannot pay an asset invoice at all. Proper per-asset gossip (an
   asset in `channel_update`, or a `channel_announcement` TLV) stays a later core PR; until
   then announcing asset channels is a choice (`assetchan-open announce=true`), default off.

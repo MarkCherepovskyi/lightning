@@ -709,7 +709,8 @@ def test_gossip(node_factory, bitcoind):
     # 5. l5 has no asset channel, so it can't pay l4's asset invoice: not
     #    through the plugin (nothing to leave by), nor by plain xpay (l4
     #    refuses the HTLC that arrives over L-BTC), nor around through l1,
-    #    which refuses to forward from its L-BTC channel into an asset one.
+    #    whose plugin refuses to forward from its L-BTC channel into an
+    #    asset one.
     inv = l4.rpc.call('assetchan-invoice', {'amount': PAY_UNITS, 'asset': asset,
                                             'label': 'asset-l5', 'description': 'in the asset'})
     with pytest.raises(RpcError):
@@ -729,7 +730,7 @@ def test_gossip(node_factory, bitcoind):
         l5.rpc.waitsendpay(inv['payment_hash'])
     assert err.value.error['data']['failcodename'] == 'WIRE_UNKNOWN_NEXT_PEER'
     assert err.value.error['data']['erring_node'] == l1.info['id']
-    l1.daemon.wait_for_log('Refusing to forward between different assets')
+    l1.daemon.wait_for_log(r'Refusing to forward .* not in lbtc')
     settled(*nodes)
     assert only_one(l4.rpc.listinvoices('asset-l5')['invoices'])['status'] == 'unpaid'
 

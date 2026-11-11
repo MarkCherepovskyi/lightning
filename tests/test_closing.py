@@ -3490,6 +3490,59 @@ def test_permfail_htlc_in(node_factory, bitcoind, executor):
     l2.daemon.wait_for_log('onchaind complete, forgetting peer')
 
 
+def test_onchaind_rescan_htlc_success(node_factory, bitcoind, executor):
+    """A restart that rescans the close and our HTLC-success tx must still
+    sweep the HTLC-success output: onchaind may only hear of that spend
+    after it knows the preimage, or it takes the spend for the peer's."""
+    disconnects = ['-WIRE_UPDATE_FULFILL_HTLC', 'permfail']
+    # No anchors: their HTLC-success tx has no CSV, so it can be mined in
+    # the same block as the commitment tx, which makes the race certain.
+    l1 = node_factory.get_node(options={'dev-no-reconnect': None,
+                                        'dev-force-features': "-23"},
+                               feerates=(7500, 7500, 7500, 7500))
+    l2 = node_factory.get_node(disconnect=disconnects,
+                               options={'dev-force-features': "-23"})
+
+    l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
+    l1.fundchannel(l2, 10**6)
+    l2.fundwallet(30000, mine_block=False)
+
+    t = executor.submit(l1.pay, l2, 200000000)
+
+    l2.daemon.wait_for_log('dev_disconnect permfail')
+    l2.wait_for_channel_onchain(l1.info['id'])
+    close_block = bitcoind.generate_block(1)[0]
+    l2.daemon.wait_for_log(' to ONCHAIN')
+    _, success, _ = l2.wait_for_onchaind_tx('OUR_HTLC_SUCCESS_TX',
+                                            'OUR_UNILATERAL/THEIR_HTLC')
+    success_block = bitcoind.generate_block(1, wait_for_mempool=success)[0]
+    l2.wait_for_onchaind_tx('OUR_DELAYED_RETURN_TO_WALLET',
+                            'OUR_HTLC_SUCCESS_TX/DELAYED_OUTPUT_TO_US')
+    t.cancel()
+
+    # Mine the close and the HTLC-success tx again, in one block, and let
+    # l2 rescan it: the spend then comes in the very block which starts
+    # the new onchaind, before it has replied to init.
+    l2.stop()
+    raw = [bitcoind.rpc.getrawtransaction(txid, False, close_block)
+           for txid in bitcoind.rpc.getblock(close_block)['tx'][1:]]
+    raw.append(bitcoind.rpc.getrawtransaction(success, False, success_block))
+    bitcoind.rpc.invalidateblock(close_block)
+    addr = bitcoind.rpc.getnewaddress()
+    # An empty block first: a wallet tx's nLockTime can be the close's height.
+    bitcoind.rpc.generateblock(addr, [])
+    bitcoind.rpc.generateblock(addr, raw)
+    l2.daemon.opts['rescan'] = 10
+    l2.start()
+    l2.daemon.wait_for_log('Resolved OUR_UNILATERAL/THEIR_HTLC by our proposal OUR_HTLC_SUCCESS_TX')
+    _, txid, blocks = l2.wait_for_onchaind_tx('OUR_DELAYED_RETURN_TO_WALLET',
+                                              'OUR_HTLC_SUCCESS_TX/DELAYED_OUTPUT_TO_US')
+    assert blocks == 4
+    bitcoind.generate_block(4)
+    bitcoind.generate_block(1, wait_for_mempool=txid)
+    l2.daemon.wait_for_log('Resolved OUR_HTLC_SUCCESS_TX/DELAYED_OUTPUT_TO_US by our proposal OUR_DELAYED_RETURN_TO_WALLET')
+
+
 def test_permfail_htlc_out(node_factory, bitcoind, executor):
     # Test case where we fail with unsettled outgoing HTLC.
     disconnects = ['+WIRE_REVOKE_AND_ACK', 'permfail']

@@ -1,0 +1,19 @@
+[profile.default]
+src = "src"
+test = "test"
+out = "out"
+cache_path = "cache"
+libs = []
+solc_version = "0.8.30"
+# Osaka (Fusaka): EIP-7883 modexp pricing, which the key recovery pays for.
+evm_version = "osaka"
+optimizer = true
+optimizer_runs = 200
+# The differential test reads the reference cases the generator writes.
+fs_permissions = [{ access = "read", path = "./test/generated" }]
+
+[fuzz]
+runs = 256
+
+[lint]
+lint_on_build = false

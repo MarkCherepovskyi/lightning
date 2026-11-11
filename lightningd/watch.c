@@ -323,8 +323,9 @@ struct scriptpubkeywatch {
 	struct script_with_len swl;
 	struct bitcoin_outpoint expected_outpoint;
 	struct amount_sat expected_amount;
-	/* Asset the output must be in (NULL: the chain's coin) */
-	const u8 *expected_asset;
+	/* Asset the output must be in, and the fee reserve that must follow it
+	 * (NULL: the chain's coin) */
+	const struct channel_asset *expected_asset;
 	void (*cb)(struct lightningd *ld,
 		   const struct bitcoin_tx *tx,
 		   u32 outnum,
@@ -380,7 +381,7 @@ bool watch_scriptpubkey_(const tal_t *ctx,
 			 const u8 *scriptpubkey TAKES,
 			 const struct bitcoin_outpoint *expected_outpoint,
 			 struct amount_sat expected_amount,
-			 const u8 *expected_asset,
+			 const struct channel_asset *expected_asset,
 			 void (*cb)(struct lightningd *ld,
 				    const struct bitcoin_tx *tx,
 				    u32 outnum,
@@ -406,7 +407,8 @@ bool watch_scriptpubkey_(const tal_t *ctx,
 	w->expected_outpoint = *expected_outpoint;
 	w->expected_amount = expected_amount;
 	w->expected_asset = expected_asset
-		? channel_asset_tag_dup(w, expected_asset) : NULL;
+		? channel_asset_new(w, expected_asset->tag, expected_asset->fee_reserve)
+		: NULL;
 	w->cb = cb;
 	w->arg = arg;
 	scriptpubkeywatch_hash_add(topo->scriptpubkeywatches, w);
@@ -436,6 +438,29 @@ bool unwatch_scriptpubkey_(const tal_t *ctx,
 		return true;
 	}
 	return false;
+}
+
+/* An asset channel's fee reserve is output n+1: the same 2-of-2 script, in
+ * explicit L-BTC, exactly the amount every commitment and close tx spends as
+ * their second input. A funding tx without it can never be closed, so it
+ * does not count as the funding. */
+static bool fee_reserve_output_ok(const struct bitcoin_tx *tx, size_t outnum,
+				  const struct script_with_len *swl,
+				  const struct channel_asset *asset)
+{
+	const struct wally_tx_output *out;
+	struct amount_asset amt;
+
+	if (outnum + 1 >= tx->wtx->num_outputs)
+		return false;
+	out = &tx->wtx->outputs[outnum + 1];
+	if (out->script_len != swl->len
+	    || memcmp(out->script, swl->script, swl->len) != 0
+	    || !elements_output_is_explicit(out))
+		return false;
+	amt = bitcoin_tx_output_get_amount(tx, outnum + 1);
+	return amount_asset_is_main(&amt)
+		&& amount_sat_eq(amount_asset_to_sat(&amt), asset->fee_reserve);
 }
 
 bool watch_check_tx_outputs(const struct chain_topology *topo,
@@ -472,12 +497,22 @@ bool watch_check_tx_outputs(const struct chain_topology *topo,
 			/* An asset channel's funding is in the asset. */
 			if (w->expected_asset) {
 				if (!channel_asset_tag_eq(outasset.asset,
-							  w->expected_asset)) {
+							  w->expected_asset->tag)) {
 					bad_amount = true;
 					continue;
 				}
 				if (!amount_sat_eq(amount_sat(outasset.value),
 						   w->expected_amount)) {
+					bad_amount = true;
+					continue;
+				}
+				if (!fee_reserve_output_ok(tx, outnum, &swl,
+							   w->expected_asset)) {
+					log_unusual(topo->ld->log,
+						    "Funding %s:%zu has no fee reserve output after it"
+						    " (%s L-BTC to the same script): not our channel's funding",
+						    fmt_bitcoin_txid(tmpctx, txid), outnum,
+						    fmt_amount_sat(tmpctx, w->expected_asset->fee_reserve));
 					bad_amount = true;
 					continue;
 				}

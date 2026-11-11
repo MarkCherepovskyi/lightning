@@ -105,13 +105,12 @@ static struct bitcoin_signature sign_tx(const tal_t *ctx,
 					struct bitcoin_tx *tx,
 					const struct pubkey *remote_fundingkey)
 {
-	struct bitcoin_signature sig, *reserve_sig;
+	struct bitcoin_signature sig;
 	const u8 *msg;
 
 	msg = hsm_req(tmpctx,
-		take(towire_hsmd_sign_mutual_close_tx(NULL, tx, remote_fundingkey,
-						      NULL)));
-	if (!fromwire_hsmd_sign_commitment_tx_reply(tmpctx, msg, &sig, &reserve_sig))
+		take(towire_hsmd_sign_mutual_close_tx(NULL, tx, remote_fundingkey)));
+	if (!fromwire_hsmd_sign_tx_reply(msg, &sig))
 		status_failed(STATUS_FAIL_HSM_IO,
 			"Bad sign_mutual_close_tx reply %s",
 			tal_hex(tmpctx, msg));
