@@ -4,6 +4,7 @@ GOSSIPD_HEADERS_WSRC := gossipd/gossipd_wiregen.h \
 	gossipd/gossipd.h				\
 	gossipd/gossip_store.h				\
 	gossipd/gossmap_manage.h			\
+	gossipd/liquid_sync.h				\
 	gossipd/queries.h				\
 	gossipd/txout_failures.h			\
 	gossipd/sigcheck.h				\

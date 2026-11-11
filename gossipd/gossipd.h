@@ -33,6 +33,10 @@ struct daemon {
 	/* Who am I?  Helps us find ourself in the routing map. */
 	struct node_id id;
 
+	/* PoC: Liquid asset gossip networks we follow (besides the chain's
+	 * own), see common/liquid_asset.h. */
+	struct bitcoin_blkid *liquid_networks;
+
 	/* Peers we are gossiping to: id is unique */
 	struct peer_node_id_map *peers;
 
@@ -101,6 +105,11 @@ struct peer {
 	/* The two features gossip cares about (so far) */
 	bool gossip_queries_feature, initial_routing_sync_feature;
 
+	/* PoC: Liquid asset gossip networks we both follow, and our
+	 * catching up on them (see liquid_sync.h) */
+	struct bitcoin_blkid *liquid_networks;
+	struct liquid_sync *liquid_sync;
+
 	/* Are there outstanding responses for queries on short_channel_ids? */
 	const struct short_channel_id *scid_queries;
 	const bigsize_t *scid_query_flags;
@@ -113,9 +122,14 @@ struct peer {
 	/* Do we have an scid_query outstanding?  What to call when it's done? */
 	bool scid_query_outstanding;
 	void (*scid_query_cb)(struct peer *peer, bool complete);
+	/* PoC: which gossip network it's about */
+	struct bitcoin_blkid scid_query_network;
 
 	/* What we're querying: [range_first_blocknum, range_end_blocknum) */
 	u32 range_first_blocknum, range_end_blocknum;
+	/* PoC: in which gossip network */
+	struct bitcoin_blkid range_query_network;
+
 	u32 range_blocks_outstanding;
 	struct range_query_reply *range_replies;
 	void (*query_channel_range_cb)(struct peer *peer,

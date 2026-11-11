@@ -25,6 +25,7 @@
 #include <gossipd/gossipd.h>
 #include <gossipd/gossipd_wiregen.h>
 #include <gossipd/gossmap_manage.h>
+#include <gossipd/liquid_sync.h>
 #include <gossipd/queries.h>
 #include <gossipd/seeker.h>
 
@@ -118,8 +119,9 @@ static void connectd_new_peer(struct daemon *daemon, const u8 *msg)
 {
 	struct peer *peer = tal(daemon, struct peer);
 
-	if (!fromwire_gossipd_new_peer(msg, &peer->id,
-				      &peer->gossip_queries_feature)) {
+	if (!fromwire_gossipd_new_peer(peer, msg, &peer->id,
+				      &peer->gossip_queries_feature,
+				      &peer->liquid_networks)) {
 		status_failed(STATUS_FAIL_INTERNAL_ERROR,
 			      "Bad new_peer msg from connectd: %s",
 			      tal_hex(tmpctx, msg));
@@ -142,6 +144,7 @@ static void connectd_new_peer(struct daemon *daemon, const u8 *msg)
 	peer->scid_query_outstanding = false;
 	peer->range_replies = NULL;
 	peer->query_channel_range_cb = NULL;
+	peer->liquid_sync = NULL;
 
 	/* We keep a htable so we can find peer by id */
 	peer_node_id_map_add(daemon->peers, peer);
@@ -149,6 +152,9 @@ static void connectd_new_peer(struct daemon *daemon, const u8 *msg)
 
 	/* This sends the initial timestamp filter. */
 	seeker_setup_peer_gossip(daemon->seeker, peer);
+
+	/* PoC: catch up on the Liquid asset networks we both follow */
+	liquid_sync_peer(daemon, peer);
 }
 
 static void connectd_peer_gone(struct daemon *daemon, const u8 *msg)
@@ -384,7 +390,8 @@ static void gossip_init(struct daemon *daemon, const u8 *msg)
 				   &daemon->autoconnect_seeker_peers,
 				   &daemon->compactd_helper,
 				   &daemon->dev_fast_gossip,
-				   &daemon->dev_fast_gossip_prune)) {
+				   &daemon->dev_fast_gossip_prune,
+				   &daemon->liquid_networks)) {
 		master_badmsg(WIRE_GOSSIPD_INIT, msg);
 	}
 

@@ -359,6 +359,41 @@ bool invoices_find_by_label(struct invoices *invoices,
 	return true;
 }
 
+void invoices_set_liquid_asset(struct invoices *invoices,
+			       u64 inv_dbid,
+			       const u8 *asset)
+{
+	struct db_stmt *stmt;
+
+	stmt = db_prepare_v2(invoices->wallet->db,
+			     SQL("UPDATE invoices SET liquid_asset = ?"
+				 " WHERE id = ?;"));
+	if (asset)
+		db_bind_blob(stmt, asset, tal_bytelen(asset));
+	else
+		db_bind_null(stmt);
+	db_bind_u64(stmt, inv_dbid);
+	db_exec_prepared_v2(take(stmt));
+}
+
+u8 *invoices_get_liquid_asset(const tal_t *ctx,
+			      struct invoices *invoices,
+			      u64 inv_dbid)
+{
+	struct db_stmt *stmt;
+	u8 *asset = NULL;
+
+	stmt = db_prepare_v2(invoices->wallet->db,
+			     SQL("SELECT liquid_asset FROM invoices"
+				 " WHERE id = ?;"));
+	db_bind_u64(stmt, inv_dbid);
+	db_query_prepared(stmt);
+	if (db_step(stmt) && !db_col_is_null(stmt, "liquid_asset"))
+		asset = db_col_arr(ctx, stmt, "liquid_asset", u8);
+	tal_free(stmt);
+	return asset;
+}
+
 bool invoices_find_by_rhash(struct invoices *invoices,
 			    u64 *inv_dbid,
 			    const struct sha256 *rhash)

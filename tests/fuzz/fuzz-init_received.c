@@ -48,7 +48,8 @@ struct io_plan *peer_connected(struct io_conn *conn UNNEEDED,
 			       const u8 *their_features TAKES UNNEEDED,
 			       enum is_websocket is_websocket UNNEEDED,
 			       struct timemono starttime,
-			       bool incoming UNNEEDED)
+			       bool incoming UNNEEDED,
+			       const struct bitcoin_blkid *their_networks UNNEEDED)
 {	if (taken(their_features))
 		tal_steal(tmpctx, their_features);
 	return io_close(conn);

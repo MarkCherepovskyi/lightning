@@ -2077,8 +2077,10 @@
         "FundchannelStartRequest": {
             "FundChannel_Start.amount": 2,
             "FundChannel_Start.announce": 4,
+            "FundChannel_Start.asset": 10,
             "FundChannel_Start.channel_type[]": 9,
             "FundChannel_Start.close_to": 5,
+            "FundChannel_Start.fee_reserve": 11,
             "FundChannel_Start.feerate": 3,
             "FundChannel_Start.id": 1,
             "FundChannel_Start.mindepth": 7,
@@ -2243,6 +2245,7 @@
         },
         "GetroutesRequest": {
             "GetRoutes.amount_msat": 3,
+            "GetRoutes.asset": 10,
             "GetRoutes.destination": 2,
             "GetRoutes.final_cltv": 7,
             "GetRoutes.finalcltv": 6,
@@ -2334,6 +2337,7 @@
         },
         "InvoiceRequest": {
             "Invoice.amount_msat": 10,
+            "Invoice.asset": 11,
             "Invoice.cltv": 6,
             "Invoice.deschashonly": 9,
             "Invoice.description": 2,
@@ -2468,6 +2472,7 @@
             "ListChannels.channels[].htlc_maximum_msat": 14,
             "ListChannels.channels[].htlc_minimum_msat": 13,
             "ListChannels.channels[].last_update": 9,
+            "ListChannels.channels[].liquid_asset": 17,
             "ListChannels.channels[].message_flags": 6,
             "ListChannels.channels[].public": 4,
             "ListChannels.channels[].short_channel_id": 3,
@@ -3313,6 +3318,8 @@
             "ListPeerChannels.channels[].last_feerate": 13,
             "ListPeerChannels.channels[].last_stable_connection": 56,
             "ListPeerChannels.channels[].last_tx_fee_msat": 59,
+            "ListPeerChannels.channels[].liquid_asset": 64,
+            "ListPeerChannels.channels[].liquid_fee_reserve_msat": 65,
             "ListPeerChannels.channels[].lost_state": 57,
             "ListPeerChannels.channels[].max_accepted_htlcs": 40,
             "ListPeerChannels.channels[].max_to_us_msat": 25,
@@ -4645,6 +4652,7 @@
         },
         "XpayRequest": {
             "Xpay.amount_msat": 2,
+            "Xpay.asset": 12,
             "Xpay.dev_use_shadow": 11,
             "Xpay.invstring": 1,
             "Xpay.label": 9,
@@ -8441,6 +8449,10 @@
             "added": "pre-v0.10.1",
             "deprecated": null
         },
+        "FundChannel_Start.asset": {
+            "added": "v26.09",
+            "deprecated": null
+        },
         "FundChannel_Start.channel_type": {
             "added": "v24.02",
             "deprecated": null
@@ -8459,6 +8471,10 @@
         },
         "FundChannel_Start.close_to": {
             "added": "pre-v0.10.1",
+            "deprecated": null
+        },
+        "FundChannel_Start.fee_reserve": {
+            "added": "v26.09",
             "deprecated": null
         },
         "FundChannel_Start.feerate": {
@@ -8791,6 +8807,10 @@
         },
         "GetRoutes.amount_msat": {
             "added": "v24.08",
+            "deprecated": null
+        },
+        "GetRoutes.asset": {
+            "added": "v26.09",
             "deprecated": null
         },
         "GetRoutes.destination": {
@@ -9151,6 +9171,10 @@
         },
         "Invoice.amount_msat": {
             "added": "pre-v0.10.1",
+            "deprecated": null
+        },
+        "Invoice.asset": {
+            "added": "v26.09",
             "deprecated": null
         },
         "Invoice.bolt11": {
@@ -9571,6 +9595,10 @@
         },
         "ListChannels.channels[].last_update": {
             "added": "pre-v0.10.1",
+            "deprecated": null
+        },
+        "ListChannels.channels[].liquid_asset": {
+            "added": "v26.09",
             "deprecated": null
         },
         "ListChannels.channels[].message_flags": {
@@ -12047,6 +12075,14 @@
         },
         "ListPeerChannels.channels[].last_tx_fee_msat": {
             "added": "v23.02",
+            "deprecated": null
+        },
+        "ListPeerChannels.channels[].liquid_asset": {
+            "added": "v26.09",
+            "deprecated": null
+        },
+        "ListPeerChannels.channels[].liquid_fee_reserve_msat": {
+            "added": "v26.09",
             "deprecated": null
         },
         "ListPeerChannels.channels[].lost_state": {
@@ -15347,6 +15383,10 @@
         },
         "Xpay.amount_sent_msat": {
             "added": "v24.11",
+            "deprecated": null
+        },
+        "Xpay.asset": {
+            "added": "v26.09",
             "deprecated": null
         },
         "Xpay.dev_use_shadow": {

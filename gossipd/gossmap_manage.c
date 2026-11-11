@@ -34,6 +34,8 @@
 
 struct pending_cannounce {
 	const u8 *scriptpubkey;
+	/* The chain's genesis hash, or (PoC) a Liquid asset network */
+	struct bitcoin_blkid network;
 	const u8 *channel_announcement;
 	struct node_id node_id[2];
 	const struct node_id *source_peer;
@@ -617,6 +619,19 @@ static void node_announcements_not_dying(struct gossmap_manage *gm,
 	}
 }
 
+/* PoC: gossip on the chain itself, or on a Liquid asset's network that we
+ * follow (see common/liquid_asset.h). */
+static bool known_network(const struct daemon *daemon,
+			  const struct bitcoin_blkid *chain_hash)
+{
+	if (bitcoin_blkid_eq(chain_hash, &chainparams->genesis_blockhash))
+		return true;
+	for (size_t i = 0; i < tal_count(daemon->liquid_networks); i++)
+		if (bitcoin_blkid_eq(chain_hash, &daemon->liquid_networks[i]))
+			return true;
+	return false;
+}
+
 const char *gossmap_manage_channel_announcement(const tal_t *ctx,
 						struct gossmap_manage *gm,
 						const u8 *announce TAKES,
@@ -666,7 +681,7 @@ const char *gossmap_manage_channel_announcement(const tal_t *ctx,
 	 *   - if the specified `chain_hash` is unknown to the receiver:
 	 *     - MUST ignore the message.
 	 */
-	if (!bitcoin_blkid_eq(&chain_hash, &chainparams->genesis_blockhash))
+	if (!known_network(gm->daemon, &chain_hash))
 		return NULL;
 
 	/* Immediately discard claims of ancient channels */
@@ -701,6 +716,7 @@ const char *gossmap_manage_channel_announcement(const tal_t *ctx,
 					       bitcoin_redeem_2of2(tmpctx,
 								   &bitcoin_key_1,
 								   &bitcoin_key_2));
+	pca->network = chain_hash;
 	pca->channel_announcement = tal_dup_talarr(pca, u8, announce);
 	pca->source_peer = tal_dup_or_null(pca, struct node_id, source_peer);
 	pca->node_id[0] = node_id_1;
@@ -756,17 +772,29 @@ const char *gossmap_manage_channel_announcement(const tal_t *ctx,
 	return NULL;
 }
 
+/* PoC: a funding output must be in its network's asset: the chain's own coin,
+ * or the Liquid asset that the network is named after. */
+static bool funding_asset_ok(const struct bitcoin_blkid *network, const u8 *asset)
+{
+	if (bitcoin_blkid_eq(network, &chainparams->genesis_blockhash))
+		return tal_count(asset) == 0;
+	return tal_count(asset) == 1 + sizeof(*network)
+		&& asset[0] == 0x01
+		&& memcmp(asset + 1, network, sizeof(*network)) == 0;
+}
+
 /*~ We queue incoming channel_announcement pending confirmation from lightningd
  * that it really is an unspent output.  Here's its reply. */
 void gossmap_manage_handle_get_txout_reply(struct gossmap_manage *gm, const u8 *msg)
 {
 	struct short_channel_id scid;
-	u8 *outscript;
+	u8 *outscript, *asset;
 	struct amount_sat sat;
 	struct pending_cannounce *pca;
 	struct gossmap *gossmap;
 
-	if (!fromwire_gossipd_get_txout_reply(msg, msg, &scid, &sat, &outscript))
+	if (!fromwire_gossipd_get_txout_reply(msg, msg, &scid, &sat, &outscript,
+					      &asset))
 		master_badmsg(WIRE_GOSSIPD_GET_TXOUT_REPLY, msg);
 
 	status_trace("channel_announcement: got reply for %s...",
@@ -819,6 +847,13 @@ void gossmap_manage_handle_get_txout_reply(struct gossmap_manage *gm, const u8 *
 			     fmt_short_channel_id(tmpctx, scid),
 			     tal_hex(tmpctx, pca->scriptpubkey),
 			     tal_hex(tmpctx, outscript));
+		goto bad;
+	}
+
+	if (!funding_asset_ok(&pca->network, asset)) {
+		peer_warning(gm, pca->source_peer,
+			     "channel_announcement: txout %s is in the wrong asset",
+			     fmt_short_channel_id(tmpctx, scid));
 		goto bad;
 	}
 
@@ -1026,6 +1061,7 @@ const char *gossmap_manage_channel_update(const tal_t *ctx,
 	u32 fee_proportional_millionths;
 	struct bitcoin_blkid chain_hash;
 	struct gossmap *gossmap = gossmap_manage_get_gossmap(gm);
+	const struct gossmap_chan *chan;
 
 	if (taken(update))
 		tal_steal(tmpctx, update);
@@ -1049,7 +1085,7 @@ const char *gossmap_manage_channel_update(const tal_t *ctx,
 	 *   the specified chain):
 	 *     - MUST ignore the channel update.
 	 */
-	if (!bitcoin_blkid_eq(&chain_hash, &chainparams->genesis_blockhash)) {
+	if (!known_network(gm->daemon, &chain_hash)) {
 		status_debug("wrong chain for update %s", tal_hex(tmpctx, update));
 		return NULL;
 	}
@@ -1111,6 +1147,20 @@ const char *gossmap_manage_channel_update(const tal_t *ctx,
 					    cltv_expiry_delta, htlc_minimum_msat,
 					    htlc_maximum_msat);
 		return NULL;
+	}
+
+	/* PoC: an update must be for the network its channel was announced
+	 * in (an L-BTC update can't describe an asset channel). */
+	chan = gossmap_find_chan(gossmap, &scid);
+	if (chan && chainparams->is_elements) {
+		struct bitcoin_blkid chan_network;
+		gossmap_chan_get_chain_hash(gossmap, chan, &chan_network);
+		if (!bitcoin_blkid_eq(&chain_hash, &chan_network)) {
+			status_peer_debug(source_peer,
+					  "channel_update for %s on the wrong network",
+					  fmt_short_channel_id(tmpctx, scid));
+			return NULL;
+		}
 	}
 
 	return process_channel_update(ctx, gm, scid, &signature,

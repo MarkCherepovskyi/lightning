@@ -3,6 +3,7 @@
 #include "config.h"
 #include <ccan/short_types/short_types.h>
 
+struct bitcoin_blkid;
 struct channel_update_timestamps;
 struct daemon;
 struct io_conn;
@@ -15,10 +16,12 @@ struct short_channel_id;
 const u8 *handle_reply_short_channel_ids_end(struct peer *peer, const u8 *msg);
 const u8 *handle_reply_channel_range(struct peer *peer, const u8 *msg);
 
-/* Ask this peer for a range of scids.  Must support it, and not already
- * have a query pending. */
+/* Ask this peer for a range of scids in this gossip network (the chain's own,
+ * or a Liquid asset's).  Must support it, and not already have a query
+ * pending. */
 bool query_channel_range(struct daemon *daemon,
 			 struct peer *peer,
+			 const struct bitcoin_blkid *network,
 			 u32 first_blocknum, u32 number_of_blocks,
 			 enum query_option_flags qflags,
 			 void (*cb)(struct peer *peer_,
@@ -26,9 +29,11 @@ bool query_channel_range(struct daemon *daemon,
 				    u32 number_of_blocks_,
 				    const struct range_query_reply *replies_));
 
-/* Ask this peer for info about an array of scids, with optional query_flags */
+/* Ask this peer for info about an array of scids in this gossip network,
+ * with optional query_flags */
 bool query_short_channel_ids(struct daemon *daemon,
 			     struct peer *peer,
+			     const struct bitcoin_blkid *network,
 			     const struct short_channel_id *scids,
 			     const u8 *query_flags,
 			     void (*cb)(struct peer *peer_, bool complete));

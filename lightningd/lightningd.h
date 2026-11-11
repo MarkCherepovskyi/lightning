@@ -280,6 +280,10 @@ struct lightningd {
 	 * FEERATE_PENALTY). */
 	u32 *force_feerates;
 
+	/* PoC: Liquid assets whose gossip networks we follow, and in which we
+	 * may announce asset channels (asset tags, see common/liquid_asset.h). */
+	u8 **liquid_gossip_assets;
+
 	/* If they force db upgrade on or off this is set. */
 	bool *db_upgrade_ok;
 

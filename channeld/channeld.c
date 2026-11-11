@@ -990,8 +990,8 @@ static void send_shutdown_complete(struct peer *peer)
 			take(towire_channeld_shutdown_complete(NULL)));
 	per_peer_state_fdpass_send(MASTER_FD, peer->pps);
 
-	/* Give master a chance to pass the fd along */
-	sleep(1);
+	/* Keep our copy of the fd until master has it */
+	per_peer_state_fdpass_wait(MASTER_FD);
 
 	close(MASTER_FD);
 }
@@ -1129,9 +1129,12 @@ static struct bitcoin_signature *calc_commitsigs(const tal_t *ctx,
 
 		wscript = bitcoin_tx_output_get_witscript(tmpctx, txs[0],
 							  txs[i+1]->wtx->inputs[0].index);
+		/* PoC: Liquid asset channels' HTLC txs are signed like
+		 * anchors' (see liquid_htlc_tx_fee()) */
 		msg = towire_hsmd_sign_remote_htlc_tx(NULL, txs[i + 1], wscript,
 						      remote_per_commit,
-						      channel_has_anchors(peer->channel));
+						      channel_has_anchors(peer->channel)
+						      || liquid_channel_asset());
 
 		msg = hsm_req(tmpctx, take(msg));
 		if (!fromwire_hsmd_sign_tx_reply(msg, &htlc_sigs[i]))
@@ -2219,7 +2222,8 @@ static struct commitsig_info *handle_peer_commit_sig(struct peer *peer,
 	/* SIGHASH_ALL is implied. */
 	commit_sig.sighash_type = SIGHASH_ALL;
 	htlc_sigs = unraw_sigs(tmpctx, raw_sigs,
-			       channel_has_anchors(peer->channel));
+			       channel_has_anchors(peer->channel)
+			       || liquid_channel_asset());
 
 	if (commit_index) {
 		outpoint = peer->splice_state->inflights[commit_index - 1]->outpoint;

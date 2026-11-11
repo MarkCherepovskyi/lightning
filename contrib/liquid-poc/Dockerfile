@@ -1,0 +1,108 @@
+# syntax=docker/dockerfile:1
+#
+# Liquid asset channel PoC: an elementsd image and a Core Lightning image built
+# from this source tree.  Build context is the repository root; see
+# docker-compose.yml next to this file.
+
+ARG ELEMENTS_VERSION=23.3.4
+
+# Elements release binaries, checked against the release's SHA256SUMS.
+FROM debian:bookworm-slim AS elements
+ARG ELEMENTS_VERSION
+ARG TARGETARCH
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates curl \
+ && rm -rf /var/lib/apt/lists/*
+WORKDIR /tmp/elements
+RUN set -e; \
+    case "${TARGETARCH}" in \
+      amd64) triple=x86_64-linux-gnu ;; \
+      arm64) triple=aarch64-linux-gnu ;; \
+      *) echo "unsupported architecture ${TARGETARCH}"; exit 1 ;; \
+    esac; \
+    tarball="elements-${ELEMENTS_VERSION}-${triple}.tar.gz"; \
+    base="https://github.com/ElementsProject/elements/releases/download/elements-${ELEMENTS_VERSION}"; \
+    curl -fsSLO "${base}/${tarball}"; \
+    curl -fsSLO "${base}/SHA256SUMS"; \
+    grep " ${tarball}\$" SHA256SUMS | sha256sum -c -; \
+    tar xzf "${tarball}" --strip-components=1; \
+    install -m 755 bin/elementsd bin/elements-cli /usr/local/bin/
+
+# The Liquid regtest node.
+FROM debian:bookworm-slim AS elementsd
+COPY --from=elements /usr/local/bin/elementsd /usr/local/bin/elements-cli /usr/local/bin/
+VOLUME /data
+ENTRYPOINT ["elementsd"]
+
+# CLN's pytest suite against elementsd (TEST_NETWORK=liquid-regtest): build
+# tools, the tests' Python packages and elementsd.  No source in the image:
+# run-tests.sh streams the tree in and builds it in a volume.
+FROM debian:bookworm-slim AS pytest
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      build-essential autoconf automake libtool gettext pkg-config git \
+      python3 python3-mako python3-venv lowdown jq ca-certificates curl \
+      libsodium-dev libsqlite3-dev zlib1g-dev \
+ && rm -rf /var/lib/apt/lists/*
+RUN python3 -m venv /venv \
+ && /venv/bin/pip install --no-cache-dir \
+      'pytest>=8' pytest-xdist pytest-timeout pytest-rerunfailures \
+      ephemeral-port-reserve psycopg2-binary python-bitcoinlib jsonschema \
+      Flask 'cheroot<=10' psutil requests mnemonic \
+      base58 bitstring coincurve cryptography PySocks mako
+COPY --from=elements /usr/local/bin/elementsd /usr/local/bin/elements-cli /usr/local/bin/
+# assetswap-plugin and pricetiers-plugin's own tests (plugins/*/tests/) build
+# and run these from source each time (see run-tests.sh), so the toolchain
+# just needs to be present here -- not the crates themselves.
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+      | sh -s -- -y --profile minimal --default-toolchain 1.85.0
+ENV PATH=/venv/bin:/root/.cargo/bin:${PATH}
+WORKDIR /build
+
+# Core Lightning from this source tree (the liquid branch).  Rust plugins are
+# left out to keep the build short.
+FROM debian:bookworm-slim AS cln-builder
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      build-essential autoconf automake libtool gettext pkg-config git \
+      python3 python3-mako lowdown jq ca-certificates \
+      libsodium-dev libsqlite3-dev zlib1g-dev \
+ && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+COPY . .
+ARG VERSION=liquid-poc
+# PYTHON is set so configure doesn't go looking for uv.
+RUN PYTHON=python3 ./configure --prefix=/opt/lightning --disable-rust --disable-valgrind --disable-compat \
+ && make -j"$(nproc)" VERSION="${VERSION}" install-program
+
+# assetswap-plugin and pricetiers-plugin (contrib/liquid-poc/
+# CROSS_ASSET_SWAP.md): built in their own Rust stage, separate from
+# cln-builder's --disable-rust build above. Only the crates actually needed
+# are copied in, so unrelated C-side changes don't invalidate this stage's
+# cache. pricetiers-plugin is deliberately a separate, swappable pricing
+# policy plugin -- see plugins/pricetiers-plugin/src/main.rs's doc comment.
+FROM rust:1-bookworm AS rust-plugins-builder
+WORKDIR /src
+COPY Cargo.toml Cargo.lock ./
+COPY cln-rpc cln-rpc
+COPY cln-grpc cln-grpc
+COPY plugins plugins
+RUN cargo build --release -p cln-assetswap -p cln-pricetiers
+
+FROM debian:bookworm-slim AS cln
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      libsodium23 libsqlite3-0 zlib1g python3 jq \
+ && rm -rf /var/lib/apt/lists/*
+COPY --from=cln-builder /opt/lightning /opt/lightning
+# bcli talks to elementsd through elements-cli.
+COPY --from=elements /usr/local/bin/elements-cli /usr/local/bin/
+# Dropped straight into the default plugins directory, so every node loads
+# them automatically at startup -- no --plugin=/plugin= config line needed,
+# and (importantly, see CROSS_ASSET_SWAP.md's "Restart idempotency" section)
+# they're always present before lightningd replays any pending HTLC on restart.
+COPY --from=rust-plugins-builder /src/target/release/assetswap-plugin /opt/lightning/libexec/c-lightning/plugins/assetswap-plugin
+COPY --from=rust-plugins-builder /src/target/release/pricetiers-plugin /opt/lightning/libexec/c-lightning/plugins/pricetiers-plugin
+ENV PATH=/opt/lightning/bin:${PATH}
+VOLUME /data
+ENTRYPOINT ["lightningd"]

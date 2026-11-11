@@ -1,0 +1,7 @@
+# lnpoc.py remembers the issued test asset here
+.lnpoc-state.json
+.lnpoc-testnet-state.json
+# lnpoc.py add-node's overlay compose file for nodes added at runtime
+.lnpoc-nodes.yml
+.lnpoc-testnet-nodes.yml
+__pycache__/
