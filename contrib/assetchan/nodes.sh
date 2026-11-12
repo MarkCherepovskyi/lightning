@@ -87,6 +87,7 @@ start)
 		--network="$network" \
 		--lightning-dir="$dir/$node" \
 		--alias="assetchan-$node" \
+		--disable-plugin=cln-grpc \
 		--bind-addr=127.0.0.1:"$port" \
 		--bitcoin-rpcconnect="${hostport%:*}" \
 		--bitcoin-rpcport="${hostport#*:}" \

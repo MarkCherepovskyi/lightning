@@ -1370,6 +1370,7 @@ impl From<responses::ListpeerchannelsChannels> for pb::ListpeerchannelsChannels 
     fn from(c: responses::ListpeerchannelsChannels) -> Self {
         Self {
             alias: c.alias.map(|v| v.into()),
+            asset: c.asset.map(|v| hex::decode(v).unwrap()), // Rule #2 for type hex?
             channel_id: c.channel_id.map(|v| <Sha256 as AsRef<[u8]>>::as_ref(&v).to_vec()), // Rule #2 for type hash?
             channel_type: Some(c.channel_type.into()),
             close_to: c.close_to.map(|v| hex::decode(v).unwrap()), // Rule #2 for type hex?
@@ -1381,6 +1382,7 @@ impl From<responses::ListpeerchannelsChannels> for pb::ListpeerchannelsChannels 
             features: c.features.into_iter().map(|i| i.into()).collect(), // Rule #3 for type string
             fee_base_msat: c.fee_base_msat.map(|f| f.into()), // Rule #2 for type msat?
             fee_proportional_millionths: c.fee_proportional_millionths, // Rule #2 for type u32?
+            fee_reserve_msat: c.fee_reserve_msat.map(|f| f.into()), // Rule #2 for type msat?
             feerate: c.feerate.map(|v| v.into()),
             funding: c.funding.map(|v| v.into()),
             funding_outnum: c.funding_outnum, // Rule #2 for type u32?
@@ -6315,9 +6317,11 @@ impl From<requests::FundchannelStartRequest> for pb::FundchannelStartRequest {
         Self {
             amount: Some(c.amount.into()), // Rule #2 for type sat
             announce: c.announce, // Rule #2 for type boolean?
+            asset: c.asset.map(|v| hex::decode(v).unwrap()), // Rule #2 for type hex?
             // Field: FundChannel_Start.channel_type[]
             channel_type: c.channel_type.map(|arr| arr.into_iter().map(|i| i.into()).collect()).unwrap_or(vec![]), // Rule #3
             close_to: c.close_to, // Rule #2 for type string?
+            fee_reserve: c.fee_reserve.map(|f| f.into()), // Rule #2 for type sat?
             feerate: c.feerate.map(|o|o.into()), // Rule #2 for type feerate?
             id: c.id.serialize().to_vec(), // Rule #2 for type pubkey
             mindepth: c.mindepth, // Rule #2 for type u32?
@@ -8485,8 +8489,10 @@ impl TryFrom<pb::FundchannelStartRequest> for requests::FundchannelStartRequest 
         Ok(Self {
             amount: c.amount.ok_or_else(|| missing_field("amount"))?.into(), // Rule #1 for type sat
             announce: c.announce, // Rule #1 for type boolean?
+            asset: c.asset.map(|v| hex::encode(v)), // Rule #1 for type hex?
             channel_type: Some(c.channel_type.into_iter().map(|s| s).collect()), // Rule #4
             close_to: c.close_to, // Rule #1 for type string?
+            fee_reserve: c.fee_reserve.map(|a| a.into()), // Rule #1 for type sat?
             feerate: c.feerate.map(|a| a.try_into().map_err(|e| invalid_argument("feerate", e))).transpose()?, // Rule #1 for type feerate?
             id: PublicKey::from_slice(&c.id).map_err(|e| invalid_argument("id", e))?, // Rule #1 for type pubkey
             mindepth: c.mindepth, // Rule #1 for type u32?

@@ -2077,8 +2077,10 @@
         "FundchannelStartRequest": {
             "FundChannel_Start.amount": 2,
             "FundChannel_Start.announce": 4,
+            "FundChannel_Start.asset": 10,
             "FundChannel_Start.channel_type[]": 9,
             "FundChannel_Start.close_to": 5,
+            "FundChannel_Start.fee_reserve": 11,
             "FundChannel_Start.feerate": 3,
             "FundChannel_Start.id": 1,
             "FundChannel_Start.mindepth": 7,
@@ -3287,6 +3289,7 @@
         },
         "ListpeerchannelsChannels": {
             "ListPeerChannels.channels[].alias": 41,
+            "ListPeerChannels.channels[].asset": 64,
             "ListPeerChannels.channels[].channel_id": 9,
             "ListPeerChannels.channels[].channel_type": 5,
             "ListPeerChannels.channels[].close_to": 17,
@@ -3298,6 +3301,7 @@
             "ListPeerChannels.channels[].features[]": 21,
             "ListPeerChannels.channels[].fee_base_msat": 27,
             "ListPeerChannels.channels[].fee_proportional_millionths": 28,
+            "ListPeerChannels.channels[].fee_reserve_msat": 65,
             "ListPeerChannels.channels[].feerate": 6,
             "ListPeerChannels.channels[].funding": 22,
             "ListPeerChannels.channels[].funding_outnum": 11,
@@ -8441,6 +8445,10 @@
             "added": "pre-v0.10.1",
             "deprecated": null
         },
+        "FundChannel_Start.asset": {
+            "added": "v26.09",
+            "deprecated": null
+        },
         "FundChannel_Start.channel_type": {
             "added": "v24.02",
             "deprecated": null
@@ -8459,6 +8467,10 @@
         },
         "FundChannel_Start.close_to": {
             "added": "pre-v0.10.1",
+            "deprecated": null
+        },
+        "FundChannel_Start.fee_reserve": {
+            "added": "v26.09",
             "deprecated": null
         },
         "FundChannel_Start.feerate": {
@@ -11841,6 +11853,10 @@
             "added": "v23.02",
             "deprecated": null
         },
+        "ListPeerChannels.channels[].asset": {
+            "added": "v26.09",
+            "deprecated": null
+        },
         "ListPeerChannels.channels[].channel_id": {
             "added": "v23.02",
             "deprecated": null
@@ -11891,6 +11907,10 @@
         },
         "ListPeerChannels.channels[].fee_proportional_millionths": {
             "added": "v23.02",
+            "deprecated": null
+        },
+        "ListPeerChannels.channels[].fee_reserve_msat": {
+            "added": "v26.09",
             "deprecated": null
         },
         "ListPeerChannels.channels[].feerate": {

@@ -110,7 +110,7 @@ start_evm() {
 		# (--daemon keeps our stdout open: it gets its own file.)
 		"$root/lightningd/lightningd" --daemon --network=regtest --lightning-dir="$d" \
 			--log-file="$d/log" --log-level=debug --alias="$n" --bind-addr=127.0.0.1:"$port" \
-			--disable-plugin=bcli --plugin="$root/contrib/evmchan/evmbackend.py" \
+ 			--disable-plugin=bcli --disable-plugin=cln-grpc --plugin="$root/contrib/evmchan/evmbackend.py" \
 			--evm-rpc='https://base-sepolia.infura.io/v3/${INFURA_API_KEY}' \
 			--evm-contract="$EVM_CONTRACT" --evm-poll="$EVM_POLL" \
 			--evm-min-balance="$EVM_MIN_BALANCE" "$@" \
@@ -208,8 +208,10 @@ start_btc() {
 		i=$((i + 1)); d=$BTC_DIR/$n; port=$((BTC_PORT_BASE + i))
 		if btc_cli "$n" getinfo > /dev/null 2>&1; then say "Bitcoin $n: already running"; continue; fi
 		mkdir -p "$d"
+		# (cln-grpc: a Rust build runs it on one fixed port for every node; the page doesn't use it)
 		"$root/lightningd/lightningd" --daemon --network=regtest --lightning-dir="$d" --log-file="$d/log" \
 			--alias="$n" --bind-addr=127.0.0.1:"$port" --bitcoin-datadir="$BTC_DIR/bitcoind" \
+			--disable-plugin=cln-grpc \
 			--bitcoin-rpcuser="$BTC_RPC_USER" --bitcoin-rpcpassword="$BTC_RPC_PASS" \
 			--bitcoin-rpcport="$BTC_RPC_PORT" > "$d/stdout" 2>&1 || die "Bitcoin $n did not start (log: $d/log)"
 		say "Bitcoin $n: started on port $port"

@@ -212,7 +212,11 @@ pub(crate) async fn payassetinvoice(p: Plugin<State>, args: Value) -> Result<Val
             maxfee_msat: Amount::from_msat(maxfee_msat),
             maxdelay: None,
             maxhops: None,
-            maxparts: None,
+            // One part: the provider's htlc_accepted hook judges each HTLC
+            // that lands on it as a whole leg 1 (prices it, pays leg 2), so
+            // a leg 1 split over several HTLCs can't work. We also only
+            // send routes[0] below, whose amount must then be the total.
+            maxparts: Some(1),
         })
         .await
         .map_err(|e| anyhow!("no leg-1 route to swap provider {provider} in asset {from_asset}: {e}"))?;

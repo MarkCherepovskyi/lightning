@@ -1010,6 +1010,9 @@ def build_state(app, snaps):
                      mining=app.miners.get(nd.net) is not None,
                      peers=[{'id': p['id'], 'name': ids.get(p['id'], p['id'][:10]),
                              'connected': bool(p.get('connected'))} for p in s['peers']])
+        swap = swap_info(app, nd, ids)
+        if swap:
+            entry['swap'] = swap
         if nd.kind == 'liquid':
             elements = s.get('elements') or {}
             entry['elements'] = {app.asset_label(k) if not HEX64.match(k) else k: int(v)
@@ -1554,6 +1557,276 @@ def cmd_invoice(ctx, node, amount, asset, description):
     ctx.result['bolt11'] = inv['bolt11']
 
 
+# ---------------------------------------------------------------- swaps
+# assetswap-plugin (plugins/assetswap-plugin): a payer pays a payee's
+# invoice in another asset, or on another chain, through a swap provider.
+SWAP_TIERS = ('low', 'medium', 'high')
+SWAP_MARGINS = {'low': 2010, 'medium': 2030, 'high': 2060}    # pricetiers-plugin's, per mille
+
+
+def native_asset(nd):
+    """What assetswap-plugin calls the coin a node's channels are in."""
+    return {'evm': 'eth', 'liquid': 'lbtc'}.get(nd.kind, 'btc')
+
+
+def swap_info(app, nd, ids):
+    """What a node can do in a swap (from its plugins, as detected): pay
+    (payassetinvoice; through which provider), receive (assetinvoice), and
+    as a provider which pairs it quotes and which page node pays leg 2 in
+    each remote asset."""
+    if 'assetinvoice' not in nd.methods:
+        return None
+    info = {'receive': True, 'pay': 'payassetinvoice' in nd.methods, 'native': native_asset(nd)}
+    providers = config_value(nd.cfg, 'assetswap-provider', []) or []
+    if providers:
+        info['provider'] = ids.get(providers[0], providers[0][:10])
+    pairs = []
+    for v in config_value(nd.cfg, 'pricetiers-pair', []) or []:
+        parts = v.split(':')
+        if len(parts) == 4 and parts[2].isdigit() and parts[3].isdigit():
+            pairs.append({'from': parts[0], 'to': parts[1], 'rate_ppm': int(parts[2]), 'fee_base_msat': int(parts[3])})
+    if pairs:
+        info['pairs'] = pairs
+    remotes = {}
+    for v in config_value(nd.cfg, 'assetswap-remote', []) or []:
+        asset, _, path = v.partition(':')
+        other = next((o for o in app.nodes.values()
+                      if os.path.realpath(o.rpc_path()) == os.path.realpath(path)), None)
+        remotes[asset] = other.name if other else '(not on this page)'
+    if remotes:
+        info['remotes'] = remotes
+    return info
+
+
+def swap_asset_arg(body, key, nd):
+    """An asset as assetswap-plugin names it: the node's native coin
+    ('lbtc', 'eth', 'btc') or, on Liquid, an asset id the node allows."""
+    a = body.get(key)
+    if a in (None, ''):
+        return native_asset(nd)
+    if not isinstance(a, str):
+        raise BadRequest('{}: not an asset'.format(key))
+    a = a.lower()
+    if a == native_asset(nd):
+        return a
+    if nd.kind == 'liquid' and HEX64.match(a) and a in nd.allowed:
+        return a
+    raise BadRequest('{}: {} takes {} or one of its assets'.format(key, nd.name, native_asset(nd)))
+
+
+def swap_label(app, asset):
+    return {'lbtc': 'L-BTC', 'eth': 'ETH', 'btc': 'BTC'}.get(asset) or app.asset_label(asset)
+
+
+def swap_amount(app, asset, x):
+    """'100 sat of ETH', '203 units of <asset>'."""
+    return '{} {} of {}'.format(n(x), 'sat' if asset in ('lbtc', 'eth', 'btc') else 'units', swap_label(app, asset))
+
+
+# assetswap-plugin's CLTV rules (plugins/assetswap-plugin: pay.rs LEG1_CLTV_MARGIN,
+# config.rs defaults), for explaining a swap's route.
+LEG1_CLTV_MARGIN = 60
+CHAIN_NAMES = {'liquid': 'Liquid', 'evm': 'EVM', 'bitcoin': 'Bitcoin'}
+
+
+def channel_coin(nd, c):
+    """The coin a channel of nd is in, as assetswap-plugin names it."""
+    return (c.get('asset') or native_asset(nd)).lower()
+
+
+def swap_candidates(app, nd, asset, amount_msat, toward=None):
+    """nd's channels, each with whether it could carry amount_msat in asset
+    and, if not, why (what the route finder's asset layer and balances rule
+    out). `toward`: the page node the payment is going to, if known."""
+    out = []
+    for c in nd.call('listpeerchannels').get('channels', []):
+        peer = peer_node(app, c.get('peer_id'))
+        coin, spend = channel_coin(nd, c), msat(c.get('spendable_msat')) // 1000
+        if state_name(c.get('state', '')) != 'open':
+            why = 'not open ({})'.format(state_name(c.get('state', '')))
+        elif not c.get('peer_connected'):
+            why = 'peer offline'
+        elif coin != asset:
+            why = 'in {}, not {}: the route finder keeps the payment off it'.format(
+                swap_label(app, coin), swap_label(app, asset))
+        elif spend * 1000 < amount_msat:
+            why = 'only {} spendable, {} needed'.format(n(spend), n(amount_msat // 1000))
+        else:
+            why = None
+        out.append({'peer': peer.name if peer else (c.get('peer_id') or '')[:10], 'scid': c.get('short_channel_id'),
+                    'coin': swap_label(app, coin), 'spendable': spend, 'ok': why is None, 'why': why,
+                    'toward': bool(toward and peer is not None and peer.name == toward)})
+    return out
+
+
+def forwards_before(app, net):
+    return {nd.name: len(settled_forwards(nd)) for nd in app.nodes.values()
+            if nd.net == net and app.up.get(nd.name)}
+
+
+def leg_path(app, payer, dest, before, candidates):
+    """A payment's hops, payer to dest, from the forwards it left on the
+    page's nodes (their fees too); a direct one went over the channel that
+    could carry it."""
+    route = pay_route(app, payer, before)            # [(node, in channel, out channel, fee)]
+    names = [payer.name] + [r[0] for r in route] + [dest]
+    if route:
+        scids = [route[0][1]] + [r[2] for r in route]
+    else:
+        scids = [next((c['scid'] for c in candidates if c['ok'] and c['peer'] == dest), None)]
+    return {'path': names, 'hops': [{'from': names[i], 'to': names[i + 1], 'scid': scids[i]}
+                                    for i in range(len(names) - 1)],
+            'forwarders': [{'node': r[0], 'fee_msat': r[3]} for r in route]}
+
+
+def cmd_swap(ctx, frm, to, to_asset, amount, from_asset, tier):
+    app = ctx.app
+    payer, payee = app.nodes[frm], app.nodes[to]
+    from_l, to_l = swap_label(app, from_asset), swap_label(app, to_asset)
+    tr = ctx.result['swap'] = {
+        'kind': 'swap', 'payer': frm, 'payee': to, 'from_asset': from_asset, 'to_asset': to_asset,
+        'from_label': from_l, 'to_label': to_l, 'from_unit': 'sat' if from_asset in ('lbtc', 'eth', 'btc') else 'units',
+        'to_unit': 'sat' if to_asset in ('lbtc', 'eth', 'btc') else 'units', 'amount': amount, 'tier': tier,
+        'ok': False, 'why': []}
+    why = tr['why']
+    try:
+        _swap(ctx, app, tr, why, payer, payee, frm, to, to_asset, amount, from_asset, tier, from_l)
+    except Fail as e:
+        tr['error'] = app.scrub.text(e)
+        raise
+
+
+def _swap(ctx, app, tr, why, payer, payee, frm, to, to_asset, amount, from_asset, tier, from_l):
+    to_l = tr['to_label']
+    ctx.say('1. {} makes an invoice for {} (assetinvoice)'.format(to, swap_amount(app, to_asset, amount)))
+    w = payee.call('assetinvoice', amount_msat=amount * 1000, label='nodeui-swap-{}'.format(time.time_ns()),
+                   description='nodeui swap {} -> {}'.format(frm, to), asset=to_asset)['assetinvoice']
+    wrapper = json.loads(base64.urlsafe_b64decode(w + '=' * (-len(w) % 4)))
+    h = tr['hash'] = wrapper['payment_hash']
+    ctx.say('   bolt11 {}…, payment hash {}'.format(wrapper['bolt11'][:30], h))
+    try:
+        final_cltv = payee.call('decode', string=wrapper['bolt11']).get('min_final_cltv_expiry')
+    except Fail:
+        final_cltv = None
+
+    # The same coin on the same network: payassetinvoice pays it directly
+    # (xpay), no swap and no provider.
+    if from_asset == to_asset and payer.net == payee.net:
+        tr['kind'] = 'direct'
+        why.append('{} and {} are on the same network and {} wants {}, which {} holds: a plain payment, '
+                   'no swap and no provider.'.format(frm, to, to, swap_label(app, to_asset), frm))
+        cands = swap_candidates(app, payer, from_asset, amount * 1000)
+        before = forwards_before(app, payer.net)
+        ctx.say('2. {} pays it directly in {}: same coin, same network, no swap (payassetinvoice -> xpay)'.format(
+            frm, from_l))
+        res = payer.call('payassetinvoice', assetinvoice=w, from_asset=from_asset, tier=tier)
+        if not res.get('payment_preimage'):
+            raise Fail('{}: payassetinvoice: no preimage in its reply'.format(frm))
+        sent = msat(res.get('amount_sent_msat', res.get('amount_msat'))) // 1000
+        ctx.say('   paid: {} sent, preimage {}'.format(swap_amount(app, from_asset, sent), res['payment_preimage']))
+        tr['leg1'] = dict(leg_path(app, payer, to, before, cands), candidates=cands, chain=payer.kind,
+                          label=from_l, amount=sent)
+        tr['paid'] = sent
+        inv = payee.call('listinvoices', payment_hash=h)['invoices']
+        ctx.say('3. {}\'s invoice: {}'.format(to, inv[0]['status'] if inv else '?'))
+        tr['ok'] = bool(inv and inv[0]['status'] == 'paid')
+        return
+
+    prov_id = (config_value(payer.cfg, 'assetswap-provider', []) or [None])[0]
+    prov = peer_node(app, prov_id) if prov_id else None
+    if prov is None:
+        raise Fail('{} has no swap provider on this page (assetswap-provider)'.format(frm))
+    tr['provider'] = prov.name
+    why.append('{} is set up to swap through {} (its assetswap-provider), so leg 1 goes to {} in {}.'.format(
+        frm, prov.name, prov.name, from_l))
+    remote = None
+    for v in config_value(prov.cfg, 'assetswap-remote', []) or []:
+        asset, _, path = v.partition(':')
+        if asset == to_asset:
+            remote = next((o for o in app.nodes.values()
+                           if os.path.realpath(o.rpc_path()) == os.path.realpath(path)), None)
+    leg2 = remote or prov
+    tr['leg2_node'] = leg2.name
+    if remote is not None:
+        tr['bridge'] = {'from': prov.name, 'to': remote.name}
+        why.append('{} can\'t pay {} itself ({} is on {}): its assetswap-remote for {} is {}, the same LSP\'s '
+                   'node there, which pays leg 2 over {}\'s RPC socket.'.format(
+                       prov.name, to_l, to, CHAIN_NAMES.get(payee.kind, payee.kind), to_asset if len(to_asset) < 20 else to_l, remote.name,
+                       remote.name))
+    else:
+        why.append('{} pays leg 2 itself: it has channels in {}.'.format(prov.name, to_l))
+
+    from_msat = None
+    try:
+        q = payer.call('pricetiers', to_asset=to_asset, to_amount_msat=amount * 1000)
+        tiers = ', '.join('{} {}'.format(t['name'], n(t['from_amount_msat'] // 1000)) for t in q['tiers'])
+        tr['tiers'] = [{'name': t['name'], 'amount': t['from_amount_msat'] // 1000} for t in q['tiers']]
+        from_msat = next((t['from_amount_msat'] for t in q['tiers'] if t['name'] == tier), None)
+        ctx.say('2. price in {} from {}\'s own pricetiers (the provider decides when leg 1 lands): {}'.format(
+            swap_label(app, q['from_asset']), frm, tiers))
+        why.append('Price: {} {} for {} {} at the {} tier ({}); {} accepts leg 1 if it pays at least its own '
+                   'low tier.'.format(n((from_msat or 0) // 1000), tr['from_unit'], n(amount), tr['to_unit'], tier,
+                                      tiers, prov.name))
+    except Fail as e:
+        ctx.say('2. no local price ({}): payassetinvoice will need one'.format(app.scrub.text(e)))
+
+    if final_cltv is not None:
+        safety = config_value(prov.cfg, 'assetswap-cltv-safety-blocks', 18)
+        budget = config_value(prov.cfg, 'assetswap-min-hop-budget', 34)
+        tr['cltv'] = {'final': final_cltv, 'leg1': final_cltv + LEG1_CLTV_MARGIN, 'safety': safety,
+                      'budget': budget, 'need': final_cltv + safety + budget,
+                      'leg2_max': final_cltv + LEG1_CLTV_MARGIN - safety}
+        why.append('Timelocks: {} asks for {} blocks at the end; {} gives leg 1 {} (+{}); {} needs at least {} '
+                   '({} + {} safety + {} hop budget) and lets leg 2 take at most {}, so leg 2 times out {} blocks '
+                   'before leg 1.'.format(to, final_cltv, frm, final_cltv + LEG1_CLTV_MARGIN, LEG1_CLTV_MARGIN,
+                                          prov.name, final_cltv + safety + budget, final_cltv, safety, budget,
+                                          final_cltv + LEG1_CLTV_MARGIN - safety, safety)
+                   + (' Caveat: leg 1 counts {} blocks and leg 2 {} blocks; the plugin compares them as raw counts, '
+                      'safe only if a block on the {} chain is no longer than one on the {} chain.'.format(
+                          CHAIN_NAMES[payer.kind], CHAIN_NAMES[leg2.kind], CHAIN_NAMES[leg2.kind],
+                          CHAIN_NAMES[payer.kind]) if payer.kind != leg2.kind else ''))
+
+    c1 = swap_candidates(app, payer, from_asset, from_msat or amount * 1000, prov.name)
+    c2 = swap_candidates(app, leg2, to_asset, amount * 1000, to)
+    for who, cands, dest, coin in ((frm, c1, prov.name, from_l), (leg2.name, c2, to, tr['to_label'])):
+        direct = [c for c in cands if c['ok'] and c['toward']]
+        via = sorted({c['peer'] for c in cands if c['ok'] and not c['toward']})
+        out = sum(1 for c in cands if not c['ok'])
+        parts = ['{} channel{} straight to {}'.format(len(direct), '' if len(direct) == 1 else 's', dest)]
+        if via:
+            parts.append('only via {} (if {} on)'.format(', '.join(via), 'it routes' if len(via) == 1 else 'they route'))
+        if out:
+            parts.append('{} ruled out'.format(out))
+        why.append('{}\'s channels able to carry {} {}: {}.'.format(who, coin, 'to ' + dest, '; '.join(parts)))
+    before1, before2 = forwards_before(app, payer.net), forwards_before(app, leg2.net)
+
+    ctx.say('3. {} pays it in {} via provider {} (payassetinvoice, tier {})'.format(frm, from_l, prov.name, tier))
+    res = payer.call('payassetinvoice', assetinvoice=w, from_asset=from_asset, tier=tier)
+    # (waitsendpay's reply for a swap; xpay's, without a status, for a direct payment)
+    if not res.get('payment_preimage') or res.get('status', 'complete') != 'complete':
+        raise Fail('{}: payassetinvoice: {}'.format(frm, res.get('status') or 'no preimage in its reply'))
+    sent = msat(res.get('amount_sent_msat', res.get('amount_msat'))) // 1000
+    tr['paid'] = sent
+    ctx.say('   leg 1: {} -> {}: {} sent, preimage {}'.format(frm, prov.name, swap_amount(app, from_asset, sent),
+                                                           res.get('payment_preimage')))
+    tr['leg1'] = dict(leg_path(app, payer, prov.name, before1, c1), candidates=c1, chain=payer.kind,
+                      label=from_l, amount=sent)
+    paid = None
+    try:
+        pays = leg2.call('listsendpays', payment_hash=h)['payments']
+        done = [p for p in pays if p.get('status') == 'complete']
+        if done:
+            paid = sum(msat(p.get('amount_msat')) for p in done) // 1000
+            ctx.say('   leg 2: {} -> {}: {} paid'.format(leg2.name, to, swap_amount(app, to_asset, paid)))
+    except Fail as e:
+        ctx.say('   leg 2: {}'.format(app.scrub.text(e)))
+    tr['leg2'] = dict(leg_path(app, leg2, to, before2, c2), candidates=c2, chain=leg2.kind,
+                      label=swap_label(app, to_asset), amount=paid)
+    inv = payee.call('listinvoices', payment_hash=h)['invoices']
+    ctx.say('4. {}\'s invoice: {}'.format(to, inv[0]['status'] if inv else '?'))
+    tr['ok'] = bool(inv and inv[0]['status'] == 'paid')
+
+
 def elements_assets(node):
     try:
         return {k: int(v) for k, v in node.call('assetchan-funds', channels=False)['elements'].items()}
@@ -1995,6 +2268,25 @@ def build_job(app, body):
         return ('Pay {} {} from {} to {} ({})'.format(n(amount), unit_name(asset), a.name, b.name,
                                                       app.channel_net(a, asset)),
                 a.net, lambda ctx: cmd_pay(ctx, a.name, b.name, amount, asset), (a.name, b.name))
+    if action == 'swap':
+        a, b = node_arg(app, body, 'frm'), node_arg(app, body, 'to')
+        if a.name == b.name:
+            raise BadRequest('pick two different nodes')
+        if 'payassetinvoice' not in a.methods:
+            raise BadRequest('{} has no assetswap-plugin with a provider to pay through'.format(a.name))
+        if 'assetinvoice' not in b.methods:
+            raise BadRequest('{} has no assetswap-plugin to make the invoice'.format(b.name))
+        from_asset, to_asset = swap_asset_arg(body, 'from_asset', a), swap_asset_arg(body, 'to_asset', b)
+        amount = amount_arg(body)
+        tier = body.get('tier') or 'medium'
+        if tier not in SWAP_TIERS:
+            raise BadRequest('tier: one of {}'.format(', '.join(SWAP_TIERS)))
+        return ('Swap: {} pays {} to {} in {}'.format(a.name, swap_amount(app, to_asset, amount), b.name,
+                                                     swap_label(app, from_asset)),
+                # Only the payer: a job's nodes must be on its network, and the
+                # payee may be on another chain (it only makes an invoice).
+                a.net, lambda ctx: cmd_swap(ctx, a.name, b.name, to_asset, amount, from_asset, tier),
+                (a.name,))
     if action == 'invoice':
         nd = node_arg(app, body, 'node')
         amount, asset = amount_arg(body), asset_arg(body, nd)

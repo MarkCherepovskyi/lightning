@@ -1500,6 +1500,8 @@ message ListpeerchannelsChannels {
 	optional Amount their_max_htlc_value_in_flight_msat = 61;
 	optional Amount our_max_htlc_value_in_flight_msat = 62;
 	repeated string features = 63;
+	optional bytes asset = 64;
+	optional Amount fee_reserve_msat = 65;
 }
 
 message ListpeerchannelsChannelsAlias {
@@ -2168,6 +2170,8 @@ message FundchannelStartRequest {
 	optional uint32 mindepth = 7;
 	optional AmountSat reserve = 8;
 	repeated uint32 channel_type = 9;
+	optional bytes asset = 10;
+	optional AmountSat fee_reserve = 11;
 }
 
 message FundchannelStartResponse {

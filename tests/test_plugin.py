@@ -1251,6 +1251,27 @@ def test_channel_state_change_history(node_factory, bitcoind):
         assert(history[3]['message'] == "Closing complete")
 
 
+def test_htlc_accepted_hook_replaced_after_fail(node_factory):
+    """A plugin's htlc_accepted answer of "fail" (or "resolve") ends the hook
+    chain. That used to leave the hook counted as in use for good, so a
+    plugin (re)started for it afterwards was never called: "Deferring
+    registration of hook htlc_accepted until it's not in use." """
+    plugin = os.path.join(os.getcwd(), 'tests/plugins/fail_htlcs.py')
+    l1, l2 = node_factory.line_graph(2, opts=[{}, {'plugin': plugin}])
+
+    with pytest.raises(RpcError, match=r'temporary_node_failure'):
+        l1.rpc.pay(l2.rpc.invoice(1000, 'first', 'first')['bolt11'])
+    l2.daemon.wait_for_log('Failing htlc on purpose')
+
+    # Replace the plugin: the new instance must be called for the next HTLC.
+    l2.rpc.plugin_stop(plugin)
+    l2.rpc.plugin_start(plugin)
+    with pytest.raises(RpcError, match=r'temporary_node_failure'):
+        l1.rpc.pay(l2.rpc.invoice(1000, 'second', 'second')['bolt11'])
+    assert l2.rpc.listinvoices('second')['invoices'][0]['status'] == 'unpaid'
+    assert not l2.daemon.is_in_log('Deferring registration of hook htlc_accepted')
+
+
 def test_htlc_accepted_hook_fail(node_factory):
     """Send payments from l1 to l2, but l2 just declines everything.
 

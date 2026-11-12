@@ -101,6 +101,31 @@ main { display: grid; grid-template-columns: minmax(0, 1fr) 390px; gap: 24px; ma
 .banner ul { margin: 0; padding-left: 18px; }
 
 /* maps */
+/* swap network: every chain on one map, the LSP in the middle, a swap's route */
+.sn { display: grid; grid-template-columns: minmax(0, 1fr) 300px; }
+@media (max-width: 1240px) { .sn { grid-template-columns: minmax(0, 1fr); } }
+.sn-graph { padding: 12px 16px; min-width: 0; }
+.sn-graph svg { display: block; width: 100%; height: auto; }
+.sn-graph svg text { font-family: var(--body); fill: var(--fg); }
+.sn-graph svg .cap { font: 500 10px var(--mono); fill: var(--muted); paint-order: stroke; stroke: var(--panel); stroke-width: 3px; }
+.sn-graph svg .zone { font: 600 11px var(--display); letter-spacing: .14em; text-transform: uppercase; fill: var(--dim); }
+.sn-graph svg .lsp { font: 700 12px var(--display); letter-spacing: .2em; fill: var(--accent-hi); }
+.sn-graph svg .step { font: 700 11px var(--display); fill: var(--on-accent); }
+.sn-graph svg .faded { opacity: .22; }
+.sn-route { border-left: 1px solid var(--line); padding: 12px 16px; font-size: 13px; min-width: 0; }
+@media (max-width: 1240px) { .sn-route { border-left: 0; border-top: 1px solid var(--line); } }
+.sn-route select { width: 100%; margin-bottom: 10px; }
+.sn-route h3 { font: 600 11px var(--display); letter-spacing: .12em; text-transform: uppercase; color: var(--dim); margin: 14px 0 6px; }
+.sn-route .sum { font-weight: 600; margin: 4px 0 8px; }
+.sn-route ol.legs { margin: 0; padding-left: 18px; }
+.sn-route ol.legs li { margin: 4px 0; }
+.sn-route .hop { font: 12px var(--mono); color: var(--muted); overflow-wrap: anywhere; }
+.sn-route ul.why { margin: 0; padding-left: 16px; color: var(--muted); }
+.sn-route ul.why li { margin: 4px 0; }
+.sn-route table.cands { min-width: 0; font-size: 12px; }
+.sn-route table.cands td { padding: 3px 6px 3px 0; border: 0; vertical-align: top; }
+.sn-route .y { color: var(--ok); } .sn-route .x { color: var(--dim); }
+.sn-route .err { color: var(--bad); overflow-wrap: anywhere; }
 .maps { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); }
 .map { padding: 12px 16px; border-right: 1px solid var(--line); border-bottom: 1px solid var(--line); margin: 0 -1px -1px 0; min-width: 0; }
 .map svg { display: block; width: 100%; height: auto; max-height: 240px; }
@@ -111,6 +136,28 @@ main { display: grid; grid-template-columns: minmax(0, 1fr) 390px; gap: 24px; ma
 .map .empty { padding: 20px 0; }
 
 /* nodes */
+/* toggles: panels fold under their title, node cards keep the details folded */
+.foldbtn { background: none; border: 0; padding: 0; color: inherit; font: inherit; letter-spacing: inherit; text-transform: inherit; cursor: pointer; display: inline-flex; align-items: center; gap: 8px; }
+.foldbtn::before { content: ""; width: 0; height: 0; border-left: 5px solid currentColor; border-top: 4px solid transparent; border-bottom: 4px solid transparent; transition: transform .15s; }
+.foldbtn[aria-expanded="true"]::before { transform: rotate(90deg); }
+.foldbtn:hover { color: var(--fg); }
+.foldnote { color: var(--dim); font: 12px var(--mono); }
+.panel.folded > :not(header) { display: none !important; }
+.panel.folded > header .legend, .panel.folded > header .link, .panel.folded > header .hint { display: none; }
+.panel:not(.folded) > header .foldnote { display: none; }
+details.fold > summary { cursor: pointer; list-style: none; color: var(--muted); font-size: 12px; display: inline-flex; align-items: center; gap: 6px; }
+details.fold > summary::-webkit-details-marker { display: none; }
+details.fold > summary::before { content: ""; border-left: 5px solid currentColor; border-top: 4px solid transparent; border-bottom: 4px solid transparent; transition: transform .15s; }
+details.fold[open] > summary::before { transform: rotate(90deg); }
+details.fold > summary:hover { color: var(--fg); }
+details.fold > .fbody { display: flex; flex-direction: column; gap: 8px; padding-top: 8px; }
+details.fold h4 { font: 600 11px var(--display); letter-spacing: .12em; text-transform: uppercase; color: var(--dim); margin: 6px 0 0; }
+.node .health { font-size: 12px; display: flex; flex-direction: column; gap: 2px; }
+.node .health b { font: 600 12px var(--body); }
+.node .health.ok b { color: var(--ok); } .node .health.warn b { color: var(--warn); } .node .health.bad b { color: var(--bad); }
+.node .health span { color: var(--muted); overflow-wrap: anywhere; }
+.node .warnline { color: var(--warn); font-size: 12px; }
+.node .badline { color: var(--bad); font-size: 12px; overflow-wrap: anywhere; }
 .nodes { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); }
 .node { padding: 14px 16px; display: flex; flex-direction: column; gap: 8px; min-width: 0; border-right: 1px solid var(--line); border-bottom: 1px solid var(--line); margin: 0 -1px -1px 0; }
 .node .top { display: flex; align-items: center; gap: 8px; }
@@ -250,33 +297,39 @@ pre.log { margin: 12px 0 0; padding: 12px 16px; background: var(--bg); border-to
   <div class="col">
     <div id="alerts"></div>
 
-    <section class="panel" aria-labelledby="h-map">
+    <section class="panel" aria-labelledby="h-swapnet" id="swapnet-panel" data-fold="swapnet" data-fold-default="open" hidden>
       <header>
-        <h2 id="h-map">Network maps</h2>
+        <h2 id="h-swapnet">Swap network</h2><span class="foldnote" id="note-swapnet"></span>
+        <div class="legend" id="swapnet-legend"></div>
+      </header>
+      <div class="sn">
+        <div class="sn-graph" id="swapnet"></div>
+        <aside class="sn-route" id="swaproute" aria-label="Swap route"></aside>
+      </div>
+    </section>
+
+    <section class="panel" aria-labelledby="h-map" data-fold="maps">
+      <header>
+        <h2 id="h-map">Network maps</h2><span class="foldnote" id="note-maps"></span>
         <div class="legend" id="legend"></div>
       </header>
       <div class="maps" id="maps"></div>
     </section>
 
-    <section class="panel" aria-labelledby="h-nodes">
-      <header><h2 id="h-nodes">Nodes</h2><span class="hint" id="nodes-hint"></span></header>
+    <section class="panel" aria-labelledby="h-nodes" data-fold="nodes" data-fold-default="open">
+      <header><h2 id="h-nodes">Nodes</h2><span class="foldnote" id="note-nodes"></span><span class="hint" id="nodes-hint"></span></header>
       <div class="nodes" id="nodes"></div>
     </section>
 
-    <section class="panel" aria-labelledby="h-evm" id="evm-panel" hidden>
-      <header><span class="hgroup"><h2 id="h-evm">EVM status</h2><button class="qi" type="button" aria-label="About EVM status" aria-expanded="false" data-tip="Each EVM node's plugin: its contract, ETH key and balances, how far its index is behind the chain, and its Infura use, priced in Infura's credits (the free tier is 3M a day).">?</button></span></header>
-      <div class="evms" id="evms"></div>
-    </section>
-
-    <section class="panel" aria-labelledby="h-chan">
-      <header><h2 id="h-chan">Channels</h2><button class="link" id="toggleClosed" type="button"></button></header>
+    <section class="panel" aria-labelledby="h-chan" data-fold="channels">
+      <header><h2 id="h-chan">Channels</h2><span class="foldnote" id="note-channels"></span><button class="link" id="toggleClosed" type="button"></button></header>
       <div class="tablewrap"><table>
         <thead><tr><th>Channel</th><th>Network</th><th>State</th><th>Balance (left | right)</th><th><span class="sr">Actions</span></th></tr></thead>
         <tbody id="channels"></tbody>
       </table></div>
     </section>
 
-    <section class="panel" aria-labelledby="h-sweeps" id="sweeps-panel" hidden>
+    <section class="panel" aria-labelledby="h-sweeps" id="sweeps-panel" data-fold="sweeps" hidden>
       <header><span class="hgroup"><h2 id="h-sweeps">Asset sweeps</h2><button class="qi" type="button" aria-label="About asset sweeps" aria-expanded="false" data-tip="assetchan-sweeps: the asset outputs a node sweeps after a unilateral close, from when they can be spent until their deadline.">?</button></span></header>
       <div class="tablewrap"><table>
         <thead><tr><th>Node</th><th>Outpoint</th><th>Asset</th><th>From block</th><th>Deadline</th><th>Sweep tx</th></tr></thead>
@@ -291,6 +344,7 @@ pre.log { margin: 12px 0 0; padding: 12px 16px; background: var(--bg); border-to
         <button role="tab" type="button" aria-selected="true" aria-controls="p-open" id="t-open" data-tab="open">Open</button>
         <button role="tab" type="button" aria-selected="false" aria-controls="p-pay" id="t-pay" data-tab="pay" tabindex="-1">Pay</button>
         <button role="tab" type="button" aria-selected="false" aria-controls="p-invoice" id="t-invoice" data-tab="invoice" tabindex="-1">Invoice</button>
+        <button role="tab" type="button" aria-selected="false" aria-controls="p-swap" id="t-swap" data-tab="swap" tabindex="-1" hidden>Swap</button>
         <button role="tab" type="button" aria-selected="false" aria-controls="p-close" id="t-close" data-tab="close" tabindex="-1">Close</button>
         <button role="tab" type="button" aria-selected="false" aria-controls="p-chain" id="t-chain" data-tab="chain" tabindex="-1">On-chain</button>
         <button role="tab" type="button" aria-selected="false" aria-controls="p-evm" id="t-evm" data-tab="evm" tabindex="-1">EVM</button>
@@ -338,6 +392,29 @@ pre.log { margin: 12px 0 0; padding: 12px 16px; background: var(--bg); border-to
           <label>Description<input name="description" type="text" maxlength="100" value="nodeui invoice"></label>
           <p class="hint">The invoice shows in Activity, with a button to copy it.</p>
           <button class="btn" type="submit">Create invoice</button>
+        </form>
+      </div>
+
+      <div role="tabpanel" id="p-swap" aria-labelledby="t-swap" hidden>
+        <form data-action="swap">
+          <div class="row">
+            <label>Payer<select name="frm" id="swap-frm"></select></label>
+            <label>Pays with<select name="from_asset" id="swap-from"></select></label>
+          </div>
+          <div class="row">
+            <label>Payee<select name="to" id="swap-to"></select></label>
+            <label>Gets<select name="to_asset" id="swap-toasset"></select></label>
+          </div>
+          <div class="row">
+            <label><span id="swap-unit">Amount (sat)</span><input name="amount" id="swap-amount" type="number" min="1" step="1" value="1000" required></label>
+            <label>Tier<select name="tier" id="swap-tier"><option value="low">low</option><option value="medium" selected>medium</option><option value="high">high</option></select></label>
+          </div>
+          <p class="hint" id="swap-route"></p>
+          <p class="hint">The payee makes an invoice (assetinvoice); the payer pays it in its own asset (payassetinvoice)
+            through its swap provider: leg 1 to the provider in the payer's asset, carrying the invoice; the provider
+            (or its node on the payee's chain) pays the invoice as leg 2 and settles leg 1 with the preimage that comes
+            back. Both legs share the invoice's payment hash, so neither settles without the other.</p>
+          <button class="btn" type="submit">Swap and pay</button>
         </form>
       </div>
 
@@ -558,9 +635,52 @@ const visChannels = () => S.channels.filter(c => inNet(c.node_net));
 const nodeBy = name => S.nodes.find(x => x.name === name);
 
 /* ------------------------------------------------------------ render */
+/* ------------------------------------------------------------ toggles */
+/* Open/closed state of every toggle (panels and node details), kept across
+   the page's re-renders and, in this browser, across reloads. */
+const folds = new Map();
+try { Object.entries(JSON.parse(localStorage.getItem('nodeui-folds') || '{}')).forEach(([k, v]) => folds.set(k, !!v)); } catch (e) {}
+function saveFolds() { try { localStorage.setItem('nodeui-folds', JSON.stringify(Object.fromEntries(folds))); } catch (e) {} }
+const isOpen = (key, dflt) => folds.has(key) ? folds.get(key) : !!dflt;
+/* A folded block: the summary stays, the body shows when opened. */
+function fold(key, summary, body, dflt) {
+  return `<details class="fold" data-fold-key="${esc(key)}"${isOpen(key, dflt) ? ' open' : ''}><summary>${summary}</summary><div class="fbody">${body}</div></details>`;
+}
+document.addEventListener('toggle', e => {
+  const d = e.target;
+  if (d.matches && d.matches('details[data-fold-key]') && isOpen(d.dataset.foldKey) !== d.open) { folds.set(d.dataset.foldKey, d.open); saveFolds(); }
+}, true);
+/* Panels: the title is the toggle. */
+function applyPanelFold(p) {
+  const open = isOpen('panel:' + p.dataset.fold, p.dataset.foldDefault === 'open');
+  p.classList.toggle('folded', !open);
+  const b = p.querySelector(':scope > header .foldbtn');
+  if (b) b.setAttribute('aria-expanded', open);
+}
+$$('section.panel[data-fold]').forEach(p => {
+  const h2 = p.querySelector(':scope > header h2');
+  const b = document.createElement('button');
+  b.type = 'button'; b.className = 'foldbtn'; b.textContent = h2.textContent;
+  h2.textContent = ''; h2.append(b);
+  b.addEventListener('click', () => {
+    folds.set('panel:' + p.dataset.fold, p.classList.contains('folded')); saveFolds(); applyPanelFold(p);
+  });
+  applyPanelFold(p);
+});
+/* What a folded panel says about itself. */
+function renderFoldNotes() {
+  const nets = S.networks.filter(x => inNet(x.id)), nodes = visNodes(), chans = visChannels();
+  $('#note-maps').textContent = `${nets.length} network${nets.length === 1 ? '' : 's'}`;
+  $('#note-nodes').textContent = `${nodes.filter(x => x.ok).length} of ${nodes.length} up`;
+  const open = chans.filter(c => c.state === 'open').length;
+  $('#note-channels').textContent = `${open} open${chans.length > open ? ', ' + (chans.length - open) + ' other' : ''}`;
+  const jobs = swapJobs();
+  $('#note-swapnet').textContent = `${S.nodes.filter(x => x.kind).length} nodes · ${jobs.length} swap${jobs.length === 1 ? '' : 's'}`;
+}
+
 function render() {
   if (sel !== 'all' && !netOf(sel)) sel = 'all';
-  renderChain(); renderNets(); renderAlerts(); renderMaps(); renderNodes(); renderEvm(); renderChannels(); renderSweeps();
+  renderChain(); renderNets(); renderAlerts(); renderSwapNet(); renderMaps(); renderNodes(); renderChannels(); renderSweeps(); renderFoldNotes();
   renderForms(); syncTips(); renderJobs();
 }
 
@@ -595,6 +715,165 @@ function renderAlerts() {
     if (items.length) out.push(`<div class="banner"><b>${esc(nd.name)}</b><ul>${items.map(i => `<li>${i}</li>`).join('')}</ul></div>`);
   });
   put('#alerts', out.join(''));
+}
+
+/* ------------------------------------------------------------ swap network */
+let routeSel = null;          /* the job id whose swap route is shown (null: the newest) */
+const CHAIN_NAME = {liquid: 'Liquid', evm: 'EVM', bitcoin: 'Bitcoin'};
+/* Swaps the page ran (running and finished), newest first. */
+function swapJobs() {
+  return (S.jobs || []).concat(S.history || []).filter(j => j.result && j.result.swap)
+    .sort((a, b) => b.id - a.id);
+}
+function coinColor(kind, label) { return color(label === 'L-BTC' ? '' : label, kind); }
+function chanLabel(c) { return c.kind === 'liquid' ? (c.asset_label || 'L-BTC') : c.kind === 'evm' ? (c.asset_label || 'ETH') : 'BTC'; }
+
+function renderSwapNet() {
+  const nodes = S.nodes.filter(x => x.kind);
+  const lsp = nodes.filter(x => x.swap && x.swap.remotes);
+  /* Swaps cross networks: only on the All view. */
+  $('#swapnet-panel').hidden = !lsp.length || sel !== 'all';
+  if ($('#swapnet-panel').hidden) return;
+  const jobs = swapJobs();
+  /* routeSel: null = the newest swap, 0 = none (the whole network) */
+  if (routeSel && !jobs.some(j => j.id === routeSel)) routeSel = null;
+  const job = routeSel === 0 ? null : routeSel === null ? jobs[0] : jobs.find(j => j.id === routeSel);
+  const tr = job ? job.result.swap : null;
+
+  /* Layout: the LSP box in the middle, its node on each chain inside it,
+     facing that chain's other nodes on an arc around it. */
+  const W = 960, H = 600, cx = 480, cy = 292, rx = 405, ry = 235;
+  const SECT = {liquid: [145, 215], evm: [-35, 35], bitcoin: [68, 112]};
+  const INSIDE = {liquid: [cx - 105, cy - 22], evm: [cx + 105, cy - 22], bitcoin: [cx, cy + 50]};
+  const pos = {}, lspNames = new Set(lsp.map(x => x.name));
+  lsp.forEach(x => { pos[x.name] = INSIDE[x.kind] || [cx, cy]; });
+  Object.keys(SECT).forEach(kind => {
+    const list = nodes.filter(x => x.kind === kind && !lspNames.has(x.name));
+    const [a0, a1] = SECT[kind];
+    list.forEach((x, i) => {
+      const t = (list.length === 1 ? (a0 + a1) / 2 : a0 + (a1 - a0) * i / (list.length - 1)) * Math.PI / 180;
+      pos[x.name] = [cx + rx * Math.cos(t), cy + ry * Math.sin(t)];
+    });
+  });
+
+  /* What the selected swap used: edges by channel (or by pair), and the bridge. */
+  const used = new Map(), usedPairs = new Map();
+  let step = 0;
+  const legs = tr ? [tr.leg1, tr.leg2].filter(Boolean) : [];
+  if (tr && tr.leg1) tr.leg1.hops.forEach(hp => { step++; const k = hp.scid || [hp.from, hp.to].sort().join(); used.set(k, {step, leg: 1}); usedPairs.set([hp.from, hp.to].sort().join(), {step, leg: 1, from: hp.from}); });
+  let bridgeStep = null;
+  if (tr && tr.bridge && tr.leg2) bridgeStep = ++step;
+  if (tr && tr.leg2) tr.leg2.hops.forEach(hp => { step++; const k = hp.scid || [hp.from, hp.to].sort().join(); used.set(k, {step, leg: 2}); usedPairs.set([hp.from, hp.to].sort().join(), {step, leg: 2, from: hp.from}); });
+  const routeOn = legs.length > 0;
+  const onRoute = new Set(legs.flatMap(l => l.path));
+
+  let svg = `<defs><marker id="sn-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--accent-hi)"/></marker></defs>`;
+  /* chain zones */
+  [['Liquid', cx - rx + 10, 24, 'start'], ['EVM · Base Sepolia', cx + rx - 10, 24, 'end'], ['Bitcoin', cx, H - 8, 'middle']]
+    .forEach(([t, x, y, a]) => { if (nodes.some(nd => CHAIN_NAME[nd.kind] && t.startsWith(CHAIN_NAME[nd.kind]))) svg += `<text class="zone" x="${x}" y="${y}" text-anchor="${a}">${esc(t)}</text>`; });
+  /* the LSP */
+  svg += `<rect x="${cx - 190}" y="${cy - 82}" width="380" height="172" rx="14" fill="rgba(0,195,255,.05)" stroke="var(--accent)" stroke-width="1.5" stroke-dasharray="2 0"/>
+    <text class="lsp" x="${cx}" y="${cy - 60}" text-anchor="middle">LSP · SWAP PROVIDER</text>`;
+
+  /* channels between page nodes */
+  const chans = S.channels.filter(c => c.b_ours && c.state !== 'closed' && pos[c.a] && pos[c.b]);
+  const pairs = {};
+  chans.forEach(c => { const k = [c.a, c.b].sort().join(); (pairs[k] = pairs[k] || []).push(c); });
+  Object.values(pairs).forEach(list => list.forEach((c, i) => {
+    let [x1, y1] = pos[c.a], [x2, y2] = pos[c.b];
+    const len = Math.hypot(x2 - x1, y2 - y1) || 1, off = (i - (list.length - 1) / 2) * 12;
+    const ox = -(y2 - y1) / len * off, oy = (x2 - x1) / len * off;
+    x1 += ox; x2 += ox; y1 += oy; y2 += oy;
+    const lab = chanLabel(c), col = coinColor(c.kind, lab);
+    const hit = used.get(c.scid) || ((used.has(c.scid) || !routeOn) ? null : (() => {
+      const u = usedPairs.get([c.a, c.b].sort().join());
+      /* a hop recorded without its channel: the pair's channel in the leg's coin */
+      if (!u) return null;
+      const leg = u.leg === 1 ? tr.leg1 : tr.leg2;
+      return leg && !leg.hops.some(hp => hp.scid) && lab === leg.label ? u : null;
+    })());
+    const dash = c.state === 'open' && c.peer_connected !== false ? '' : ' stroke-dasharray="6 4"';
+    const cls = routeOn && !hit ? ' class="faded"' : '';
+    svg += `<g${cls}><line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" stroke="${col}" stroke-width="${hit ? 6 : 3}"${dash}>
+      <title>${esc(c.a + ' ⇄ ' + c.b + ' · ' + lab + ' · ' + n(c.a_units) + ' | ' + n(c.b_units) + ' ' + c.unit + ' · ' + c.state + (c.scid ? ' · ' + c.scid : ''))}</title></line>`;
+    if (!routeOn) svg += `<text class="cap" x="${(x1 + x2) / 2}" y="${(y1 + y2) / 2 + 4}" text-anchor="middle">${n(c.a_units + c.b_units)}</text>`;
+    if (hit) {
+      const fromA = (usedPairs.get([c.a, c.b].sort().join()) || {}).from === c.a;
+      const [ax, ay, bx, by] = fromA ? [x1, y1, x2, y2] : [x2, y2, x1, y1];
+      const mx = (ax + bx) / 2, my = (ay + by) / 2;
+      svg += `<line x1="${ax + (bx - ax) * .2}" y1="${ay + (by - ay) * .2}" x2="${ax + (bx - ax) * .8}" y2="${ay + (by - ay) * .8}" stroke="var(--accent-hi)" stroke-width="1.5" marker-end="url(#sn-arrow)"/>
+        <circle cx="${mx}" cy="${my}" r="9" fill="var(--accent-hi)"/><text class="step" x="${mx}" y="${my + 4}" text-anchor="middle">${hit.step}</text>`;
+    }
+    svg += '</g>';
+  }));
+
+  /* the LSP's bridges: one of its nodes pays leg 2 through another's RPC */
+  const bridges = {};
+  lsp.forEach(x => Object.entries(x.swap.remotes || {}).forEach(([asset, to]) => {
+    if (!pos[to]) return;
+    const k = [x.name, to].sort().join();
+    (bridges[k] = bridges[k] || {a: x.name, b: to, assets: new Set()}).assets.add(asset.length > 20 ? assetLabel(asset) : asset.toUpperCase());
+  }));
+  Object.values(bridges).forEach(br => {
+    const [x1, y1] = pos[br.a], [x2, y2] = pos[br.b];
+    const hit = tr && tr.bridge && [tr.bridge.from, tr.bridge.to].sort().join() === [br.a, br.b].sort().join();
+    svg += `<g${routeOn && !hit ? ' class="faded"' : ''}><line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" stroke="${hit ? 'var(--accent-hi)' : 'var(--muted)'}" stroke-width="${hit ? 3 : 1.5}" stroke-dasharray="5 5">
+      <title>${esc(br.a + ' ⇢ ' + br.b + ': pays leg 2 over RPC (' + [...br.assets].join(', ') + ')')}</title></line>`;
+    if (hit) {
+      const mx = (x1 + x2) / 2, my = (y1 + y2) / 2;
+      svg += `<circle cx="${mx}" cy="${my}" r="9" fill="var(--accent-hi)"/><text class="step" x="${mx}" y="${my + 4}" text-anchor="middle">${bridgeStep}</text>`;
+    }
+    svg += '</g>';
+  });
+
+  /* nodes */
+  nodes.forEach(nd => {
+    if (!pos[nd.name]) return;
+    const [x, y] = pos[nd.name], isLsp = lspNames.has(nd.name);
+    const role = tr && (nd.name === tr.payer ? 'payer' : nd.name === tr.payee ? 'payee' : null);
+    const faded = routeOn && !onRoute.has(nd.name) && !(tr.bridge && (tr.bridge.from === nd.name || tr.bridge.to === nd.name));
+    const stroke = !nd.ok ? 'var(--bad)' : role ? 'var(--accent-hi)' : isLsp ? 'var(--accent)' : 'var(--line)';
+    const kcol = {liquid: 'var(--lbtc)', evm: 'var(--evm)', bitcoin: 'var(--btc)'}[nd.kind];
+    const sw = nd.swap ? (isLsp ? 'swap provider' : nd.swap.pay && nd.swap.provider ? 'swaps via ' + nd.swap.provider : 'can get swaps') : 'no swap plugin';
+    svg += `<g${faded ? ' class="faded"' : ''}><title>${esc(nd.name + ' · ' + (CHAIN_NAME[nd.kind] || '') + ' · ' + (nd.ok ? sw : 'down'))}</title>
+      <rect x="${x - 34}" y="${y - 15}" width="68" height="30" rx="4" fill="var(--raised)" stroke="${stroke}" stroke-width="${role ? 2.5 : 1.5}"/>
+      <rect x="${x - 34}" y="${y - 15}" width="4" height="30" fill="${kcol}"/>
+      <text class="nm" x="${x + 2}" y="${y + 5}" text-anchor="middle">${esc(nd.name)}</text>
+      ${role ? `<text class="zone" x="${x}" y="${y - 21}" text-anchor="middle" style="fill:var(--accent-hi)">${role}</text>` : ''}</g>`;
+  });
+  put('#swapnet', `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="${esc('All chains: ' + nodes.length + ' nodes, ' + chans.length + ' channels, swap provider ' + lsp.map(x => x.name).join(', '))}">${svg}</svg>`);
+
+  /* legend: one color per coin that has a channel */
+  const coins = new Map();
+  chans.forEach(c => coins.set(c.kind + '|' + chanLabel(c), coinColor(c.kind, chanLabel(c))));
+  put('#swapnet-legend', [...coins].map(([k, col]) => `<span><i style="background:${col}"></i>${esc(k.split('|')[1])}</span>`)
+    .concat(['<span><i class="dash"></i>LSP bridge (RPC)</span>', '<span><i style="background:var(--accent-hi);height:5px"></i>Selected route</span>']).join(''));
+  renderSwapRoute(jobs, job, tr, bridgeStep);
+}
+
+function renderSwapRoute(jobs, job, tr, bridgeStep) {
+  if (!jobs.length) {
+    put('#swaproute', '<p class="hint">Run a swap from the Swap tab: its route shows here, step by step, with why it went that way.</p>');
+    return;
+  }
+  const unit = (u, label) => `${u} of ${esc(label)}`;
+  const opts = `<option value="0"${job ? '' : ' selected'}>Whole network, no route</option>` + jobs.map(j => `<option value="${j.id}"${job && j.id === job.id ? ' selected' : ''}>#${j.id} ${esc(j.result.swap.payer)} → ${esc(j.result.swap.payee)} · ${n(j.result.swap.amount)} ${esc(j.result.swap.to_unit)} ${esc(j.result.swap.to_label)} · ${esc(j.status)}</option>`).join('');
+  let h = `<select id="route-pick" aria-label="Swap to show">${opts}</select>`;
+  if (!tr) { put('#swaproute', h + '<p class="hint">Pick a swap to see its route on the map and why it went that way.</p>'); return; }
+  h += `<div class="sum">${esc(tr.payer)} pays ${n(tr.amount)} ${unit(tr.to_unit, tr.to_label)} to ${esc(tr.payee)}${tr.paid != null ? `, for ${n(tr.paid)} ${unit(tr.from_unit, tr.from_label)}` : ''}${tr.kind === 'swap' ? ` <span class="sub">(${esc(tr.tier)} tier)</span>` : ''}</div>`;
+  h += `<div>${pill(job.status)}${tr.ok ? ' <span class="y">invoice paid</span>' : ''}</div>`;
+  if (tr.error) h += `<p class="err">${esc(tr.error)}</p>`;
+  let st = 0;
+  const legHtml = (leg, what) => `<li><b>${what}</b> in ${esc(leg.label)}: ${leg.hops.map(hp => `<span class="hop">${esc(hp.from)} → ${esc(hp.to)}${hp.scid ? ' (' + esc(hp.scid) + ')' : ''}</span>`).join(', ')}${(leg.forwarders || []).length ? `<div class="hop">forwarded by ${leg.forwarders.map(f => esc(f.node) + ' (fee ' + n(f.fee_msat) + ' msat)').join(', ')}</div>` : ''}${leg.amount != null ? `<div class="hop">${n(leg.amount)} ${esc(leg.label)}</div>` : ''}</li>`;
+  h += '<h3>Route</h3><ol class="legs">';
+  if (tr.leg1) { h += legHtml(tr.leg1, tr.kind === 'direct' ? 'Payment' : 'Leg 1, to the LSP'); st += tr.leg1.hops.length; }
+  if (tr.bridge && tr.leg2) h += `<li><b>Across the LSP</b>: ${esc(tr.bridge.from)} has ${esc(tr.bridge.to)} pay leg 2 (RPC), same payment hash</li>`;
+  if (tr.leg2) h += legHtml(tr.leg2, 'Leg 2, to the payee');
+  h += '</ol>';
+  h += `<h3>Why this route</h3><ul class="why">${tr.why.map(w => `<li>${esc(w)}</li>`).join('')}</ul>`;
+  const candTable = (leg, who) => leg && leg.candidates && leg.candidates.length ? `<h3>${esc(who)}'s channels</h3><table class="cands">${leg.candidates.map(c => `<tr><td class="${c.ok ? 'y' : 'x'}">${c.ok ? '✓' : '✗'}</td><td>to ${esc(c.peer)}<div class="hop">${esc(c.coin)} · ${n(c.spendable)} spendable</div></td><td class="${c.ok ? 'y' : 'x'}">${c.ok ? (leg.hops.some(hp => hp.scid && hp.scid === c.scid) ? 'used' : c.toward ? 'straight there, unused' : 'right coin, only via ' + esc(c.peer)) : esc(c.why)}</td></tr>`).join('')}</table>` : '';
+  h += candTable(tr.leg1, tr.payer) + candTable(tr.leg2, tr.leg2_node || '');
+  put('#swaproute', h);
 }
 
 function renderMaps() {
@@ -647,70 +926,97 @@ function mapSvg(m, net) {
   return `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="${esc('Map of ' + net.id + ': ' + m.nodes.length + ' nodes, ' + m.edges.length + ' channels')}">${svg}</svg>`;
 }
 
+/* An EVM node's health, from its evmbackend plugin: its own alarms (SPEC 5.5:
+   lag, a stuck safe block, low gas, altered log data, index sync) and sync or
+   option problems are bad; low gas, an old pending send, heavy Infura use or
+   a stale read need attention. {level: ok|warn|bad, head, reasons[]} */
+const ALARM_NAMES = {lag: 'Index lag', tag: 'Safe block stuck', balance: 'Low gas', witness: 'Altered log data', sync: 'Index sync failing'};
+function evmHealth(nd) {
+  const e = nd.evm;
+  if (!e) return {level: 'bad', head: 'No EVM status', reasons: [nd.evm_error || 'evm-status not read yet']};
+  const bad = [], warn = [];
+  Object.entries(e.alarms || {}).forEach(([k, a]) => bad.push(`${ALARM_NAMES[k] || k}: ${(a && a.message) || a}`));
+  if (e.sync_error) bad.push('Sync: ' + e.sync_error);
+  (e.option_problems || []).forEach(x => bad.push('Option: ' + x));
+  (e.errors || []).forEach(x => bad.push(x));
+  if (e.opens_refused) bad.push('Opens refused: ' + e.opens_refused);
+  if (e.low_gas && !(e.alarms || {}).balance) warn.push(`Low gas: ${e.gas_text}, below evm-min-balance ${e.min_balance_text}`);
+  const old = (e.pending_sends || []).filter(x => (x.age_s || 0) > 600);
+  if (old.length) warn.push(`${old.length} send${old.length === 1 ? '' : 's'} pending for over 10 min`);
+  if (e.credits_pct > 80) warn.push(`Infura use ${e.credits_pct}% of the free tier`);
+  if (!e.anvil && e.read_age_s != null && e.poll_every_s && e.read_age_s > 3 * e.poll_every_s) warn.push(`Status last read ${ago(e.read_age_s)} ago`);
+  const facts = `lag ${e.lag ?? '–'} block${e.lag === 1 ? '' : 's'} · ${e.confirm || 'safe'} block last moved ${ago(e.tag_unchanged_s)} ago`;
+  if (bad.length) return {level: 'bad', head: 'Unhealthy', reasons: bad.concat(warn)};
+  if (warn.length) return {level: 'warn', head: 'Needs attention', reasons: warn.concat([facts])};
+  return {level: 'ok', head: 'Healthy', reasons: [facts]};
+}
+
 function renderNodes() {
   const list = visNodes();
   put('#nodes', list.map(nd => {
-    const top = `<div class="top"><span class="dot ${nd.ok ? (nd.syncing ? 'warn' : 'ok') : 'bad'}" aria-hidden="true"></span><span class="name">${esc(nd.name)}</span>
+    const health = nd.ok && nd.kind === 'evm' ? evmHealth(nd) : null;
+    const dot = !nd.ok ? 'bad' : health && health.level !== 'ok' ? health.level : nd.syncing ? 'warn' : 'ok';
+    const top = `<div class="top"><span class="dot ${dot}" aria-hidden="true"></span><span class="name">${esc(nd.name)}</span>
         <button class="id mono" type="button" data-copy="${esc(nd.id)}" title="Copy node id" aria-label="Copy node id of ${esc(nd.name)}">${nd.id ? esc(nd.id.slice(0, 10)) + '…' : ''}</button></div>
       <div>${badge(nd.net, nd.kind)}</div>`;
     if (!nd.ok) return `<div class="node">${top}<div class="down">Down: ${esc(nd.error || 'not reachable')}</div></div>`;
+    /* Up front: the wallet, deposits on their way, and anything that needs attention. */
     let rows = `<div class="bal"><span class="hgroup">Wallet (${esc(nd.wallet.unit)})${nd.wallet.reserve_hint ? qi(nd.wallet.reserve_hint + '.', 'About the wallet reserve') : ''}</span><b>${n(nd.wallet.confirmed)}${nd.wallet.unconfirmed ? ` <span class="sub">+${n(nd.wallet.unconfirmed)} unconfirmed</span>` : ''}</b></div>`;
     (nd.deposits || []).forEach(d => {
       rows += `<div class="progress" title="${esc(d.txid)}">Deposit of ${n(d.sat)} sat: ${d.in_wallet ? 'in the wallet, unconfirmed'
         : `mined on the EVM chain; CLN at block ${n(nd.blockheight)} of ${n(d.height)}${d.height > nd.blockheight ? ` (${n(d.height - nd.blockheight)} to go)` : ''}`}</div>`;
     });
+    const e = nd.kind === 'evm' ? nd.evm : null;
+    if (health) rows += `<div class="health ${health.level}" role="status"><b>EVM ${esc(health.head.toLowerCase())}</b>${health.reasons.map(r => `<span>${esc(r)}</span>`).join('')}</div>`;
+    if (nd.elements_error) rows += `<div class="badline">elementsd: ${esc(nd.elements_error)}</div>`;
+
+    /* Under the toggle: balances in detail, addresses, and the EVM chain status. */
+    let more = '';
     if (nd.kind === 'liquid') {
-      rows += Object.entries(nd.elements || {}).map(([k, v]) => `<div class="bal"><span><span class="chip" style="--c:${color(assetLabel(k), 'liquid')}">elementsd ${esc(assetLabel(k))}</span></span><b>${n(v)}</b></div>`).join('');
-      if (nd.elements_error) rows += `<div class="down">elementsd: ${esc(nd.elements_error)}</div>`;
-      rows += `<div class="sub">Asset channels in: ${nd.allowed_assets.length ? nd.allowed_assets.map(a => esc(assetLabel(a))).join(', ') : 'none (L-BTC only)'}</div>`;
+      more += Object.entries(nd.elements || {}).map(([k, v]) => `<div class="bal"><span><span class="chip" style="--c:${color(assetLabel(k), 'liquid')}">elementsd ${esc(assetLabel(k))}</span></span><b>${n(v)}</b></div>`).join('');
+      more += `<div class="sub">Asset channels in: ${nd.allowed_assets.length ? nd.allowed_assets.map(a => esc(assetLabel(a))).join(', ') : 'none (L-BTC only)'}</div>`;
     }
-    if (nd.kind === 'evm' && nd.evm) {
-      const e = nd.evm;
-      rows += `<div class="bal"><span>Gas</span><b title="${esc(e.gas_title || '')}"${e.low_gas ? ' style="color:var(--warn)"' : ''}>${esc(e.gas_text || '–')}</b></div>`;
-      if (e.token) rows += `<div class="bal"><span>${esc(e.token_label || 'Token')}</span><b>${esc(e.token_balance_text || '–')}</b></div>`;
-      rows += `<div class="bal"><span>Withdrawable</span><b title="${esc(e.withdrawable_title || '')}">${esc(e.withdrawable_text || '–')}</b></div>`;
+    if (e) {
+      more += `<div class="bal"><span>Gas</span><b title="${esc(e.gas_title || '')}"${e.low_gas ? ' style="color:var(--warn)"' : ''}>${esc(e.gas_text || '–')}</b></div>`;
+      if (e.token) more += `<div class="bal"><span>${esc(e.token_label || 'Token')}</span><b>${esc(e.token_balance_text || '–')}</b></div>`;
+      more += `<div class="bal"><span>Withdrawable</span><b title="${esc(e.withdrawable_title || '')}">${esc(e.withdrawable_text || '–')}</b></div>`;
     }
-    rows += (nd.links || []).map(l => `<div class="addr"><span>${esc(l.label)}</span>${ext(l.value, l.path, nd.net)}${l.sat != null ? ` <span class="sub">${n(l.sat)} sat</span>` : ''}</div>`).join('');
-    if (nd.links_more) rows += `<div class="sub">+${n(nd.links_more)} more wallet addresses</div>`;
+    more += (nd.links || []).map(l => `<div class="addr"><span>${esc(l.label)}</span>${ext(l.value, l.path, nd.net)}${l.sat != null ? ` <span class="sub">${n(l.sat)} sat</span>` : ''}</div>`).join('');
+    if (nd.links_more) more += `<div class="sub">+${n(nd.links_more)} more wallet addresses</div>`;
+    if (e) more += evmStatus(nd);
     const peers = nd.peers.filter(p => p.connected).map(p => p.name).join(', ') || 'none';
     return `<div class="node">${top}${rows}
+      ${more ? fold('node:' + nd.name, 'Details', more) : ''}
       <div class="peers">Block ${n(nd.blockheight)}${nd.mining ? ' · page mines here' : ''} · connected to ${esc(peers)}</div></div>`;
   }).join('') || '<div class="empty">No nodes on this network.</div>');
   $('#nodes-hint').textContent = sel === 'all' ? '' : (netOf(sel) || {}).title || '';
 }
 
-function renderEvm() {
-  const list = visNodes().filter(x => x.kind === 'evm' && x.ok);
-  $('#evm-panel').hidden = !list.length;
-  put('#evms', list.map(nd => {
-    const e = nd.evm;
-    if (!e) return `<div class="evm"><h3>${esc(nd.name)}</h3><div class="down">${esc(nd.evm_error || 'evm-status not read yet')}</div></div>`;
-    const asset = e.token ? `${esc(e.token_label || '')} <span title="${esc(e.token)}">${esc(shortAddr(e.token))}</span> · ${n(e.units_per_sat)} units/sat` : 'ETH (1 sat = 1e10 wei)';
-    const credits = e.credits_per_day == null ? '–' : `${n(e.credits_per_day)}/day · ${e.credits_pct}% of 3M${e.anvil ? ' (anvil: free)' : ''} · ${n(e.rpc_calls_total)} calls in ${e.credits_hours} h`;
-    const pend = (e.pending_sends || []).map(p => `${esc(p.kind)} ${esc(shortAddr(p.txid || ''))} nonce ${esc(p.nonce)} · ${ago(p.age_s)}${p.replacements ? ' · ' + esc(p.replacements) + ' bumps' : ''}`).join('<br>') || 'none';
-    const dd = (k, v, cls) => `<dt>${k}</dt><dd${cls ? ` class="${cls}"` : ''}>${v}</dd>`;
-    const wait = e.refresh_wait_s || 0;
-    const link = label => ((nd.links || []).find(l => l.label === label) || {}).path;
-    const read = e.anvil ? 'every ' + ago(e.poll_every_s) : `read ${ago(e.read_age_s)} ago${e.cached ? ' (cached balances)' : ''}, every ${ago(e.poll_every_s)}`;
-    return `<div class="evm">
-      <div class="top" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap"><h3>${esc(nd.name)}</h3>${badge(nd.net, 'evm')}
-        <span class="hint" style="margin-left:auto">${esc(read)}</span><button class="btn ghost" type="button" data-refresh="${esc(nd.name)}" ${wait ? `disabled title="Again in ${wait} s"` : 'title="One fresh evm-status read (an eth_getBalance and an eth_call)"'}>Refresh</button></div>
+/* An EVM node's chain status (its evmbackend plugin): contract, key, how far
+   its index is behind, sends in flight, Infura use. In the node's Details. */
+function evmStatus(nd) {
+  const e = nd.evm;
+  const asset = e.token ? `${esc(e.token_label || '')} <span title="${esc(e.token)}">${esc(shortAddr(e.token))}</span> · ${n(e.units_per_sat)} units/sat` : 'ETH (1 sat = 1e10 wei)';
+  const credits = e.credits_per_day == null ? '–' : `${n(e.credits_per_day)}/day · ${e.credits_pct}% of 3M${e.anvil ? ' (anvil: free)' : ''} · ${n(e.rpc_calls_total)} calls in ${e.credits_hours} h`;
+  const pend = (e.pending_sends || []).map(p => `${esc(p.kind)} ${esc(shortAddr(p.txid || ''))} nonce ${esc(p.nonce)} · ${ago(p.age_s)}${p.replacements ? ' · ' + esc(p.replacements) + ' bumps' : ''}`).join('<br>') || 'none';
+  const dd = (k, v, cls) => `<dt>${k}</dt><dd${cls ? ` class="${cls}"` : ''}>${v}</dd>`;
+  const wait = e.refresh_wait_s || 0;
+  const link = label => ((nd.links || []).find(l => l.label === label) || {}).path;
+  const read = e.anvil ? 'every ' + ago(e.poll_every_s) : `read ${ago(e.read_age_s)} ago${e.cached ? ' (cached balances)' : ''}, every ${ago(e.poll_every_s)}`;
+  return `<h4>EVM chain status ${qi("The node's evmbackend plugin: its contract, ETH key and balances, how far its index is behind the chain, and its Infura use, priced in Infura's credits (the free tier is 3M a day).", 'About EVM chain status')}</h4>
+    <div class="evm" style="padding:0;border:0;margin:0">
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap"><span class="hint">${esc(read)}</span>
+        <button class="btn ghost" type="button" data-refresh="${esc(nd.name)}" ${wait ? `disabled title="Again in ${wait} s"` : 'title="One fresh evm-status read (an eth_getBalance and an eth_call)"'} style="margin-left:auto">Refresh</button></div>
       <dl>
         ${dd('Contract', `${ext(e.contract, link('Contract'), nd.net)} · chain ${esc(e.chain_id)}`)}
         ${dd('Asset', asset)}
-        ${dd('ETH address', ext(e.eth_address, link('ETH address'), nd.net, e.eth_address))}
-        ${dd('Gas balance', `<span title="${esc(e.gas_title || '')}">${esc(e.gas_text || '–')}</span>` + (e.low_gas ? ` · below evm-min-balance ${esc(e.min_balance_text)}` : ''), e.low_gas ? 'warn' : '')}
-        ${e.token ? dd('Token balance', esc(e.token_balance_text || '–')) : ''}
-        ${dd('Withdrawable', `<span title="${esc(e.withdrawable_title || '')}">${esc(e.withdrawable_text || '–')}</span>`)}
         ${dd('Tip / height', `${n(e.tip ?? 0)} / ${n(e.current_height ?? 0)} · lag ${esc(e.lag ?? '–')}`)}
         ${dd(`${esc(e.confirm || 'safe')} age`, `${ago(e.tag_age_s)}${e.tag_unchanged_s != null ? ' · unchanged ' + ago(e.tag_unchanged_s) : ''}`)}
+        ${dd('Alarms', Object.keys(e.alarms || {}).length ? Object.entries(e.alarms).map(([k, a]) => esc((ALARM_NAMES[k] || k) + ': ' + ((a && a.message) || a) + (a && a.since ? ' (since ' + new Date(a.since * 1000).toLocaleTimeString() + ')' : ''))).join('<br>') : 'none', Object.keys(e.alarms || {}).length ? 'bad' : '')}
         ${dd('Pending sends', pend)}
         ${dd('Credit use', credits, e.credits_pct > 80 ? 'warn' : '')}
-        ${(e.errors || []).length ? dd('Errors', e.errors.map(esc).join('<br>'), 'bad') : ''}
       </dl>
-      ${e.opens_refused ? `<div class="banner"><b>Opens refused</b><span>${esc(e.opens_refused)}</span></div>` : ''}
     </div>`;
-  }).join(''));
 }
 
 const STATES = {open: 'Open', opening: 'Opening', closing: 'Closing', onchain: 'On chain', closed: 'Closed'};
@@ -778,6 +1084,8 @@ function renderForms() {
   const hasEvm = up.some(x => x.kind === 'evm');
   const mineNets = S.networks.filter(x => x.mining && inNet(x.id));
   $('#t-evm').hidden = !hasEvm; $('#t-mine').hidden = !mineNets.length;
+  /* Swaps cross networks: the Swap tab only on the All view. */
+  $('#t-swap').hidden = sel !== 'all' || !S.nodes.some(x => x.ok && x.swap && x.swap.pay && x.swap.provider);
   const curTab = $('#tabs [aria-selected=true]');
   if (curTab && curTab.hidden) showTab('open');
 
@@ -814,6 +1122,40 @@ function renderForms() {
   fill('#inv-node', up.map(nodeOpt), 'no node is up');
   const inode = nodeBy($('#inv-node').value);
   setAsset('inv', inode ? [inode] : []);
+
+  // Swap (assetswap-plugin): across networks, so every node that is up,
+  // whatever the network filter shows.
+  const allUp = S.nodes.filter(x => x.ok && x.detected && x.net && !x.net.includes('?'));
+  const payers = allUp.filter(x => x.swap && x.swap.pay && x.swap.provider);
+  fill('#swap-frm', payers.map(nodeOpt), 'no node has a swap provider');
+  const sf = nodeBy($('#swap-frm').value);
+  const swapAssets = nd => !nd ? [] : nd.kind === 'liquid'
+    ? (nd.allowed_assets || []).map(a => [a, assetLabel(a) + ' (units)']).concat([['lbtc', 'L-BTC (sat)']])
+    : [[nd.swap.native, nd.swap.native.toUpperCase() + ' (sat)']];
+  fill('#swap-from', swapAssets(sf));
+  fill('#swap-to', allUp.filter(x => x.swap && x.swap.receive && sf && x.name !== sf.name).map(nodeOpt), 'no node can receive');
+  const st = nodeBy($('#swap-to').value);
+  fill('#swap-toasset', swapAssets(st));
+  const fromA = $('#swap-from').value, toA = $('#swap-toasset').value;
+  const unitOf = a => ['lbtc', 'eth', 'btc'].includes(a) ? 'sat' : 'units';
+  $('#swap-unit').textContent = `Amount (${unitOf(toA)} ${toA === 'eth' ? 'of ETH' : toA === 'lbtc' ? 'of L-BTC' : ''})`.replace(' )', ')');
+  let sr = '';
+  if (sf && st && fromA === toA && sf.net === st.net) sr = `Same coin on the same network: ${sf.name} pays ${st.name} directly (xpay), no swap and no provider.`;
+  else if (sf && st) {
+    const prov = nodeBy(sf.swap.provider), remote = prov && prov.swap && prov.swap.remotes && prov.swap.remotes[toA];
+    const pair = (sf.swap.pairs || []).find(p => p.to === toA);
+    const amt = Number($('#swap-amount').value) || 0, tier = $('#swap-tier').value;
+    const lab = a => ({lbtc: 'L-BTC', eth: 'ETH', btc: 'BTC'})[a] || assetLabel(a);
+    sr = `Leg 1: ${sf.name} → ${sf.swap.provider} in ${lab(fromA)}; leg 2: ${remote || sf.swap.provider} → ${st.name} in ${lab(toA)}.`;
+    if (pair && pair.from === fromA && amt) {
+      const margin = {low: 2010, medium: 2030, high: 2060}[tier];
+      const from = Math.floor(amt * 1000 * Math.floor(pair.rate_ppm * margin / 1000) / 1e6 + pair.fee_base_msat) / 1000;
+      sr += ` ${sf.name}'s quote (${tier}): ${n(from)} ${unitOf(fromA)} for ${n(amt)} ${unitOf(toA)}.`;
+    } else if (pair) sr += ` ${sf.name} prices ${lab(toA)} only against ${lab(pair.from)}.`;
+    else sr += ` ${sf.name} has no local price for ${lab(toA)}.`;
+    if (prov && prov.swap && prov.swap.remotes && !remote && st.net !== prov.net) sr += ` ${prov.name} has no node on ${st.name}'s chain (assetswap-remote).`;
+  }
+  $('#swap-route').textContent = sr;
 
   // Close
   fill('#close-chan', visChannels().filter(c => !['closed', 'onchain'].includes(c.state) && (nodeBy(c.a) || {}).ok)
@@ -870,7 +1212,8 @@ const pill = st => { const [cls, txt] = PILL[st] || ['', st]; return `<span clas
 const openLogs = new Map();       /* finished job id -> the user opened (true) or closed (false) its log */
 function jobResult(j) {
   return Object.entries(j.result || {}).filter(([k]) => k === 'bolt11' || k === 'address')
-    .map(([k, v]) => `<button class="btn ghost" type="button" data-copy="${esc(v)}" data-what="${k === 'bolt11' ? 'Invoice' : 'Address'}">Copy ${k === 'bolt11' ? 'invoice' : 'address'}</button>`).join('');
+    .map(([k, v]) => `<button class="btn ghost" type="button" data-copy="${esc(v)}" data-what="${k === 'bolt11' ? 'Invoice' : 'Address'}">Copy ${k === 'bolt11' ? 'invoice' : 'address'}</button>`).join('')
+    + (j.result && j.result.swap ? `<button class="btn ghost" type="button" data-route="${j.id}">Show route</button>` : '');
 }
 /* A job log, its tx hashes linked to the network's explorer: 0x hashes on an
    EVM chain (EVM txs), and hashes after "tx"/"txid" elsewhere. */
@@ -956,13 +1299,19 @@ document.addEventListener('click', async e => {
 $('#toggleClosed').addEventListener('click', () => { showClosed = !showClosed; renderChannels(); });
 $('#close-force').addEventListener('change', e => $('#close-warn').hidden = !e.target.checked);
 document.addEventListener('change', e => { if (S && e.target.closest('form')) renderForms(); });
+$('#swap-amount').addEventListener('input', () => { if (S) renderForms(); });
 document.addEventListener('click', e => {
   const c = e.target.closest('[data-close]');
   if (c) { showTab('close'); $('#close-chan').value = c.dataset.close; $('#close-chan').focus(); }
+  const rt = e.target.closest('[data-route]');
+  if (rt) { routeSel = Number(rt.dataset.route); renderSwapNet(); $('#swapnet-panel').scrollIntoView({behavior: 'smooth', block: 'start'}); }
   const cp = e.target.closest('[data-copy]');
   if (cp && cp.dataset.copy) copy(cp.dataset.copy, cp.dataset.what || 'Node id');
 });
 
+document.addEventListener('change', e => {
+  if (e.target.id === 'route-pick') { routeSel = Number(e.target.value); renderSwapNet(); }
+});
 $$('form[data-action]').forEach(f => f.addEventListener('submit', e => {
   e.preventDefault();
   if (!S) return;
