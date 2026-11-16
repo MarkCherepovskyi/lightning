@@ -21,6 +21,7 @@
 //! this one calls via a plain local RPC call (`protocol::fetch_price_tiers`).
 
 mod assetinvoice;
+mod balances;
 mod config;
 mod htlc;
 mod pay;
@@ -71,6 +72,12 @@ async fn main() -> Result<(), Error> {
             "Pay an assetinvoice string, even if it requires an asset you \
              don't directly hold (via a swap-provider node)",
             pay::payassetinvoice,
+        )
+        .rpcmethod(
+            "assetbalances",
+            "List this node's channel balance per asset, including \
+             ordinary L-BTC channels under \"lbtc\"",
+            balances::assetbalances,
         )
         .configure()
         .await?
