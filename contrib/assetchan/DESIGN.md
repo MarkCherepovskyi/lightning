@@ -124,7 +124,7 @@ Explicit (unblinded) outputs only.
   is spent by a transaction whose input 0 is the asset output, going in full to output
   0 (the channel's close script, or the HTLC-tx output for HTLC txs); L-BTC from CLN's
   own wallet pays the fee (more inputs, P2WPKH change back to the wallet, the explicit
-  fee output), at most the channel's fee reserve per tx. Core builds, signs (SIGHASH_ALL;
+  fee output), capped per tx (`asset_fee_cap`, below). Core builds, signs (SIGHASH_ALL;
   HTLC txs keep BOLT 3's SIGHASH_SINGLE|ANYONECANPAY from both sides on their HTLC
   input), broadcasts and rebuilds it every block at the feerate its deadline calls for,
   the upstream sweep and HTLC-tx paths (`consider_onchain_rebroadcast`,
@@ -133,16 +133,31 @@ Explicit (unblinded) outputs only.
   swept the same way, from the `onchaind_add_utxo` notification upstream hands the
   wallet (which can't hold assets); onchaind doesn't wait for that sweep, so
   lightningd keeps the channel (and the sweep's rebroadcasting) until it is mined, even
-  once onchaind is done with everything else. The fee cap ignores deadline urgency
-  (penalties), and dust change goes to the fee, so a fee can exceed the cap by up to
-  the dust limit. No plugin is on this path. (An earlier version had
+  once onchaind is done with everything else. No plugin is on this path. (An earlier version had
   the plugin fund sweeps from elementsd, through SIGHASH_SINGLE|ANYONECANPAY signatures
   and an `asset_sweep` notification; reviewers showed that exposes penalties to
-  replacement cycling and drops sweeps when the plugin is down, so it went.) Anchors:
-  `anchorspend.c` is off on Elements (it builds no Elements transactions). The plugin's
-  anchors bit is node-wide, so ordinary L-BTC channels between plugin nodes are anchor
-  channels too: their commitments pay their own fee, unbumped, and their zero-fee HTLC
-  txs get wallet L-BTC from the upstream rebroadcast path (P2WPKH change, explicit fee).
+  replacement cycling and drops sweeps when the plugin is down, so it went.)
+- **Anchor CPFP**: upstream's `anchorspend.c`, which builds Elements transactions too
+  (the anchor and wallet coins are explicit L-BTC; P2WPKH change, explicit fee
+  output; hsmd's `sign_anchorspend` signs the PSET unchanged). A commitment whose
+  fixed fee falls short of the feerate an HTLC deadline calls for gets its anchor
+  spent with wallet L-BTC, and the spend is RBF'd every block as the deadline nears.
+  Upstream only bumps when the HTLCs are worth more than the fee; an asset channel's
+  HTLCs are in the asset, so it pays what the feerate asks up to `asset_fee_cap`
+  instead (aiming at a lower feerate if the cap is short). The plugin's anchors bit is
+  node-wide, so ordinary L-BTC channels between plugin nodes are anchor channels too:
+  they get upstream's rule unchanged (their HTLCs are L-BTC).
+- **Fee cap** (`asset_fee_cap`, `lightningd/onchain_control.c`): we can't tell what the
+  asset is worth in L-BTC, so every tx of ours (sweep, HTLC tx fee inputs, anchor
+  spend) pays at most one fee reserve, which is what the opener set aside for fees.
+  For a claim the peer could otherwise win (a penalty, an HTLC: success, timeout, or
+  taken off the peer's commitment) that is within 12 blocks of its deadline, the cap
+  is 10 fee reserves (20,000 sat at the default reserve): losing the claim costs the
+  whole output. Outputs only we can spend (our delayed outputs, `to_remote`) and the
+  low-priority anchor spend that just gets a commitment mined stay at one reserve.
+  The fee still follows the deadline's feerate, so the cap only bites in a fee spike;
+  change too small to be worth an output (at the capped feerate) goes to the fee, so a
+  fee can exceed the cap by about the cost of one output plus dust.
 - **Invariants**: one asset per channel (core). A forward leaves in the asset it arrived
   in: the plugin's `htlc_accepted` hook keeps core's outgoing channel (`forward_to`) if
   it is in that asset, else picks the peer's channel in that asset with the same fees
@@ -167,7 +182,7 @@ Explicit (unblinded) outputs only.
 | C2 | Asset tags on channel tx outputs; fee computation counts only the fee asset; tx parser reads asset amounts instead of asserting L-BTC | `bitcoin/{tx,psbt,tx_parts}.c`, `common/{initial_commit_tx,htlc_tx,close_tx}.c`, `channeld/commit_tx.c` | 150 | tx builders live in daemons |
 | C3 | Reserve input + second signature + `hsmd` signing both inputs; `sign_last_tx`. Input 0 is signed with upstream's messages, which accept a tx that also spends the funding output's next sibling; input 1 with one generic message, `hsmd_sign_funding_sibling_input` (SIGHASH_ALL, input 1 must spend the output after input 0's; hsmd knows nothing of assets), so ordinary channels and external signers see upstream's messages unchanged | `openingd`, `channeld`, `closingd`, `hsmd/{hsmd,libhsmd}.c`, `hsmd_wire.csv`, `lightningd/peer_control.c` | 400 | protocol + signer |
 | C4 | Anchors on Elements come from the plugin's feature bits (no core change); skip fee subtraction; fee output = reserve − anchors; ignore `update_fee` | `channeld/{commit_tx,channeld}.c` | 30 | |
-| C5 | Asset sweeps: `onchaind_tx_unsigned` builds the asset-in → asset-out spend plus L-BTC wallet inputs, change and fee (capped at the fee reserve), all signed SIGHASH_ALL (hsmd allows wallet inputs next to an asset input); HTLC txs get wallet L-BTC on the upstream path; core broadcasts and bumps both; `to_remote` swept from the upstream `add_utxo` notification; `anchorspend` off | `lightningd/onchain_control.c`, `hsmd/libhsmd.c`, `onchaind/onchaind.c`, `lightningd/anchorspend.c` | 450 | `onchaind` + channel keys + fee safety |
+| C5 | Asset sweeps: `onchaind_tx_unsigned` builds the asset-in → asset-out spend plus L-BTC wallet inputs, change and fee (capped by `asset_fee_cap`: the fee reserve, ten near a contested claim's deadline), all signed SIGHASH_ALL (hsmd allows wallet inputs next to an asset input); HTLC txs get wallet L-BTC on the upstream path; core broadcasts and bumps both; `to_remote` swept from the upstream `add_utxo` notification; `anchorspend` builds Elements anchor spends, capped the same way for asset channels | `lightningd/onchain_control.c`, `hsmd/libhsmd.c`, `onchaind/onchaind.c`, `lightningd/anchorspend.c` | 450 | `onchaind` + channel keys + fee safety |
 | C6 | `fundchannel_complete` verifies output n (asset, amount, explicit) and n+1 (L-BTC, reserve); funding watch by asset | `lightningd/opening_control.c`, `lightningd/watch.c` | 60 | safety |
 | C7 | `liquid-testnet` chainparams | `bitcoin/chainparams.c` | 35 | |
 | ~~C8~~ | (Reverted on `feat/clean-up`.) Gossip verification of asset channels: recording every explicit P2WSH output, any asset, as "sats" let anyone back fake-capacity announcements with a self-issued asset, on every node of the fork. Asset channels are private again; the plugin refuses `announce=true` and offers of announced ones | — | 0 | |

@@ -131,17 +131,17 @@ Built by `htlc_tx(..., asset_tag)` (`common/htlc_tx.c:8-71`), through `htlc_succ
 
 ### As broadcast (fee added from CLN's wallet)
 
-`consider_onchain_htlc_tx_rebroadcast` (`lightningd/onchain_control.c:1615`), run immediately and then every block:
+`consider_onchain_htlc_tx_rebroadcast` (`lightningd/onchain_control.c:1672`), run immediately and then every block:
 
 | | # | Asset | Amount | Notes |
 |---|---|---|---|---|
 | in | 0 | the asset | HTLC amount | peer's sig SINGLE\|ACP, ours ALL (re-signed after the wallet inputs are added) |
 | in | 1..k | L-BTC | wallet UTXOs | `wallet_utxo_boost` → `psbt_using_utxos`, sequence `BITCOIN_TX_RBF_SEQUENCE` (`0xFFFFFFFD`) (`:1655-1665`). hsmd signs them **SIGHASH_ALL** (`hsmd_sign_htlc_tx_mingle` → `sign_our_inputs` → `wally_psbt_sign`, `hsmd/libhsmd.c:1909-1924`, `:562-645`) |
 | out | 0 | the asset | HTLC amount | Unchanged |
-| out | fee | L-BTC | `L-BTC in − change` | `psbt_elements_normalize_fees` (`:1720`) keeps one fee output and sets it |
-| out | change? | L-BTC | `change_amount(excess, ...)` | **P2WPKH** on Elements (upstream: P2TR, which Elements lacks) (`:1704-1717`) |
+| out | fee | L-BTC | `L-BTC in − change` | `psbt_elements_normalize_fees` (`:1786`) keeps one fee output and sets it |
+| out | change? | L-BTC | `change_amount(excess, ...)`, at the feerate actually paid (lower when capped) | **P2WPKH** on Elements (upstream: P2TR, which Elements lacks) (`:1778-1782`) |
 
-Asset-specific fee rules: the fee is `min(amount_tx_fee(feerate, weight), fee_reserve)`, or everything the gathered wallet inputs hold if that is less; whatever was gathered past it becomes change (`:1686-1697`). The upstream "don't spend more in fees than the HTLC is worth" check is skipped, because the HTLC is in another unit (`:1723`). Without wallet L-BTC it logs "We want to bump HTLC fee, but no funds!" and keeps the zero-fee tx, which won't relay, and retries next block (`:1670-1673`).
+Asset-specific fee rules: the fee is `min(amount_tx_fee(feerate, weight), asset_fee_cap(channel, deadline, true))` (one fee reserve, ten within 12 blocks of the HTLC's deadline), or everything the gathered wallet inputs hold if that is less; whatever was gathered past it becomes change (`:1722-1755`). The upstream "don't spend more in fees than the HTLC is worth" check is skipped, because the HTLC is in another unit (`:1788-1790`). Without wallet L-BTC it logs "We want to bump HTLC fee, but no funds!" and keeps the zero-fee tx, which won't relay, and retries next block (`:1670-1673`).
 
 ## 5. Mutual close transaction
 
@@ -163,7 +163,7 @@ Sort: `permute_outputs(tx, NULL, NULL)` (`common/close_tx.c:105`), then `bitcoin
 
 ## 6. Sweeps of asset outputs after a unilateral close
 
-All sweeps go through `asset_sweep_unsigned` (`lightningd/onchain_control.c:1107-1216`). They share one shape:
+All sweeps go through `asset_sweep_unsigned` (`lightningd/onchain_control.c:1180-1308`). They share one shape:
 
 | | # | Asset | Amount | Script | nSequence | Signature |
 |---|---|---|---|---|---|---|
@@ -171,7 +171,7 @@ All sweeps go through `asset_sweep_unsigned` (`lightningd/onchain_control.c:1107
 | in | 1..k | L-BTC | wallet UTXOs (last build's first, then `wallet_utxo_boost`) | CLN wallet (P2WPKH, ...) | `0xFFFFFFFD` | `hsmd_sign_withdrawal` → `wally_psbt_sign` = **SIGHASH_ALL** (`sign_wallet_inputs`, `:1385-1441`) |
 | out | 0 | the asset | `out_sats` (**full**, no fee) | `channel->shutdown_scriptpubkey[LOCAL]` (the close address) | — | — |
 | out | 1? | L-BTC | `change_amount(L-BTC in − fee)` | P2WPKH(final_key) with a BIP32/86 keypath | — | — |
-| out | last | L-BTC | `min(feerate × weight, fee_reserve)` (+ dust change, if any) | empty (fee) | — | — |
+| out | last | L-BTC | `min(feerate × weight, asset_fee_cap)` (+ change too small for an output, if any) | empty (fee) | — | — |
 
 nLockTime = `info->locktime` (`bitcoin_tx(ctx, chainparams, 2, 3, info->locktime)`, `:1122`). No `permute_outputs`: the asset is output 0, change output 1, fee last.
 
@@ -194,7 +194,7 @@ hsmd lets these to-us messages sign a multi-input tx only when the input being s
 
 - **Input 0 = the asset, output 0 = all of it.** An asset can't pay a fee (§1), and CLN's wallet can't hold the asset, so the whole amount goes to the close address. That's where a mutual close would have paid it (DESIGN §3).
 - **L-BTC from CLN's own wallet**, not from the plugin or elementsd. DESIGN §8: plugin-funded sweeps with SINGLE|ACP signatures exposed penalties to replacement cycling and dropped sweeps whenever the plugin was down.
-- **Fee capped at `fee_reserve`.** Core can't tell what the asset is worth in L-BTC, and the reserve is what the opener set aside for fees (`:1173-1190`). The cap ignores deadlines (penalties included). Dust change goes to the fee, so the fee can exceed the cap by up to the dust limit.
+- **Fee capped in fee reserves** (`asset_fee_cap`, `lightningd/onchain_control.c:1140`). Core can't tell what the asset is worth in L-BTC, and the reserve is what the opener set aside for fees. One reserve per tx; ten for a claim the peer could win (penalty, HTLC success/timeout, fulfill, expired) within 12 blocks of its deadline, since losing it costs the whole output. Our delayed outputs and `to_remote` stay at one reserve. The fee still follows the deadline's feerate, so the cap only bites in a fee spike. Change too small to be worth an output (at the capped feerate) goes to the fee, so the fee can exceed the cap by about the cost of one output plus dust.
 - **Rebuilt every block until the swept input is spent** (`consider_onchain_rebroadcast`, `lightningd/onchain_control.c:1507`), with the UTXOs re-reserved for 2 blocks (`ASSET_SWEEP_RESERVE_BLOCKS`, `:1134`). Once that input is spent, by this sweep or another tx, `asset_sweep_input_spent` (`:1574`) stops the rebuilds and unreserves the sweep's wallet L-BTC.
 
 ## 7. Signature map (who signs what)
@@ -226,11 +226,12 @@ hsmd capability for `WIRE_HSMD_SIGN_FUNDING_SIBLING_INPUT`: `HSM_PERM_SIGN_REMOT
 | Mutual close | `bitcoin_tx_weight(tx) + num_inputs · bitcoin_tx_2of2_input_witness_weight()` (2 inputs for assets) | `closing_tx_weight_estimate`, `closingd/closingd.c:631-659` (only used for fee bounds, which are then pinned to the reserve) |
 | Sweep | `bitcoin_tx_weight(1-in/1-out tx) + channel_input_witness_weight + elements_tx_overhead(2, 3) + Σ utxo_spend_weight` | `asset_sweep_unsigned` `lightningd/onchain_control.c:1130-1146`; `channel_input_witness_weight` `:1076-1093` = `1 + (1+71) + [1+|elem|] + varint(|wscript|) + |wscript|` |
 | HTLC tx bump | upstream: `bitcoin_tx_weight(raw HTLC tx)` + what `wallet_utxo_boost` adds | `consider_onchain_htlc_tx_rebroadcast` `:1559-1573` |
+| Anchor spend (CPFP) | upstream's 1-in-1-out core + anchor input witness + change + `elements_tx_overhead(1, 1)` + the commitment's weight (the package), plus what `wallet_utxo_boost` adds | `spend_anchor` `lightningd/anchorspend.c:412-419` |
 
 Results of the cap formula: reserve 1,000 → 36 HTLCs (18 per side); 2,000 → 164 (82 per side); see the table in [[Liquid Asset Channels]] §4.
 
 > [!note] Why the HTLC count, not the feerate, is capped
-> The fee is fixed by the reserve, so the only thing that can push the commitment below the relay floor is its size. `update_fee` can't help: it changes no output (§3), and there's no CPFP. So the cap is the only lever, and it's checked at open time, once, for the worst case of both sides' `max_accepted_htlcs`.
+> The fee is fixed by the reserve, so the only thing that can push the commitment below the relay floor is its size. `update_fee` can't help: it changes no output (§3), and CPFP through the anchor can't either: the commitment must be relayed on its own before a child can bump it (no package relay). So the cap is the only lever, and it's checked at open time, once, for the worst case of both sides' `max_accepted_htlcs`. Once relayed, a commitment whose fee is short of an HTLC deadline's feerate is CPFP'd through our anchor with wallet L-BTC, capped by `asset_fee_cap` ([[Core - lightningd]] §10).
 
 ## See also
 

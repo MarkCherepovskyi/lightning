@@ -5,7 +5,7 @@ aliases: [lightningd changes, lightningd delta]
 
 # Core - lightningd
 
-A walkthrough of everything this fork changes in `lightningd/` relative to the upstream merge-base `41362d38a` (`git diff 41362d38a -- lightningd/`, about +1143/-116 lines in 20 files). Most of it carries one new per-channel object, `struct channel_asset` (asset tag + L-BTC fee reserve, `common/channel_asset.h:29-34`), from the RPC that opens a channel to the code that sweeps its outputs after a force close. The rest is a handful of **generic upstream bug fixes** found while building asset channels. They are listed separately at the end and can be upstreamed on their own. EVM channels need none of this: to lightningd they are ordinary channels on a chain that `evmbackend` emulates (see [[EVM Channels]]).
+A walkthrough of everything this fork changes in `lightningd/` relative to the upstream merge-base `41362d38a` (`git diff 41362d38a -- lightningd/`, about +1299/-135 lines in 22 files). Most of it carries one new per-channel object, `struct channel_asset` (asset tag + L-BTC fee reserve, `common/channel_asset.h:29-34`), from the RPC that opens a channel to the code that sweeps its outputs after a force close. The rest is a handful of **generic upstream bug fixes** found while building asset channels. They are listed separately at the end and can be upstreamed on their own. EVM channels need none of this: to lightningd they are ordinary channels on a chain that `evmbackend` emulates (see [[EVM Channels]]).
 
 > [!info] How to read this note
 > Line numbers are for the working tree of `feat/clean-up` and may drift by a few lines. Each section follows one file in roughly execution order. **[asset]** marks asset-channel-specific code, **[elements]** marks fixes needed for any anchor channel on Elements, and **[generic]** marks upstream bug fixes.
@@ -26,11 +26,12 @@ A walkthrough of everything this fork changes in `lightningd/` relative to the u
 | `lightningd/pay.c` | +12 | asset | `injectpaymentonion` refuses a blinded path that starts at us over an asset channel |
 | `lightningd/plugin.c` | +21 | asset | drops feature bits 232/233 offered by a plugin that isn't an `important-plugin` |
 | `lightningd/lightningd.c` | +11 | asset | `fatal` at startup if the asset bit is offered but the HSM can't `sign_funding_sibling_input` |
-| `lightningd/onchain_control.c` | +629/−62 | asset + elements + generic | wallet-funded asset sweeps, keep-alive, HTLC tx cap; replay fixes |
-| `lightningd/anchorspend.c` | +8 | elements | anchor spends off on Elements |
+| `lightningd/onchain_control.[ch]` | +709/−69 | asset + elements + generic | wallet-funded asset sweeps, keep-alive, `asset_fee_cap` (sweeps, HTLC txs, anchor spends); replay fixes |
+| `lightningd/anchorspend.c` | +80/−12 | asset + elements | Elements anchor spends (P2WPKH change, fee output); asset channels capped by `asset_fee_cap` |
 | `lightningd/plugin_hook.c` | +16/−3 | generic | `hook_release` fix |
 | `lightningd/dual_open_control.c` | +25/−6 | generic | use-after-free fixes (+ `NULL` asset for dual-funded watches) |
 | `lightningd/test/run-invoice-select-inchan.c` | +7/−10 | — | stubs regenerated |
+| `lightningd/test/run-anchorspend.c` | +4 | — | stub for `asset_fee_cap` |
 
 Persistence of `channel->asset` is in `wallet/` (not covered here): migration `wallet/migrations.c:1224-1227` adds `channels.asset` (BLOB) and `channels.fee_reserve`, which are loaded at `wallet/wallet.c:2191-2197` and saved at `wallet/wallet.c:2848-2850`.
 
@@ -238,7 +239,7 @@ After a force close, onchaind decides **what** to spend and lightningd builds, s
 
 ### 8.1 New state on `onchain_signing_info` (`lightningd/onchain_control.c:790-866`)
 
-- `struct utxo **utxos` holds the wallet L-BTC inputs of the last build, so a rebuild reuses them. `bool fee_capped` makes the "capping its fee" log line appear once. `bool input_spent` is set once the output the sweep spends is spent (§8.5); from then on the sweep is not rebuilt. All three are initialised in `new_signing_info` (`:919`).
+- `struct utxo **utxos` holds the wallet L-BTC inputs of the last build, so a rebuild reuses them. `struct amount_sat fee_capped_at` is the cap last logged, so the "capping its fee" line appears once per cap (the cap rises near a deadline). `bool input_spent` is set once the output the sweep spends is spent (§8.5); from then on the sweep is not rebuilt. All three are initialised in `new_signing_info` (`:927`).
 - A new union arm `u.to_remote {close_info, scriptpubkey}`, for `WIRE_ONCHAIND_ADD_UTXO`: our to_remote output, which we now sweep ourselves (§8.3). For this arm `info->sign` is `NULL`. hsmd signs the output like a wallet UTXO, through `hsmd_sign_withdrawal` and its `close_info`.
 
 ### 8.2 Building the tx
@@ -249,20 +250,20 @@ After a force close, onchaind decides **what** to spend and lightningd builds, s
 
 **`channel_input_witness_weight`** (`lightningd/onchain_control.c:1111`) is the worst-case witness weight of input 0: signature, optional stack element, witness script. For to_remote, `info->wscript` is `NULL` because hsmd derives that script, so it measures `bitcoin_wscript_to_remote_anchored` with any key.
 
-**`asset_sweep_unsigned`** (`lightningd/onchain_control.c:1142`), step by step (sub-refs are approximate, about +35 lines since):
-1. The feerate comes from `feerate_for_target(info->deadline_block)` (`:1116`), the same deadline-driven feerate upstream uses.
-2. Input 0 is the asset output (`bitcoin_tx_add_asset_input` with `channel->asset->tag`). Its sequence is `info->to_self_delay` (the CSV), and its scriptPubKey is set only for to_remote (`:1122-1127`).
-3. Output 0 is the **whole** amount, in the asset, to `channel->shutdown_scriptpubkey[LOCAL]` (`:1128-1129`), the close script. For a fundee whose plugin set `close_to`, that is an elementsd asset-wallet address.
-4. Base weight plus input-0 witness plus Elements overhead (`:1130-1132`).
-5. L-BTC inputs (`:1134-1154`): reuse `info->utxos` that are still unspent in the wallet, then `wallet_utxo_boost` adds more if the feerate calls for it.
-6. Reservation (`:1156-1171`): each chosen UTXO is unreserved and re-reserved for `ASSET_SWEEP_RESERVE_BLOCKS` = 2 blocks (`:1134`), then added as an RBF-sequence input. The short reservation matters because which coins a sweep holds is **not** persisted: after a restart, the rebuilt sweep can use them again once the reservation lapses.
-7. **Fee cap** (`:1173-1190`): `fee = min(amount_tx_fee(feerate, weight), channel->asset->fee_reserve)`. The cap is logged once (`fee_capped`).
-8. Not enough L-BTC (`:1191-1199`): it logs `unusual` "will retry every block", sets `excess = 0`, and builds a tx that pays what it can. Broadcast fails and the next block rebuilds it. Test: `test_sweep_waits_for_wallet_lbtc` (`tests/test_assetchan.py:1019`).
-9. Change (`:1200-1209`): `change_amount(excess, feerate, weight)`. If the change is non-zero, it becomes a P2WPKH output with the keypath. Otherwise the excess goes to the fee.
-10. `bitcoin_tx_finalize`, and the fee is recomputed from the tx (`:1213-1215`).
+**`asset_sweep_unsigned`** (`lightningd/onchain_control.c:1180`), step by step:
+1. The feerate comes from `feerate_for_target(info->deadline_block)` (`:1189`), the same deadline-driven feerate upstream uses.
+2. Input 0 is the asset output (`bitcoin_tx_add_asset_input` with `channel->asset->tag`). Its sequence is `info->to_self_delay` (the CSV), and its scriptPubKey is set only for to_remote (`:1197-1201`).
+3. Output 0 is the **whole** amount, in the asset, to `channel->shutdown_scriptpubkey[LOCAL]` (`:1202-1203`), the close script. For a fundee whose plugin set `close_to`, that is an elementsd asset-wallet address.
+4. Base weight plus input-0 witness plus Elements overhead (`:1204-1206`).
+5. L-BTC inputs (`:1208-1228`): reuse `info->utxos` that are still unspent in the wallet, then `wallet_utxo_boost` adds more if the feerate calls for it.
+6. Reservation (`:1230-1245`): each chosen UTXO is unreserved and re-reserved for `ASSET_SWEEP_RESERVE_BLOCKS` = 2 blocks (`:1172`), then added as an RBF-sequence input. The short reservation matters because which coins a sweep holds is **not** persisted: after a restart, the rebuilt sweep can use them again once the reservation lapses.
+7. **Fee cap** (`:1247-1276`): `fee = min(amount_tx_fee(feerate, weight), asset_fee_cap(channel, info->deadline_block, asset_claim_critical(info)))`. `asset_fee_cap` (`:1140`) is the fee reserve, or `ASSET_FEE_URGENT_MULT` (10) reserves once a claim the peer could win (`asset_claim_critical`, `:1153`: penalty, HTLC success/timeout, fulfill, expired) is within `ASSET_FEE_URGENT_BLOCKS` (12) of `info->deadline_block`. Our delayed outputs and to_remote stay at one reserve. Logged when the cap changes (`fee_capped_at`), and at debug level when the fee goes over the reserve. Test: `test_penalty_fee_cap_near_deadline` (`tests/test_assetchan.py:1212`).
+8. Not enough L-BTC (`:1277-1285`): it logs `unusual` "will retry every block", sets `excess = 0`, and builds a tx that pays what it can. Broadcast fails and the next block rebuilds it. Test: `test_sweep_waits_for_wallet_lbtc` (`tests/test_assetchan.py:1036`).
+9. Change (`:1286-1302`): `change_amount(excess, change_feerate, weight)`, where `change_feerate` is the feerate actually paid (lower when the fee was capped), so a capped fee overshoots the cap by less than the cost of a change output. If the change is non-zero, it becomes a P2WPKH output with the keypath. Otherwise the excess goes to the fee.
+10. `bitcoin_tx_finalize`, and the fee is recomputed from the tx (`:1305-1306`).
 
 > [!warning] Fee cap trade-off
-> The cap is the reserve the opener put aside. lightningd cannot price the asset in L-BTC, so the reserve is the only budget the channel agreed on. The cap ignores deadline urgency, so a penalty near its deadline is not bid higher. Dust change goes to the fee, so the fee paid can exceed the cap by up to the dust limit. Both are accepted at Liquid feerates, and the code comment calls a deadline-aware cap "a later refinement" (`:1176-1180`). See [[Safety Invariants]].
+> The cap is counted in fee reserves, the budget the opener put aside: lightningd cannot price the asset in L-BTC. One reserve per tx; ten for a claim the peer could win once it is within 12 blocks of its deadline, since losing that claim costs the whole output. The fee still follows the deadline's feerate, so the cap only bites in a fee spike, and a spike beyond ten reserves still lets a peer outbid a penalty or HTLC claim. Change too small to be worth an output goes to the fee, so the fee paid can exceed the cap by about the cost of one output plus dust. See [[Safety Invariants]] (L13).
 
 ### 8.3 Signing
 
@@ -317,14 +318,14 @@ flowchart TD
 - **`consider_onchain_rebroadcast`** (`lightningd/onchain_control.c:1507`): asset channels rebuild **and fully re-sign** through `onchaind_tx`, with new wallet inputs, today's feerate and both signatures. Upstream only re-signs input 0 of a rebuilt 1-in-1-out tx. Once `info->input_spent` is set it returns `false`, which stops the rebroadcast and frees `info`.
 - **`asset_sweep_input_spent`** (`lightningd/onchain_control.c:1574`): called whenever an output a sweep spends is spent, by that sweep or by another tx (the peer won an HTLC race, an older version of ours got mined). It finds the sweep's outgoing tx, sets `input_spent`, and unreserves the wallet UTXOs it still holds (only those within its `ASSET_SWEEP_RESERVE_BLOCKS` reservation). Without it, a sweep that can never confirm would be rebuilt every block and keep wallet coins other sweeps need.
 - **HTLC txs: `consider_onchain_htlc_tx_rebroadcast`** (`lightningd/onchain_control.c:1615`) is upstream's anchors path. It takes the zero-fee HTLC tx (the peer's SIGHASH_SINGLE|ANYONECANPAY signature on input 0, as BOLT 3 requires), adds wallet UTXOs, signs them with `hsmd_sign_htlc_tx_mingle`, then signs our input 0 **SIGHASH_ALL** over the final tx (`sign_and_get_htlc_witness`; BOLT 5, upstream `efdfcc6da` ported), again on every bump. The changes:
-  - **[asset] fee cap** (`:1686-1697`): the fee is `min(amount_tx_fee(feerate, weight), fee_reserve)`, or everything the gathered inputs hold if that is less; `excess` (what was gathered past the fee) becomes change. The old code added `target − reserve` to an excess that is 0 when funds ran short, so the change could exceed the inputs.
-  - **[elements] change script** (`:1704-1717`): P2WPKH instead of P2TR, since Elements has no P2TR.
-  - **[elements]** `psbt_elements_normalize_fees(psbt)` (`:1720`) adds or fixes the explicit fee output Elements needs.
-  - **[asset]** The "fees > HTLC value" sanity check is skipped for asset channels (`:1723`): the HTLC is in another asset, so its amount says nothing about L-BTC.
+  - **[asset] fee cap** (`:1722-1755`): the fee it aims for, `want = amount_tx_fee(feerate, weight)`, is capped at `asset_fee_cap(channel, info->deadline_block, true)` (an HTLC tx is always a claim the peer could win) before the excess is computed, so what the wallet inputs hold past it comes back as change; if they hold less, `excess` is 0 and the tx pays what it has. Change is sized at the feerate actually paid (`change_feerate`, lower when capped). Before, a separate cap block after the excess computation added `target − reserve` to an excess that is 0 when funds ran short, so the change could exceed the inputs.
+  - **[elements] change script** (`:1778-1782`): P2WPKH instead of P2TR, since Elements has no P2TR.
+  - **[elements]** `psbt_elements_normalize_fees(psbt)` (`:1786`) adds or fixes the explicit fee output Elements needs.
+  - **[asset]** The "fees > HTLC value" sanity check is skipped for asset channels (`:1788-1790`): the HTLC is in another asset, so its amount says nothing about L-BTC.
 - HTLC txs carry the asset tag on their output: `htlc_tx(..., channel_asset_tag(channel->asset))` (`lightningd/onchain_control.c:2088-2090`, `:2162-2164`).
 - `towire_onchaind_init` gets `channel->asset` (`lightningd/onchain_control.c:2449`), so onchaind reads asset amounts.
 
-Tests: `test_unilateral_close`, `test_htlc_onchain`, `test_penalty` (`tests/test_assetchan.py:311,392,536`), and `test_lbtc_anchor_channel_onchain` (`:973`) for the [elements] fixes on an ordinary L-BTC anchor channel.
+Tests: `test_unilateral_close`, `test_htlc_onchain`, `test_penalty` (`tests/test_assetchan.py:321,402,548`; their `paid_by_wallet` checks assert each tx's fee is at most ten reserves plus `CHANGE_SLACK`, and each node's total within `MAX_FEES`), `test_penalty_fee_cap_near_deadline` (`:1212`), and `test_lbtc_anchor_channel_onchain` (`:985`) for the [elements] fixes on an ordinary L-BTC anchor channel.
 
 ---
 
@@ -337,12 +338,15 @@ Tests: `test_unilateral_close`, `test_htlc_onchain`, `test_penalty` (`tests/test
 
 ---
 
-## 10. `anchorspend.c` [elements]
+## 10. `anchorspend.c` [asset + elements]
 
-`create_anchor_details` (`lightningd/anchorspend.c:121`) returns `NULL` on Elements (`:139-145`). Upstream's anchor-spend CPFP builds Bitcoin-shaped txs: P2TR change and no fee output. Upstream has no anchors on Elements at all. Here the plugin turns `option_anchors` on node-wide, because asset channels need it, so **ordinary L-BTC channels between plugin nodes become anchor channels too**. Their commitments pay their own fee and are never bumped.
+Upstream has no anchors on Elements at all. Here the plugin turns `option_anchors` on node-wide, because asset channels need it, so **ordinary L-BTC channels between plugin nodes become anchor channels too**. Both kinds get upstream's CPFP through the anchor (an earlier version turned `create_anchor_details` off on Elements, since upstream's anchor spend built Bitcoin-shaped txs):
 
-> [!note]
-> Asset commitments do not need CPFP: their fee (`reserve − 660` for the two anchors) is fixed. An L-BTC anchor commitment that underpays can still get stuck. Liquid feerates are flat and low, which makes this acceptable for now. See [[Upstream Status]].
+- **[elements]** `anchor_psbt` (`lightningd/anchorspend.c:230`) pays change to P2WPKH (Elements has no P2TR) and calls `psbt_elements_normalize_fees` for the explicit fee output; `spend_anchor`'s weight estimate adds `elements_tx_overhead(chainparams, 1, 1)` (`:418`). The anchor (330 sat) and the wallet coins are explicit L-BTC, also on asset channels, so hsmd's `sign_anchorspend` (`sign_our_inputs`, then `wally_psbt_sign` on the PSET) works unchanged.
+- **[asset]** An asset commitment pays a fixed fee (`reserve − 660` with both anchors, `reserve − 330` with one), which meets the relay floor (L4 in [[Safety Invariants]]) but not necessarily the feerate an HTLC deadline calls for. Upstream bumps only when the HTLCs are worth more than the fee; asset HTLCs are in the asset, so `spend_anchor` (`:397`) skips that check for asset channels (`:472`), and `try_anchor_psbt` (`:355`) caps the anchor spend's fee at `anchor_fee_cap` (`:345`) → `asset_fee_cap(channel, deadline, critical)`: one reserve while the HTLC deadline is far, ten within 12 blocks of it (`critical = true` for HTLC deadlines, `:460`; `false` for the low-priority bump of a commitment with no HTLC deadline, `:535`). If the cap is short, it builds again (`build_anchor_psbt`, `:300`) at the package feerate the cap affords, logged "Anchor spend for local|remote commit tx: capping its fee of X at Y". The spend is RBF'd every block, so it grows as the deadline nears.
+- Ordinary L-BTC anchor channels keep upstream's rule unchanged (`anchor_fee_cap` returns no cap; their HTLCs are L-BTC).
+
+Tests: `test_anchor_bump_near_htlc_deadline` (`tests/test_assetchan.py:1139`: capped at one reserve while the deadline is far, RBF'd past it within 12 blocks, mined with a feerate floor; the spend has P2WPKH change and an explicit fee output), and `test_lbtc_anchor_channel_onchain` (`:985`), where l1 now CPFPs an ordinary L-BTC commitment as on Bitcoin. See [[Safety Invariants]] (L13).
 
 ---
 
@@ -418,6 +422,7 @@ flowchart TD
 | Asset sweep, wallet L-BTC inputs (+ to_remote) | `hsmd_sign_withdrawal` | `lightningd/onchain_control.c:1409` |
 | Our HTLC tx, HTLC input | `hsmd_sign_any_local_htlc_tx` | `lightningd/onchain_control.c:957,973` (upstream) |
 | Our HTLC tx, wallet L-BTC inputs | `hsmd_sign_htlc_tx_mingle` | `lightningd/onchain_control.c:1734` |
+| Anchor spend (CPFP of a commitment) | `hsmd_sign_anchorspend` | `lightningd/anchorspend.c:579` (upstream) |
 
 The full table, covering every daemon, is in [[Core - hsmd]].
 

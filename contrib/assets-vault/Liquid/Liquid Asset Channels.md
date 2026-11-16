@@ -12,13 +12,13 @@ An asset channel is a Lightning channel whose balance is a Liquid *issued asset*
 
 ## 1. Why a fee reserve?
 
-On Bitcoin, an anchor-channel commitment can pay little or no fee, and the broadcaster bumps it later through an anchor output (CPFP). That doesn't work on Liquid, because:
+On Bitcoin, an anchor-channel commitment can pay little or no fee, and the broadcaster bumps it later through an anchor output (CPFP). On Liquid a commitment must pay a real fee of its own, because:
 
 | Liquid property | Consequence | Where it shows |
 |---|---|---|
 | Every output carries an asset tag, and the **fee is an explicit output that must be in the fee asset (L-BTC)** | An asset can't pay any fee. Subtracting the fee from the asset balances, as BOLT 3 does, is meaningless. | `bitcoin/tx.c:194` `elements_tx_add_fee_output`; `bitcoin/tx.c:166` `bitcoin_tx_compute_fee` skips non-L-BTC inputs (`psbt_input_in_fee_asset`, `bitcoin/psbt.c:626`) |
 | Elements enforces a min relay fee (default 0.1 sat/vB) | A zero-fee commitment isn't relayed. | `common/initial_commit_tx.c:368` `ASSET_RELAY_FLOOR_PERKW 25` (sat per 1000 weight) |
-| No package relay (DESIGN §2.2: "to be confirmed with the Elements team") | A zero-fee commitment can't be CPFP'd through its anchor. | DESIGN §2.2, §7 |
+| No package relay (DESIGN §2.2: "to be confirmed with the Elements team") | A zero-fee commitment can't be CPFP'd through its anchor: it has to be relayed on its own first. Once it is, a child spending the anchor can raise its feerate, and core does that ([[Core - lightningd]] §10). | DESIGN §2.2, §7 |
 | A fee input added by the broadcaster changes the commitment's txid | The pre-signed HTLC transactions commit to that txid, so the commitment must pay its own fee as signed. | DESIGN §4 (last paragraph) |
 
 So the opener locks some L-BTC (the **fee reserve**, plugin default 2,000 sat) to the **same 2-of-2** right after the asset funding output. Every commitment and every mutual close spends both outputs:
@@ -42,6 +42,7 @@ What follows from this design:
 - **The fee is fixed.** On a commitment it's the reserve minus the anchors: `reserve - 660` with both anchors, `reserve - 330` with only one. BOLT 3 rule 8 adds an anchor only for a side that has a direct output or untrimmed HTLCs (`common/initial_commit_tx.c:294-305`, `channeld/commit_tx.c:396-412`). On a mutual close the fee is the **whole** reserve (`closingd/closingd.c:705-706`).
 - **Asset conservation.** The asset outputs always add up to the funding amount. Trimmed HTLCs, which go to fees on Bitcoin, are burned to an OP_RETURN output in the asset (`channel_asset_add_burn`). What's still not an output (msat rounding) tops up the opener's direct output, or the other side's if the opener has none: `channel_asset_finish_tx()`.
 - **A broadcaster fee input can't work** (txid change, see above). Only package relay on Elements would let the reserve shrink to just the anchors (DESIGN §4, §7).
+- **The commitment can still be bumped.** When its fixed fee falls short of the feerate an HTLC deadline calls for, core CPFPs it through our anchor with L-BTC from CLN's wallet. HTLCs in the asset say nothing about what's worth paying in L-BTC, so instead of upstream's "HTLCs worth more than the fee" check the anchor spend is capped by `asset_fee_cap`: one fee reserve, ten within 12 blocks of the deadline (`lightningd/anchorspend.c` `try_anchor_psbt`). The same cap applies to every sweep and HTLC tx of ours (L13 in [[Safety Invariants]]).
 
 > [!note] The reserve is the opener's money
 > The opener funds the reserve and loses it (as fees) at every close. Neither side's channel balance includes it: `listpeerchannels` reports it separately as `fee_reserve_msat` (`lightningd/peer_control.c:1108-1113`).
@@ -87,7 +88,7 @@ The daemons learn the asset from an optional `?channel_asset` field in their ini
 If the plugin disables itself in `init` (not important, not on Liquid, no `assetchan-asset` configured: `assetchan.py:764-784`), lightningd removes its feature bits again (`plugin->fset`, `lightningd/plugin.c:1764`). Without the bit, the fundee refuses asset offers (`openingd/openingd.c:1005-1012`) and lightningd won't start channeld for an existing asset channel (`lightningd/channel_control.c:1820-1832`).
 
 > [!warning] The anchors bit is node-wide
-> With the plugin loaded, **ordinary L-BTC channels between two plugin nodes are anchor channels too**. Their commitments pay their own fee, never bumped (`anchorspend` is off on all of Elements, `lightningd/anchorspend.c:139-145`). Their zero-fee HTLC txs get wallet L-BTC on the upstream path. `test_lbtc_anchor_channel_onchain` covers this (`tests/test_assetchan.py:851`).
+> With the plugin loaded, **ordinary L-BTC channels between two plugin nodes are anchor channels too**. Their commitments pay their own fee and are CPFP'd through the anchor under upstream's rule (only when the HTLCs are worth more than the fee; they are L-BTC), with an Elements anchor spend (P2WPKH change, explicit fee output). Their zero-fee HTLC txs get wallet L-BTC on the upstream path. `test_lbtc_anchor_channel_onchain` covers both (`tests/test_assetchan.py:985`).
 
 ### TLVs
 

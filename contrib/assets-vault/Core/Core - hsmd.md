@@ -185,11 +185,11 @@ For **our own** sweeps of asset outputs (to_local, to_remote, HTLC outputs, HTLC
 | `hsmd_sign_withdrawal` (7) | lightningd (`lightningd/onchain_control.c:1409`) | MASTER | the sweep's wallet L-BTC inputs, plus the to_remote input | yes: keeps the asset (§3.5) |
 | `hsmd_sign_any_local_htlc_tx` (146) | lightningd (`lightningd/onchain_control.c:957,973`) | MASTER | our HTLC tx, input 0 (SIGHASH_ALL, signed after the wallet inputs are added; more inputs allowed with anchors) | yes (ported from upstream `efdfcc6da`) |
 | `hsmd_sign_htlc_tx_mingle` (149) | lightningd (`lightningd/onchain_control.c:1734`) | MASTER | wallet L-BTC inputs added to our HTLC tx | no (uses `sign_our_inputs`) |
+| `hsmd_sign_anchorspend` (147) | lightningd (`lightningd/anchorspend.c:579`) | MASTER | anchor spend (CPFP of a commitment, ours or theirs, through our anchor): the anchor input and the wallet L-BTC inputs | no: `sign_our_inputs`, then `wally_psbt_sign` with the funding key, on the PSET as is (the anchor and the wallet coins are explicit L-BTC) |
 | `hsmd_forget_channel` (34) | lightningd (`lightningd/channel.c:111`) | MASTER | after the channel is forgotten (after its asset sweeps are mined) | no |
 | `hsmd_sign_penalty_to_us` (14) | channeld watchtower (`channeld/watchtower.c:120`) | SIGN_ONCHAIN_TX | penalty tx for the `commitment_revocation` hook (not made for asset channels) | shares the relaxed back end, `handle_sign_to_us_tx` (§3.4) |
 
 Not used by asset channels:
-- `hsmd_sign_anchorspend`: `anchorspend.c` is off on Elements, `lightningd/anchorspend.c:139-145`.
 - `hsmd_sign_splice_tx` and `hsmd_check_outpoint` / `hsmd_lock_outpoint`: asset channels cannot be spliced.
 - `hsmd_sign_any_cannouncement_req` and `hsmd_node_announcement_sig_req` for the channel: asset channels are never announced.
 - `hsmd_sign_option_will_fund_offer`: asset channels are v1 opens only, via openingd.
@@ -215,6 +215,7 @@ sequenceDiagram
   L->>H: sign_any_*_to_us (asset input 0, SIGHASH_ALL, extra inputs ok)
   L->>H: sign_withdrawal (wallet L-BTC inputs [+ to_remote])
   L->>H: sign_htlc_tx_mingle (wallet inputs), then sign_any_local_htlc_tx (input 0, SIGHASH_ALL, again on each bump)
+  L->>H: sign_anchorspend (anchor + wallet L-BTC inputs, again on each RBF)
 ```
 
 ## See also

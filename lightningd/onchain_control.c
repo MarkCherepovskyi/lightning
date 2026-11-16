@@ -817,9 +817,9 @@ struct onchain_signing_info {
 	struct bitcoin_tx *raw_htlc_tx;
 
 	/* Asset channels: the wallet L-BTC inputs of the last build, and
-	 * whether we've said that the fee reserve caps the fee. */
+	 * the fee cap we last said caps its fee (zero: none). */
 	struct utxo **utxos;
-	bool fee_capped;
+	struct amount_sat fee_capped_at;
 	/* Asset channels: the output it spends got spent (by it, or another
 	 * tx): don't rebuild it any more (asset_sweep_input_spent). */
 	bool input_spent;
@@ -924,7 +924,7 @@ static struct onchain_signing_info *new_signing_info(const tal_t *ctx,
 	info->channel = channel;
 	info->msgtype = msgtype;
 	info->utxos = NULL;
-	info->fee_capped = false;
+	info->fee_capped_at = AMOUNT_SAT(0);
 	info->input_spent = false;
 	return info;
 }
@@ -1127,6 +1127,44 @@ static size_t channel_input_witness_weight(const struct channel *channel,
 		+ varint_size(wscript_len) + wscript_len;
 }
 
+/* Asset channels: we can't tell what the asset is worth in L-BTC, so the
+ * fees we pay are capped in units of the channel's fee reserve, which is
+ * what the opener set aside for fees.  One reserve per transaction, but
+ * when a claim the peer could otherwise win (a penalty, an HTLC) gets
+ * within ASSET_FEE_URGENT_BLOCKS of its deadline, ASSET_FEE_URGENT_MULT
+ * reserves: losing it costs the whole output.  The fee still follows the
+ * feerate for the deadline; the cap only bites in a fee spike. */
+#define ASSET_FEE_URGENT_BLOCKS 12
+#define ASSET_FEE_URGENT_MULT 10
+
+struct amount_sat asset_fee_cap(const struct channel *channel,
+				u32 deadline, bool critical)
+{
+	const u32 height = get_block_height(channel->peer->ld->topology);
+	struct amount_sat cap = channel->asset->fee_reserve;
+
+	if (critical && deadline < height + ASSET_FEE_URGENT_BLOCKS
+	    && !amount_sat_mul(&cap, cap, ASSET_FEE_URGENT_MULT))
+		abort();
+	return cap;
+}
+
+/* Can the peer take this output from us if our claim confirms too late? */
+static bool asset_claim_critical(const struct onchain_signing_info *info)
+{
+	switch (info->msgtype) {
+	case WIRE_ONCHAIND_SPEND_PENALTY:
+	case WIRE_ONCHAIND_SPEND_HTLC_SUCCESS:
+	case WIRE_ONCHAIND_SPEND_HTLC_TIMEOUT:
+	case WIRE_ONCHAIND_SPEND_FULFILL:
+	case WIRE_ONCHAIND_SPEND_HTLC_EXPIRED:
+		return true;
+	default:
+		/* Our delayed outputs and to_remote: only we can spend them. */
+		return false;
+	}
+}
+
 /* How long we keep the wallet L-BTC of an asset sweep reserved: it's
  * refreshed every rebuild (each block), and lapses when the sweep is done.
  * Short, because which coins a sweep holds isn't kept across a restart:
@@ -1151,7 +1189,8 @@ static struct bitcoin_tx *asset_sweep_unsigned(const tal_t *ctx,
 	const u32 feerate = feerate_for_target(ld->topology, info->deadline_block);
 	struct bitcoin_tx *tx;
 	struct utxo **utxos, **more;
-	struct amount_sat lbtc_in, excess, change;
+	struct amount_sat lbtc_in, excess, change, cap;
+	u32 change_feerate;
 	size_t weight;
 
 	tx = bitcoin_tx(ctx, chainparams, 2, 3, info->locktime);
@@ -1205,24 +1244,36 @@ static struct bitcoin_tx *asset_sweep_unsigned(const tal_t *ctx,
 		tal_arr_expand(&info->utxos, tal_steal(info->utxos, utxos[i]));
 	}
 
-	/* The fee: at most the channel's fee reserve, which is what the
-	 * opener set aside for fees (we can't tell what the asset is worth
-	 * in L-BTC).  Not more, even for a penalty near its deadline; and if
-	 * the change would be dust it goes to the fee, so the fee paid can
-	 * exceed the cap by up to the dust limit.  Fine at Liquid's feerates;
-	 * a deadline-aware cap is a later refinement. */
+	/* The fee: at most asset_fee_cap (the fee reserve, more for a claim
+	 * the peer could win near its deadline).  Change not worth an
+	 * output goes to the fee, so the fee paid can exceed the cap by
+	 * about the cost of one output plus dust. */
+	cap = asset_fee_cap(channel, info->deadline_block,
+			    asset_claim_critical(info));
 	*fee = amount_tx_fee(feerate, weight);
-	if (amount_sat_greater(*fee, channel->asset->fee_reserve)) {
-		if (!info->fee_capped)
+	if (amount_sat_greater(*fee, cap)) {
+		if (!amount_sat_eq(info->fee_capped_at, cap))
 			log_unusual(channel->log,
-				    "Asset sweep of %s: capping its fee at the"
-				    " channel's fee reserve, %s (feerate %u)",
+				    "Asset sweep of %s: capping its fee of %s at %s"
+				    " (fee reserve %s, deadline %+d blocks,"
+				    " feerate %u)",
 				    fmt_bitcoin_outpoint(tmpctx, &info->out),
+				    fmt_amount_sat(tmpctx, *fee),
+				    fmt_amount_sat(tmpctx, cap),
 				    fmt_amount_sat(tmpctx, channel->asset->fee_reserve),
+				    (int)(info->deadline_block - height),
 				    feerate);
-		info->fee_capped = true;
-		*fee = channel->asset->fee_reserve;
+		info->fee_capped_at = cap;
+		*fee = cap;
 	}
+	if (amount_sat_greater(*fee, channel->asset->fee_reserve))
+		log_debug(channel->log,
+			  "Asset sweep of %s: %+d blocks from its deadline,"
+			  " paying fee %s over the fee reserve %s",
+			  fmt_bitcoin_outpoint(tmpctx, &info->out),
+			  (int)(info->deadline_block - height),
+			  fmt_amount_sat(tmpctx, *fee),
+			  fmt_amount_sat(tmpctx, channel->asset->fee_reserve));
 	if (!amount_sat_sub(&excess, lbtc_in, *fee)) {
 		log_unusual(channel->log,
 			    "Asset sweep of %s: only %s L-BTC in our wallet"
@@ -1232,7 +1283,13 @@ static struct bitcoin_tx *asset_sweep_unsigned(const tal_t *ctx,
 			    fmt_amount_sat(tmpctx, *fee));
 		excess = AMOUNT_SAT(0);
 	}
-	change = change_amount(excess, feerate, weight);
+	/* Is change worth an output?  At the feerate we actually pay, which
+	 * is lower when capped: so a capped fee overshoots the cap by less
+	 * than the cost of a change output (plus dust). */
+	if (!amount_feerate(&change_feerate, *fee, weight)
+	    || change_feerate > feerate)
+		change_feerate = feerate;
+	change = change_amount(excess, change_feerate, weight);
 	if (!amount_sat_is_zero(change)) {
 		bitcoin_tx_add_output(tx, scriptpubkey_p2wpkh(tmpctx, final_key),
 				      NULL, change);
@@ -1616,10 +1673,10 @@ static bool consider_onchain_htlc_tx_rebroadcast(struct channel *channel,
 						 const struct bitcoin_tx **tx,
 						 struct onchain_signing_info *info)
 {
-	struct amount_sat change, excess;
+	struct amount_sat change, excess, want;
 	struct utxo **utxos;
 	const struct hsm_utxo **hsm_utxos;
-	u32 feerate;
+	u32 feerate, change_feerate;
 	size_t weight;
 	struct bitcoin_tx *newtx;
 	size_t locktime;
@@ -1662,10 +1719,29 @@ static bool consider_onchain_htlc_tx_rebroadcast(struct channel *channel,
 	psbt = psbt_using_utxos(tmpctx, ld->wallet, utxos, locktime,
 				BITCOIN_TX_RBF_SEQUENCE, newtx->psbt);
 
+	/* Asset channels: asset_fee_cap caps the fee (the HTLC is in the
+	 * asset, so its amount says nothing about L-BTC): whatever the
+	 * feerate wants beyond it stays with us. */
+	want = amount_tx_fee(feerate, weight);
+	if (channel->asset) {
+		struct amount_sat cap = asset_fee_cap(channel,
+						      info->deadline_block,
+						      true);
+		if (amount_sat_greater(want, cap)) {
+			log_debug(channel->log,
+				  "HTLC tx fee %s capped at %s (fee reserve %s,"
+				  " deadline %+d blocks)",
+				  fmt_amount_sat(tmpctx, want),
+				  fmt_amount_sat(tmpctx, cap),
+				  fmt_amount_sat(tmpctx, channel->asset->fee_reserve),
+				  (int)(info->deadline_block
+					- get_block_height(ld->topology)));
+			want = cap;
+		}
+	}
+
 	/* Subtract how much we pay in fees for this tx, to calc excess. */
-	if (!amount_sat_sub(&excess,
-			    psbt_compute_fee(psbt),
-			    amount_tx_fee(feerate, weight))) {
+	if (!amount_sat_sub(&excess, psbt_compute_fee(psbt), want)) {
 		/* We didn't make the feerate.  Did we get nothing at all? */
 		if (tal_count(utxos) == 0) {
 			log_unusual(channel->log,
@@ -1683,23 +1759,13 @@ static bool consider_onchain_htlc_tx_rebroadcast(struct channel *channel,
 	if (tal_count(utxos) == 0)
 		return true;
 
-	/* Asset channels: the fee reserve caps every sweep's fee (the HTLC
-	 * is in the asset, so its amount says nothing about L-BTC).  We pay
-	 * min(target, reserve), or all we have if that's less: what we
-	 * gathered past it is change.  (Not target - reserve on top of the
-	 * excess above, which is 0 when we ran short: the change could then
-	 * be more than the inputs.) */
-	if (channel->asset) {
-		struct amount_sat want = amount_tx_fee(feerate, weight);
-
-		if (amount_sat_greater(want, channel->asset->fee_reserve))
-			want = channel->asset->fee_reserve;
-		if (!amount_sat_sub(&excess, psbt_compute_fee(psbt), want))
-			excess = AMOUNT_SAT(0);
-	}
-
-	/* Maybe add change */
-	change = change_amount(excess, feerate, weight);
+	/* Maybe add change (asset channels: at the feerate we pay, lower
+	 * if capped). */
+	if (!channel->asset
+	    || !amount_feerate(&change_feerate, want, weight)
+	    || change_feerate > feerate)
+		change_feerate = feerate;
+	change = change_amount(excess, change_feerate, weight);
 	if (!amount_sat_eq(change, AMOUNT_SAT(0))) {
 		/* Append change output. */
 		struct pubkey final_key;

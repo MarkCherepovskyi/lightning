@@ -12,8 +12,8 @@ The core C delta (`bitcoin common channeld closingd onchaind openingd hsmd light
 | Class | Lines (approx.) | Examples |
 |---|---|---|
 | Generic upstream bug fixes | ~160 | onchaind replay of a tx spending two watched outputs; hook "in use" after a chain-ending answer (`plugin_hook.c`); use-after-free on a rejected `openchannel2_changed`/`_sign`; use-after-free of an `openchannel`/`openchannel2` hook's `close_to` when another plugin answers after it (parsed onto `tmpctx`; any peer opening a channel crashed such a node); `wally_tx_output_get_amount` reading a confidential value's commitment as an amount when the asset is explicit; `tx_parts.c` assert on issued-asset outputs (a remote crash on any Liquid node) |
-| Generic Elements improvements | ~160 | asset-aware tx/PSBT helpers; fees counted from the fee asset only; `liquid-testnet` network; bcli fake fees on liquid-regtest; Elements change/fee outputs on HTLC-tx rebroadcast |
-| Asset-channel protocol (fork patch) | the rest | fee-reserve second input and its signatures, asset tags on channel outputs, open TLVs, funding checks, wallet-funded asset sweeps, HTLC cap, SCB record |
+| Generic Elements improvements | ~160 | asset-aware tx/PSBT helpers; fees counted from the fee asset only; `liquid-testnet` network; bcli fake fees on liquid-regtest; Elements change/fee outputs on HTLC-tx rebroadcast and on anchor spends |
+| Asset-channel protocol (fork patch) | the rest | fee-reserve second input and its signatures, asset tags on channel outputs, open TLVs, funding checks, wallet-funded asset sweeps, fee cap in fee reserves (`asset_fee_cap`), HTLC cap, SCB record |
 
 > [!info] What can't leave core
 > While one lightningd holds several Liquid assets, and Elements has no package relay, about 1,100–1,500 lines must stay in core. They build, sign and check the channel's transactions, which both peers must reproduce byte for byte, and hsmd must be able to check what it signs. Fourteen reviewers across two reviews concluded that a generic "channel tx profile" or plugin-owned open TLVs (H1) would only rename this code and grow core. Neither was done. The only zero-core route found is a Simplicity covenant on Liquid emulating a Bitcoin chain per asset (the EVM pattern). That needs one lightningd per asset and is research, not cleanup.
@@ -27,7 +27,7 @@ The core C delta (`bitcoin common channeld closingd onchaind openingd hsmd light
 4c. Elements: never read a confidential value as an amount (`bitcoin/tx.c`), with `test_confidential_value_amount`.
 5. `liquid-testnet` chainparams, plus bcli fake fees on liquid-regtest.
 6. onchaind: probing other CSV values for an unidentified output overwrote the expected script of our own outputs (four places upstream, one on the penalty path). Restored stubs lost their `to_remote`. The fork fixes it; `test_emergencyrecoverpenaltytxn` now gets `to_remote` back too.
-7. The asset-aware tx builders, together with proper anchors on Elements (an Elements-aware anchor spend).
+7. The asset-aware tx builders, together with anchors on Elements: the fork's Elements anchor spend (`anchorspend.c`: P2WPKH change, explicit fee output) is the part ordinary L-BTC channels could use on their own.
 
 Together these take about 15% out of the fork.
 

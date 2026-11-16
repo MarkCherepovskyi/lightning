@@ -10,6 +10,7 @@
 #include <lightningd/channel.h>
 #include <lightningd/hsm_control.h>
 #include <lightningd/lightningd.h>
+#include <lightningd/onchain_control.h>
 #include <wally_psbt.h>
 
 /* This is attached to each anchor tx retransmission */
@@ -134,14 +135,6 @@ struct anchor_details *create_anchor_details(const tal_t *ctx,
 
 	/* If we don't have an anchor, we can't do anything. */
 	if (!channel_type_has_anchors(channel->type))
-		return tal_free(adet);
-
-	/* This doesn't build Elements transactions (P2TR change, no fee
-	 * output).  Upstream has no anchors on Elements; here a plugin can
-	 * turn them on (asset channels, whose commitments pay their fee
-	 * from the fee reserve, and then ordinary L-BTC channels get them
-	 * too): their commitments pay their own fee, unbumped. */
-	if (chainparams->is_elements)
 		return tal_free(adet);
 
 	if (!hsm_capable(ld, WIRE_HSMD_SIGN_ANCHORSPEND)) {
@@ -291,22 +284,28 @@ static struct wally_psbt *anchor_psbt(const tal_t *ctx,
 	} else {
 		bip32_pubkey(ld, &final_key, channel->final_key_idx);
 	}
+	/* Elements has no P2TR (as for our other sweeps' change). */
 	psbt_append_output(psbt,
-			   scriptpubkey_p2tr(tmpctx, &final_key),
+			   chainparams->is_elements
+			   ? scriptpubkey_p2wpkh(tmpctx, &final_key)
+			   : scriptpubkey_p2tr(tmpctx, &final_key),
 			   change);
+	/* Elements: the fee is an explicit output.  (The anchor and the
+	 * wallet coins are all explicit L-BTC, even on asset channels.) */
+	psbt_elements_normalize_fees(psbt);
 	return psbt;
 }
 
 /* Get UTXOs, create a PSBT to spend this */
-static struct wally_psbt *try_anchor_psbt(const tal_t *ctx,
-					  struct channel *channel,
-					  const struct one_anchor *anch,
-					  u32 feerate_target,
-					  size_t base_weight,
-					  size_t *total_weight,
-					  struct amount_sat *fee_spent,
-					  u32 *feerate,
-					  struct utxo ***utxos)
+static struct wally_psbt *build_anchor_psbt(const tal_t *ctx,
+					    struct channel *channel,
+					    const struct one_anchor *anch,
+					    u32 feerate_target,
+					    size_t base_weight,
+					    size_t *total_weight,
+					    struct amount_sat *fee_spent,
+					    u32 *feerate,
+					    struct utxo ***utxos)
 {
 	struct lightningd *ld = channel->peer->ld;
 	struct wally_psbt *psbt;
@@ -338,6 +337,62 @@ static struct wally_psbt *try_anchor_psbt(const tal_t *ctx,
 	return psbt;
 }
 
+/* The most an anchor spend for this deadline may pay.  Asset channels:
+ * asset_fee_cap, since the HTLCs are in the asset and their value says
+ * nothing about what's worth paying in L-BTC (more when the deadline is
+ * close, if @critical).  Others: no cap here (spend_anchor weighs the fee
+ * against the HTLCs). */
+static struct amount_sat anchor_fee_cap(const struct channel *channel,
+					u32 deadline, bool critical)
+{
+	if (!channel->asset)
+		return AMOUNT_SAT(UINT64_MAX);
+	return asset_fee_cap(channel, deadline, critical);
+}
+
+/* build_anchor_psbt, paying at most @max_fee: if feerate_target wants
+ * more, aim lower. */
+static struct wally_psbt *try_anchor_psbt(const tal_t *ctx,
+					  struct channel *channel,
+					  const struct one_anchor *anch,
+					  u32 feerate_target,
+					  struct amount_sat max_fee,
+					  size_t base_weight,
+					  size_t *total_weight,
+					  struct amount_sat *fee_spent,
+					  u32 *feerate,
+					  struct utxo ***utxos)
+{
+	struct wally_psbt *psbt;
+	struct amount_sat package_fee;
+	u32 capped_target;
+
+	psbt = build_anchor_psbt(ctx, channel, anch, feerate_target,
+				 base_weight, total_weight, fee_spent,
+				 feerate, utxos);
+	if (amount_sat_less_eq(*fee_spent, max_fee))
+		return psbt;
+
+	/* The package feerate the cap affords at this weight. */
+	if (!amount_sat_add(&package_fee, max_fee, anch->info.commitment_fee)
+	    || !amount_feerate(&capped_target, package_fee, *total_weight)
+	    || capped_target >= feerate_target)
+		return psbt;
+	log_info(channel->log,
+		 "Anchor spend for %s commit tx: capping its fee of %s at %s:"
+		 " feerate %u instead of %u",
+		 anch->commit_side == LOCAL ? "local" : "remote",
+		 fmt_amount_sat(tmpctx, *fee_spent),
+		 fmt_amount_sat(tmpctx, max_fee),
+		 capped_target, feerate_target);
+
+	tal_free(psbt);
+	tal_free(*utxos);
+	return build_anchor_psbt(ctx, channel, anch, capped_target,
+				 base_weight, total_weight, fee_spent,
+				 feerate, utxos);
+}
+
 /* If it's possible and worth it, return signed tx.  Otherwise NULL. */
 static struct bitcoin_tx *spend_anchor(const tal_t *ctx,
 				       struct channel *channel,
@@ -360,6 +415,7 @@ static struct bitcoin_tx *spend_anchor(const tal_t *ctx,
 					  bitcoin_tx_input_sig_weight()
 					  + 1 + tal_bytelen(anch->adet->anchor_wscript))
 		+ change_weight()
+		+ elements_tx_overhead(chainparams, 1, 1)
 		+ anch->info.commitment_weight;
 
 	total_value = AMOUNT_MSAT(0);
@@ -401,6 +457,7 @@ static struct bitcoin_tx *spend_anchor(const tal_t *ctx,
 
 		candidate_psbt = try_anchor_psbt(tmpctx, channel, anch,
 						 feerate_target,
+						 anchor_fee_cap(channel, val->block, true),
 						 base_weight,
 						 &weight,
 						 &fee,
@@ -409,8 +466,10 @@ static struct bitcoin_tx *spend_anchor(const tal_t *ctx,
 		log_debug(channel->log, "candidate_psbt total weight = %zu (commitment weight %u, anchor %zu)",
 			  weight, anch->info.commitment_weight, weight - anch->info.commitment_weight);
 
-		/* Is it even worth spending this fee to meet the deadline? */
-		if (!amount_msat_greater_sat(total_value, fee)) {
+		/* Is it even worth spending this fee to meet the deadline?
+		 * (Asset channels: their HTLCs' value is in the asset;
+		 * anchor_fee_cap bounds the fee instead.) */
+		if (!channel->asset && !amount_msat_greater_sat(total_value, fee)) {
 			log_debug(channel->log,
 				  "Not worth fee %s for %s commit tx to get %s at block %u (%+i) at feerate %uperkw",
 				  fmt_amount_sat(tmpctx, fee),
@@ -473,6 +532,7 @@ static struct bitcoin_tx *spend_anchor(const tal_t *ctx,
 				  block_target, feerate_target);
 			psbt = try_anchor_psbt(tmpctx, channel, anch,
 					       feerate_target,
+					       anchor_fee_cap(channel, block_target, false),
 					       base_weight,
 					       &psbt_weight,
 					       &psbt_fee,

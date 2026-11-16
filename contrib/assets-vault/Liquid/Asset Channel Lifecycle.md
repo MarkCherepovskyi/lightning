@@ -239,7 +239,7 @@ Tested by `test_open_pay_close` (`tests/test_assetchan.py:195`): the asset lands
 |---|---|---|---|
 | 1 | `close` timeout, a peer error, or `dev-fail` → drop to chain | `drop_to_chain` | `lightningd/peer_control.c:397` |
 | 2 | Sign our latest commitment: input 0 + input 1, the peer's input-1 sig from the PSBT (logs broken "it won't be accepted!" if missing) | `sign_last_tx` | `lightningd/peer_control.c:249-313` (`:273-305`) |
-| 3 | No anchor CPFP on Elements (`create_anchor_details` returns NULL). The commitment relays on its own fixed fee. | `create_anchor_details` | `lightningd/anchorspend.c:139-145` |
+| 3 | The commitment relays on its own fixed fee (L4 in [[Safety Invariants]]). If that fee falls short of the feerate an HTLC deadline calls for, core CPFPs it through our anchor with wallet L-BTC (P2WPKH change, explicit fee output), capped by `asset_fee_cap` (one fee reserve, ten within 12 blocks of the deadline), RBF'd every block. Ordinary L-BTC anchor channels between plugin nodes get upstream's rule (bump only if the HTLCs are worth the fee). Tested by `test_anchor_bump_near_htlc_deadline` | `create_anchor_details` → `spend_anchor` → `try_anchor_psbt` | `lightningd/anchorspend.c:122`, `:397`, `:355` |
 | 4 | Rebroadcast until mined | `sign_and_send_last` → `broadcast_tx` | `lightningd/peer_control.c:348-371` |
 | 5 | Funding spent → start onchaind with the asset; always replay from the close block once onchaind has replied to init; reset `asset_sweeps` | `funding_spent` → `onchaind_funding_spent` | `lightningd/peer_control.c:2781-2835`; `lightningd/onchain_control.c:2271-2421` (`towire_onchaind_init` at `:2363`, replay `:2408-2417`) |
 | 6 | onchaind: `chan_asset`; `output_amount()` reads asset values without asserting L-BTC; L-BTC outputs (anchors, fee) are noted and dropped from coin movements | `main`, `output_amount`, `note_lbtc_outputs`, `send_coin_mvt` | `onchaind/onchaind.c:3528`, `:261-268`, `:231-248`, `:270-275` |
@@ -263,7 +263,7 @@ sequenceDiagram
     OD->>L: onchaind_spend_to_us / _penalty / _fulfill / _htlc_expired (asset output)
     L->>L: create_onchain_tx → onchaind_tx → onchaind_tx_unsigned → asset_sweep_unsigned
     L->>W: wallet_utxo_boost (reuse last UTXOs, reserve 2 blocks)
-    L->>L: fee = min(feerate·weight, fee_reserve), change P2WPKH, bitcoin_tx_finalize (fee output)
+    L->>L: fee = min(feerate·weight, asset_fee_cap), change P2WPKH, bitcoin_tx_finalize (fee output)
     L->>H: sign input 0 (delayed / penalty / remote-htlc message)
     L->>H: hsmd_sign_withdrawal (wallet inputs, + to_remote input)
     L->>N: broadcast_tx(..., consider_onchain_rebroadcast)
@@ -278,20 +278,20 @@ sequenceDiagram
 |---|---|---|---|---|
 | Our `to_local` (after CSV) on our commitment | `onchaind_spend_to_us` (`onchaind/onchaind.c:2228`) | `handle_onchaind_spend_to_us` `lightningd/onchain_control.c:1830-1881` | `hsmd_sign_any_delayed_payment_to_us` (SIGHASH_ALL) `:924-935` | `nSequence` = `to_self_delay`; deadline `slow_sweep_deadline` |
 | Our HTLC-tx output (after CSV) | `onchaind_spend_to_us` in `resolve_htlc_tx` (`onchaind/onchaind.c:1141-1190`, msg at `:1176`) | same | same | Amount read with `output_amount` |
-| Their revoked `to_local`, their HTLC outputs on a revoked commitment, their HTLC-tx outputs | `onchaind_spend_penalty` (`onchaind/onchaind.c:1226`, `:2584`, `:2608`) | `handle_onchaind_spend_penalty` `:1883-1915` | `hsmd_sign_any_penalty_to_us` (SIGHASH_ALL) `:937-948` | Deadline `close_blockheight + our to_self_delay`; fee **still capped** at the reserve |
+| Their revoked `to_local`, their HTLC outputs on a revoked commitment, their HTLC-tx outputs | `onchaind_spend_penalty` (`onchaind/onchaind.c:1226`, `:2584`, `:2608`) | `handle_onchaind_spend_penalty` `:1883-1915` | `hsmd_sign_any_penalty_to_us` (SIGHASH_ALL) `:937-948` | Deadline `close_blockheight + our to_self_delay`; fee capped at one reserve, ten within 12 blocks of the deadline |
 | Their offered HTLC on their commitment, with the preimage | `onchaind_spend_fulfill` (`onchaind/onchaind.c:1610`) | `handle_onchaind_spend_fulfill` `:1917-1953` | `hsmd_sign_any_remote_htlc_to_us` | Upstream signs this **SIGHASH_SINGLE\|ANYONECANPAY** on anchor channels: see [[Asset Transactions]] |
 | Our offered HTLC on their commitment, after timeout | `onchaind_spend_htlc_expired` (`onchaind/onchaind.c:2035`) | `handle_onchaind_spend_htlc_expired` `:2119-2163` | `hsmd_sign_any_remote_htlc_to_us` | Same as above; `nLockTime` = cltv_expiry |
 | Our `to_remote` on their commitment | `onchaind_add_utxo` from `tell_wallet_to_remote` (`onchaind/onchaind.c:2620-2645`) | `onchain_add_utxo` → `sweep_asset_to_remote` `:712-760`, `:1774-1812` | `hsmd_sign_withdrawal` with a `close_info` UTXO (SIGHASH_ALL) `:1385-1441` | `info->sign == NULL`; nSequence 1; **onchaind doesn't wait for it** (`:1763-1766`) |
 
-The builder, step by step (`asset_sweep_unsigned`, `lightningd/onchain_control.c:1142`; sub-refs below are approximate, about +35 lines since):
+The builder, step by step (`asset_sweep_unsigned`, `lightningd/onchain_control.c:1180`):
 
-1. `bitcoin_tx(ctx, chainparams, 2, 3, info->locktime)`. Input 0 = the asset output (`bitcoin_tx_add_asset_input`, sequence `info->to_self_delay`, witness script `info->wscript`, or the to_remote scriptpubkey). Output 0 = `out_sats` of the asset to the close script (`:1122-1129`).
-2. Weight = tx + `channel_input_witness_weight` (`:1076-1093`) + `elements_tx_overhead(2,3)` (`:1130-1132`).
-3. Reuse the wallet UTXOs of the previous build if they're still unspent (`:1136-1146`), then `wallet_utxo_boost` for more at `feerate_for_target(deadline)` (`:1148-1154`).
-4. Re-reserve them for `ASSET_SWEEP_RESERVE_BLOCKS` = 2 (`:1099`, `:1158-1171`). This is short on purpose: the chosen coins aren't persisted across restarts.
-5. Fee = `amount_tx_fee(feerate, weight)`, **capped at `channel->asset->fee_reserve`** (logged once, `:1179-1190`). If the wallet has too little L-BTC: log, `excess = 0`, and the tx will be rejected and retried next block (`:1191-1199`).
-6. Change: `change_amount(excess, ...)` to P2WPKH(final_key) with a keypath. Dust change goes to the fee, so the fee can exceed the cap by up to the dust limit (`:1200-1209`).
-7. `bitcoin_tx_finalize` adds the explicit fee output; `*fee = bitcoin_tx_compute_fee(tx)` (`:1212-1214`).
+1. `bitcoin_tx(ctx, chainparams, 2, 3, info->locktime)`. Input 0 = the asset output (`bitcoin_tx_add_asset_input`, sequence `info->to_self_delay`, witness script `info->wscript`, or the to_remote scriptpubkey). Output 0 = `out_sats` of the asset to the close script (`:1196-1203`).
+2. Weight = tx + `channel_input_witness_weight` (`:1111-1128`) + `elements_tx_overhead(2,3)` (`:1204-1206`).
+3. Reuse the wallet UTXOs of the previous build if they're still unspent (`:1210-1221`), then `wallet_utxo_boost` for more at `feerate_for_target(deadline)` (`:1222-1228`).
+4. Re-reserve them for `ASSET_SWEEP_RESERVE_BLOCKS` = 2 (`:1172`, `:1230-1245`). This is short on purpose: the chosen coins aren't persisted across restarts.
+5. Fee = `amount_tx_fee(feerate, weight)`, **capped by `asset_fee_cap`**: one fee reserve, or ten for a claim the peer could win (`asset_claim_critical`: penalty, HTLC success/timeout, fulfill, expired) within 12 blocks of its deadline (logged when the cap changes, `lightningd/onchain_control.c:1247-1276`). If the wallet has too little L-BTC: log, `excess = 0`, and the tx will be rejected and retried next block (`:1277-1285`).
+6. Change: `change_amount(excess, ...)` at the feerate actually paid (lower when capped), to P2WPKH(final_key) with a keypath. Change too small to be worth an output goes to the fee, so the fee can exceed the cap by about the cost of one output plus dust (`:1286-1302`).
+7. `bitcoin_tx_finalize` adds the explicit fee output; `*fee = bitcoin_tx_compute_fee(tx)` (`:1305-1306`).
 
 Signing: `onchaind_tx` (`:1443-1470`) signs input 0 with `info->sign` when set, then `sign_wallet_inputs` (`:1385-1441`) sends `hsmd_sign_withdrawal` for the wallet UTXOs (plus the to_remote UTXO) and copies the finalized witnesses onto the tx. hsmd allows extra inputs only when the input it signs is **not** L-BTC (`handle_sign_to_us_tx`, `hsmd/libhsmd.c:681-688`).
 
@@ -304,7 +304,7 @@ Rebroadcast: `consider_onchain_rebroadcast` (`:1507`). For an asset channel it r
 | 1 | onchaind asks for an HTLC-success (we have the preimage) or HTLC-timeout on **our** commitment | `onchaind_spend_htlc_success` / `_timeout` | `onchaind/onchaind.c:1587`, `:1984` |
 | 2 | Build the zero-fee HTLC tx in the asset (input 0 = HTLC output, output 0 = to_local-style P2WSH) | `handle_onchaind_spend_htlc_success` / `_timeout` → `htlc_tx(..., channel_asset_tag(channel->asset))` | `lightningd/onchain_control.c:1955-2034`, `:2036-2117`; `common/htlc_tx.c:8-71` |
 | 3 | Our HTLC sig (SIGHASH_ALL) + the peer's (SINGLE\|ACP, from `commitment_signed`) → witness on input 0 | `sign_htlc_success` / `sign_htlc_timeout` → `do_sign_local_htlc_tx` | `lightningd/onchain_control.c:950-980`; `hsmd/libhsmd.c:1574-1645` |
-| 4 | Add wallet L-BTC: `wallet_utxo_boost` → `psbt_using_utxos`; asset fee cap (fee = min(target, reserve), or all that was gathered if less; the rest is change); **P2WPKH** change on Elements (upstream used P2TR); `psbt_elements_normalize_fees`; no "fee > HTLC value" check for assets (the HTLC is in another unit) | `consider_onchain_htlc_tx_rebroadcast` | `lightningd/onchain_control.c:1615` (`:1686-1697`, `:1704-1717`, `:1720`, `:1723`) |
+| 4 | Add wallet L-BTC: `wallet_utxo_boost` → `psbt_using_utxos`; asset fee cap (fee = min(target, `asset_fee_cap(channel, deadline, true)`), or all that was gathered if less; the rest is change); **P2WPKH** change on Elements (upstream used P2TR); `psbt_elements_normalize_fees`; no "fee > HTLC value" check for assets (the HTLC is in another unit) | `consider_onchain_htlc_tx_rebroadcast` | `lightningd/onchain_control.c:1672` (`:1722-1755`, `:1778-1782`, `:1786`, `:1788-1790`) |
 | 5 | hsmd signs the wallet inputs (SIGHASH_ALL); then our input-0 signature is made again, SIGHASH_ALL over the final tx (`sign_and_get_htlc_witness`), on every bump | `hsmd_sign_htlc_tx_mingle` → `sign_our_inputs` | `hsmd/libhsmd.c:1909-1924`, `:562-645` |
 | 6 | Broadcast, re-run every block | `broadcast_tx(..., consider_onchain_htlc_tx_rebroadcast)` | `lightningd/onchain_control.c:2027-2030`, `:2110-2113` |
 | 7 | onchaind sees the HTLC tx mined → tracks its asset output → `onchaind_spend_to_us` after CSV → §7 sweep | `resolve_htlc_tx` | `onchaind/onchaind.c:1141-1190` |
@@ -315,8 +315,8 @@ Tested by `test_htlc_onchain[timeout|success × payer|payee]` (`tests/test_asset
 
 Their revoked commitment shows up → `handle_their_cheat` (`onchaind/onchaind.c:2689`) → one `onchaind_spend_penalty` per revoked output (`to_local`, each HTLC output, and later each output of their HTLC txs via `steal_htlc_tx`, `:1194-1230`) → `handle_onchaind_spend_penalty` (`lightningd/onchain_control.c:1883-1915`) → §7 builder with SIGHASH_ALL throughout. Our own `to_remote` on that commitment goes the `onchain_add_utxo` route. Tested by `test_penalty[opener|peer]` (`tests/test_assetchan.py:517-518`).
 
-> [!warning] Penalty fees are capped at the reserve
-> `asset_sweep_unsigned` caps every sweep's fee at `fee_reserve`, deadline or not (`lightningd/onchain_control.c:1173-1190`). DESIGN calls this fine at Liquid feerates and plans a deadline-aware cap later.
+> [!warning] Penalty fees are capped
+> `asset_sweep_unsigned` caps a penalty's fee at one fee reserve until it is within 12 blocks of its deadline, then at ten (`asset_fee_cap`, `lightningd/onchain_control.c:1140`). The fee still follows the deadline's feerate, so the cap only bites in a fee spike; past ten reserves a cheater can still outbid the penalty. Tested by `test_penalty_fee_cap_near_deadline` (`tests/test_assetchan.py:1212`): the penalty isn't mined at one reserve, then is within the last 12 blocks, while the victim's `to_remote` sweep stays within one reserve.
 
 ## 10. Channel forgotten
 

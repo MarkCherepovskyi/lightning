@@ -22,7 +22,7 @@ assetchan-elements-wallet=<wallet name>                    # optional
 
 > [!warning] Two wallets, two jobs
 > - **elementsd's wallet** funds opens. It needs *unblinded* UTXOs of the asset and of L-BTC; the plugin pays itself one if needed. It also receives your assets at close, because `close_to` is an elementsd address.
-> - **CLN's own wallet** (`newaddr`, then send L-BTC to it) pays the L-BTC fees of asset sweeps and asset HTLC transactions after a unilateral close. With no L-BTC there, core logs "only … L-BTC in our wallet … will retry every block" and keeps the channel until it can sweep. The asset is not lost, but deadline-bound claims (penalties, HTLCs) can be missed. Monitor it.
+> - **CLN's own wallet** (`newaddr`, then send L-BTC to it) pays the L-BTC fees of asset sweeps, asset HTLC transactions and anchor spends (CPFP of a commitment) after a unilateral close: at most one fee reserve per tx, up to ten near a contested claim's deadline (`asset_fee_cap`). With no L-BTC there, core logs "only … L-BTC in our wallet … will retry every block" and keeps the channel until it can sweep. The asset is not lost, but deadline-bound claims (penalties, HTLCs) can be missed. Monitor it.
 
 - **`important-plugin` is required.** The plugin disables itself otherwise. lightningd then offers no asset channels, and refuses to start existing ones (`Asset channel, but no asset channel plugin`).
 - Asset channels are always private. Payers reach you through the route hints in `assetchan-invoice`.

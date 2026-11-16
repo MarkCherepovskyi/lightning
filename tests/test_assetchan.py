@@ -31,6 +31,13 @@ CHANNEL_UNITS = 100_000     # asset base units in each asset channel
 FEE_RESERVE = 2000          # L-BTC sats next to each asset channel
 PAY_UNITS = 1000
 HTLC_UNITS = 2000           # the HTLC the on-chain tests leave in flight
+# What a node's wallet may pay in fees for one close: a few txs, each at
+# most ten fee reserves (near a deadline, at regtest's high feerates) plus
+# dust change.
+# (At regtest's default 15000 perkw an Elements change output costs ~4,000
+# sat: leftover L-BTC short of that goes to the fee.)
+CHANGE_SLACK = 5000
+MAX_FEES = 4 * (10 * FEE_RESERVE + CHANGE_SLACK)
 
 sys.path.insert(0, PLUGIN_DIR)
 from elements import base_units as units  # noqa: E402  (elementsd decimal -> base units)
@@ -131,6 +138,9 @@ def paid_by_wallet(bitcoind, tx, *nodes):
     coins of one of the nodes' CLN wallets (not elementsd's)."""
     lbtc = bitcoind.rpc.dumpassetlabels()['bitcoin']
     assert len(tx['vin']) >= 2 and units(tx['fee'][lbtc]) > 0
+    # Its fee is capped: ten fee reserves at most (near a deadline), plus
+    # change too small to be worth its own output.
+    assert units(tx['fee'][lbtc]) <= 10 * FEE_RESERVE + CHANGE_SLACK
     coins = [{(o['txid'], o['output']) for o in n.rpc.listfunds(spent=True)['outputs']}
              for n in nodes]
     ins = {(vin['txid'], vin['vout']) for vin in tx['vin'][1:]}
@@ -504,14 +514,16 @@ def test_htlc_onchain(node_factory, bitcoind, closer, outcome):
 
     # Each side's asset is at its close address: l2 its balance, plus the
     # HTLC if it succeeded, and l1 the rest.  Their CLN wallets' L-BTC only
-    # paid fees (each sweep's at most the channel's fee reserve).
+    # paid fees: at regtest's high default feerates each tx (the anchor
+    # spend, the HTLC tx or sweep, the sweeps of delayed outputs) pays up to
+    # the channel's fee reserve, and up to ten near an HTLC's deadline.
     l2_units = PAY_UNITS + (HTLC_UNITS if outcome == 'success' else 0)
     assert close_units(bitcoind, asset, close_to[l1]) == CHANNEL_UNITS - l2_units
     assert close_units(bitcoind, asset, close_to[l2]) == l2_units
     bitcoind.generate_block(1)
     sync_blockheight(bitcoind, [l1, l2])
     for n in (l1, l2):
-        assert wallet_before[n] - 15000 < wallet_sats(n) < wallet_before[n]
+        assert wallet_before[n] - MAX_FEES < wallet_sats(n) < wallet_before[n]
 
     # A sweep whose input someone else spent never confirms: it must stop
     # holding wallet L-BTC (rebuilt every block, it used to keep its coins
@@ -617,7 +629,7 @@ def test_penalty(node_factory, bitcoind, cheater):
     assert wallet_units(bitcoind, asset) == elements_before + CHANNEL_UNITS
     bitcoind.generate_block(1)
     sync_blockheight(bitcoind, [victim])
-    assert wallet_before - 15000 < wallet_sats(victim) < wallet_before
+    assert wallet_before - MAX_FEES < wallet_sats(victim) < wallet_before
 
     bitcoind.generate_block(100)
     victim.daemon.wait_for_log('onchaind complete, forgetting peer')
@@ -973,10 +985,10 @@ HOLD = os.path.join(os.getcwd(), 'contrib/evmchan/hold.py')
 def test_lbtc_anchor_channel_onchain(node_factory, bitcoind):
     """Between two plugin nodes an ordinary L-BTC channel is an anchor
     channel too (the plugin turns anchors on, which asset channels need).
-    Force-closed with an HTLC in flight it still resolves on chain: the
-    commitment pays its own fee (no anchor spend: core can't build one on
-    Elements), and l1's zero-fee HTLC-timeout tx gets its fee from l1's
-    wallet, with P2WPKH change and an explicit fee output."""
+    Force-closed with an HTLC in flight it still resolves on chain: l1
+    CPFPs its commitment through its anchor as on Bitcoin (the HTLC is
+    L-BTC, worth the fee), and its zero-fee HTLC-timeout tx gets its fee
+    from l1's wallet; both with P2WPKH change and an explicit fee output."""
     asset = issue_asset(bitcoind)
     opts = node_opts(bitcoind, asset)
     l1, l2 = node_factory.get_nodes(2, opts=[opts, {**opts, 'plugin': HOLD, 'hold-all': False}])
@@ -997,7 +1009,13 @@ def test_lbtc_anchor_channel_onchain(node_factory, bitcoind):
 
     l1.rpc.disconnect(l2.info['id'], force=True)
     commit = only_one(l1.rpc.close(chan, unilateraltimeout=1)['txids'])
-    bitcoind.generate_block(1, wait_for_mempool=commit)
+    l1.daemon.wait_for_log('Creating anchor spend for local commit tx')
+    wait_for(lambda: len(bitcoind.rpc.getrawmempool()) == 2)
+    anchor = only_one([t for t in bitcoind.rpc.getrawmempool() if t != commit])
+    tx = bitcoind.rpc.getrawtransaction(anchor, True)
+    assert spends_from(tx, commit)
+    assert [v['scriptPubKey']['type'] for v in tx['vout']] == ['witness_v0_keyhash', 'fee']
+    bitcoind.generate_block(1, wait_for_mempool=[commit, anchor])
     for _ in range(40):
         if l1.daemon.is_in_log('Resolved OUR_UNILATERAL/OUR_HTLC by our proposal OUR_HTLC_TIMEOUT_TX'):
             break
@@ -1006,7 +1024,6 @@ def test_lbtc_anchor_channel_onchain(node_factory, bitcoind):
     else:
         raise ValueError("l1's HTLC-timeout tx never got mined")
     assert payment_result(bitcoind, l1, payment_hash, [l1, l2]) == 'failed'
-    assert not l1.daemon.is_in_log(r'We have \d+ anchor points to use')
     # The HTLC-timeout tx's output comes home after l1's delay.
     _, txid, blocks = l1.wait_for_onchaind_tx('OUR_DELAYED_RETURN_TO_WALLET',
                                               'OUR_HTLC_TIMEOUT_TX/DELAYED_OUTPUT_TO_US')
@@ -1109,3 +1126,151 @@ def test_recover_asset_channel(node_factory, bitcoind):
         bitcoind.generate_block(1)
         sync_blockheight(bitcoind, [l1, l2])
     assert close_units(bitcoind, asset, close_to) == PAY_UNITS
+
+
+def mempool_package(bitcoind, txid):
+    """(fee in L-BTC sats, weight) of a mempool tx with its unconfirmed
+    ancestors, as a miner sees it (CPFP)."""
+    e = bitcoind.rpc.getmempoolentry(txid)
+    return units(e['fees']['ancestor']), e['ancestorsize'] * 4
+
+
+@unittest.skipIf(TEST_NETWORK != 'liquid-regtest', 'Liquid only')
+def test_anchor_bump_near_htlc_deadline(node_factory, bitcoind):
+    """l1 force-closes an asset channel with its HTLC to l2 in flight, at a
+    feerate the commitment's fixed fee (the fee reserve less the anchors)
+    can't meet.  l1 CPFPs it through its anchor with L-BTC from its CLN
+    wallet: the HTLCs are in the asset, so their amount can't say what's
+    worth paying in L-BTC.  While the HTLC's deadline is far the anchor
+    spend pays at most one fee reserve; once it's close (12 blocks) up to
+    ten, and the package meets the feerate and gets mined."""
+    asset = issue_asset(bitcoind)
+    opts = node_opts(bitcoind, asset)
+    # l2 hangs up instead of failing the HTLC, so it stays in flight.
+    l1, l2 = node_factory.get_nodes(2, opts=[opts, {**opts, 'disconnect': ['-WIRE_UPDATE_FAIL_HTLC']}])
+    chan = open_asset_channel(bitcoind, l1, l2, asset)['channel_id']
+
+    # l2 doesn't know this payment.
+    send_htlc(l1, l2, chan, HTLC_UNITS, '01' * 32, '01' * 32)
+    l2.daemon.wait_for_log('dev_disconnect: -WIRE_UPDATE_FAIL_HTLC')
+    for n in (l1, l2):
+        wait_for(lambda: not channel(n, chan)['peer_connected'])
+    cltv_expiry = only_one(channel(l1, chan)['htlcs'])['expiry']
+    # l1's deadline for its own payment: the expiry plus its cltv-delta.
+    deadline = cltv_expiry + 6
+
+    feerate = 2000
+    l1.set_feerates((feerate,) * 4)
+    commit_txid = only_one(l1.rpc.close(chan, unilateraltimeout=1)['txids'])
+    assert deadline - bitcoind.rpc.getblockcount() > 12
+    l1.daemon.wait_for_log('Anchor spend for local commit tx: capping its fee of .* at {}sat'.format(FEE_RESERVE))
+    l1.daemon.wait_for_log('Creating anchor spend for local commit tx')
+    wait_for(lambda: len(bitcoind.rpc.getrawmempool()) == 2)
+    anchor_txid = only_one([t for t in bitcoind.rpc.getrawmempool() if t != commit_txid])
+    fee, weight = mempool_package(bitcoind, anchor_txid)
+    assert fee - units(bitcoind.rpc.getmempoolentry(commit_txid)['fees']['base']) <= FEE_RESERVE + CHANGE_SLACK
+    assert fee * 1000 // weight < feerate
+
+    # Nothing mines it at that feerate.  Once the deadline is close the
+    # anchor spend is replaced by one paying the full feerate.
+    while True:
+        assert commit_txid in bitcoind.rpc.getrawmempool()
+        if bitcoind.rpc.getblockcount() + 12 > deadline:
+            break
+        bitcoind.generate_block(1, needfeerate=feerate)
+        sync_blockheight(bitcoind, [l1])
+    l1.daemon.wait_for_log('RBF anchor local commit tx spend')
+    wait_for(lambda: anchor_txid not in bitcoind.rpc.getrawmempool()
+             and len(bitcoind.rpc.getrawmempool()) == 2)
+    anchor_txid = only_one([t for t in bitcoind.rpc.getrawmempool() if t != commit_txid])
+    fee, weight = mempool_package(bitcoind, anchor_txid)
+    assert fee * 1000 // weight >= feerate * 0.99
+    assert fee <= 11 * FEE_RESERVE
+    blockhash = bitcoind.generate_block(1, needfeerate=int(feerate * 0.99))[0]
+    mined = bitcoind.rpc.getblock(blockhash)['tx']
+    assert commit_txid in mined and anchor_txid in mined
+
+    # The anchor spend: the anchor and wallet L-BTC in, P2WPKH change and
+    # an explicit fee out.
+    lbtc = bitcoind.rpc.dumpassetlabels()['bitcoin']
+    tx = bitcoind.rpc.getrawtransaction(anchor_txid, True, blockhash)
+    commit = bitcoind.rpc.getrawtransaction(commit_txid, True, blockhash)
+    (_, anchor_n), = spends_from(tx, commit_txid)
+    assert commit['vout'][anchor_n]['asset'] == lbtc
+    assert units(commit['vout'][anchor_n]['value']) == 330
+    coins = {(o['txid'], o['output']) for o in l1.rpc.listfunds(spent=True)['outputs']}
+    others = {(vin['txid'], vin['vout']) for vin in tx['vin'] if vin['txid'] != commit_txid}
+    assert others and others <= coins
+    assert units(tx['fee'][lbtc]) > FEE_RESERVE
+    assert [v['scriptPubKey']['type'] for v in tx['vout']] == ['witness_v0_keyhash', 'fee']
+
+    # The HTLC still times out on chain.
+    assert payment_result(bitcoind, l1, '01' * 32, [l1, l2]) == 'failed'
+
+
+@unittest.skipIf(TEST_NETWORK != 'liquid-regtest', 'Liquid only')
+def test_penalty_fee_cap_near_deadline(node_factory, bitcoind):
+    """The cheater's revoked to_local is ours until its delay runs out (30
+    blocks, the victim's watchtime): until then the penalty, like any sweep,
+    pays at most the channel's fee reserve, which at a high feerate gets
+    nothing mined (censors, a fee spike).  Within 12 blocks of the deadline
+    it may pay up to ten fee reserves, meets the feerate and gets mined.
+    The victim's own to_remote, which nobody else can spend, is swept
+    slowly, within one fee reserve."""
+    asset = issue_asset(bitcoind)
+    opts = node_opts(bitcoind, asset)
+    l1, l2 = node_factory.get_nodes(2, opts=[{**opts, 'watchtime-blocks': 30}, opts])
+    chan = open_asset_channel(bitcoind, l1, l2, asset)['channel_id']
+    victim, bad = l1, l2
+    # A wallet coin for each of its two sweeps.
+    victim.fundwallet(10**6)
+    pay(l1, l2, asset, 10 * PAY_UNITS, 'balance')
+    cheat = bad.rpc.dev_sign_last_tx(victim.info['id'])['tx']
+    # That commitment gets revoked.
+    pay(l1, l2, asset, PAY_UNITS, 'more')
+
+    feerate = 3000
+    victim.set_feerates((feerate,) * 4)
+    bad.stop()
+    commit_txid = bitcoind.rpc.sendrawtransaction(cheat)
+    bitcoind.generate_block(1, wait_for_mempool=commit_txid)
+    close_height = bitcoind.rpc.getblockcount()
+    deadline = close_height + 30
+    victim.daemon.wait_for_log('Telling lightningd about OUR_PENALTY_TX')
+
+    # The penalty is capped at the fee reserve, so it doesn't get mined;
+    # nor does the victim's to_remote sweep, at the low feerate of a slow
+    # (300-block) target.
+    victim.daemon.wait_for_log(r'Asset sweep of {}:\d+: capping its fee of .* at {}sat'
+                               .format(commit_txid, FEE_RESERVE))
+    while bitcoind.rpc.getblockcount() + 12 <= deadline:
+        assert not victim.daemon.is_in_log('over the fee reserve')
+        bitcoind.generate_block(1, needfeerate=feerate)
+        sync_blockheight(bitcoind, [victim])
+
+    # Close to the deadline the penalty may pay more: it meets the feerate.
+    victim.daemon.wait_for_log(r'Asset sweep of {}:\d+: capping its fee of .* at {}sat'
+                               .format(commit_txid, 10 * FEE_RESERVE)
+                               + '|over the fee reserve')
+    spends = {}
+    for _ in range(3):
+        if spends:
+            break
+        sync_blockheight(bitcoind, [victim])
+        blockhash = bitcoind.generate_block(1, needfeerate=int(feerate * 0.99))[0]
+        for txid in bitcoind.rpc.getblock(blockhash)['tx']:
+            tx = bitcoind.rpc.getrawtransaction(txid, True, blockhash)
+            if spends_from(tx, commit_txid):
+                spends[txid] = tx
+    assert len(spends) == 2
+    lbtc = bitcoind.rpc.dumpassetlabels()['bitcoin']
+    assert bitcoind.rpc.getblockcount() <= deadline
+    fees = sorted(units(tx['fee'][lbtc]) for tx in spends.values())
+    # (Change too small for an output goes to the fee.)
+    assert fees[0] <= FEE_RESERVE + CHANGE_SLACK
+    assert FEE_RESERVE < fees[1] <= 10 * FEE_RESERVE + CHANGE_SLACK
+    for tx in spends.values():
+        paid_by_wallet(bitcoind, tx, victim)
+
+    bitcoind.generate_block(100)
+    victim.daemon.wait_for_log('onchaind complete, forgetting peer')

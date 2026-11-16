@@ -14,7 +14,8 @@ The terms the other notes use, with a pointer to where each is defined or implem
 | **Fee reserve** | L-BTC that the opener puts in the 2-of-2 at funding output `n+1`. Every commitment and mutual close spends it as input 1, and it pays both anchors plus the fee. | [[Asset Transactions]] |
 | **Funding sibling input** | Input 1 of a commitment or close tx, which spends the fee reserve. hsmd signs it with `hsmd_sign_funding_sibling_input`. | [[Core - hsmd]] |
 | **Explicit output** | An Elements output whose asset and value are not blinded. Every output of an asset channel is explicit. | `elements_output_is_explicit` |
-| **Anchors** | Two 330-sat L-BTC outputs (BOLT 3 `option_anchors_zero_fee_htlc_tx`). Asset channels require anchors, but core never builds anchor spends on Elements. | [[Asset Transactions]] |
+| **Anchors** | Two 330-sat L-BTC outputs (BOLT 3 `option_anchors_zero_fee_htlc_tx`). Asset channels require anchors. Core CPFPs a commitment through its anchor with wallet L-BTC (an Elements anchor spend: P2WPKH change, explicit fee output); on asset channels its fee is capped by `asset_fee_cap`. | [[Asset Transactions]] |
+| **Fee cap** | The most L-BTC one of our txs pays in fees on an asset channel (sweep, HTLC tx wallet inputs, anchor spend): one fee reserve, or ten for a claim the peer could win within 12 blocks of its deadline. | `asset_fee_cap` |
 | **HTLC cap** | The most HTLC outputs a commitment can carry while the fixed fee still meets the 0.1 sat/vB relay floor. Each side accepts at most half. | `asset_commit_max_htlcs` |
 | **Asset sweep** | A spend of an asset output of ours after a unilateral close. Core funds it with L-BTC from CLN's own wallet and signs it `SIGHASH_ALL`. | [[Core - lightningd]] |
 | **Stub channel** | A channel recreated from a static channel backup (SCB) so that the peer force-closes it and we sweep our side. | [[Core - lightningd]] |
