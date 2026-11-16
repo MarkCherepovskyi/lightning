@@ -27,7 +27,7 @@
 
 use crate::assetinvoice::decode_wrapper;
 use crate::protocol::{encode_swap_metadata, fetch_price_tiers, SwapMetadata};
-use crate::rpc::{asset_layers, getroutes_path_to_sendpay_route, new_rpc, param};
+use crate::rpc::{asset_layers, getroutes_path_to_sendpay_route, new_rpc, param, require_client_mode};
 use crate::State;
 use anyhow::{anyhow, Error};
 use cln_plugin::Plugin;
@@ -57,6 +57,7 @@ const LEG1_CLTV_MARGIN: u32 = 60;
 /// has no matching config, it fails the same way an unsupported pair
 /// would.
 pub(crate) async fn quoteassetinvoice(p: Plugin<State>, args: Value) -> Result<Value, Error> {
+    require_client_mode(&p, "quoteassetinvoice")?;
     let encoded = param(&args, 0, "assetinvoice")
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("Missing assetinvoice"))?;
@@ -68,6 +69,7 @@ pub(crate) async fn quoteassetinvoice(p: Plugin<State>, args: Value) -> Result<V
 }
 
 pub(crate) async fn payassetinvoice(p: Plugin<State>, args: Value) -> Result<Value, Error> {
+    require_client_mode(&p, "payassetinvoice")?;
     let encoded = param(&args, 0, "assetinvoice")
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("Missing assetinvoice"))?;

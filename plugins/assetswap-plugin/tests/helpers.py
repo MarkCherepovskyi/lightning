@@ -68,6 +68,10 @@ def setup_swap_topology(node_factory, bitcoind, rate_ppm=DEFAULT_RATE_PPM,
         **(provider_opts or {}),
         'plugin': [ASSETSWAP_PLUGIN, PRICETIERS_PLUGIN],
         'pricetiers-pair': pair,
+        # l2 is the swap provider: its on_htlc_accepted hook is what
+        # actually settles leg 1, which assetswap-mode now gates to
+        # "server" only (default is "client" - see config::Mode).
+        'assetswap-mode': 'server',
     })
 
     # l1 also needs pricetiers-plugin with the SAME pair l2 (the provider)

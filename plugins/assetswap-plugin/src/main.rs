@@ -19,6 +19,15 @@
 //! margins) isn't this plugin's job at all -- that's
 //! `plugins/pricetiers-plugin`'s, a separate, swappable policy plugin
 //! this one calls via a plain local RPC call (`protocol::fetch_price_tiers`).
+//!
+//! `assetswap-mode` (`config::Mode`) splits the two roles above so each
+//! only has the capability it actually needs: a `client` node (the
+//! default - every ordinary per-user node) gets the RPCs
+//! (`assetinvoice`/`quoteassetinvoice`/`payassetinvoice`/`assetbalances`)
+//! but `on_htlc_accepted` always passes a would-be leg-1 HTLC straight
+//! through; a `server` node (the shared swap-provider, e.g. `cln-swap`)
+//! gets the reverse - `on_htlc_accepted` actually settles leg 1, but every
+//! RPC above is refused. See `config::Mode`'s own doc comment.
 
 mod assetinvoice;
 mod balances;
@@ -44,6 +53,7 @@ async fn main() -> Result<(), Error> {
 
     let Some(plugin) = Builder::new(tokio::io::stdin(), tokio::io::stdout())
         .dynamic()
+        .option(config::OPT_MODE)
         .option(config::OPT_PROVIDER)
         .option(config::OPT_REMOTE)
         .option(config::OPT_SAFETY_BLOCKS)
@@ -85,6 +95,8 @@ async fn main() -> Result<(), Error> {
         return Ok(());
     };
 
+    let mode = config::parse_mode(&plugin.option(&config::OPT_MODE)?)?;
+
     let providers: Vec<PublicKey> = plugin
         .option_str("assetswap-provider")?
         .and_then(|v| v.as_str_arr().cloned())
@@ -101,6 +113,7 @@ async fn main() -> Result<(), Error> {
     )?;
 
     let config = config::Config {
+        mode,
         providers,
         remotes,
         safety_blocks: plugin.option_str("assetswap-cltv-safety-blocks")?.and_then(|v| v.as_i64()).unwrap_or(18) as u32,

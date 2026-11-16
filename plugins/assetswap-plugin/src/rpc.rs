@@ -3,6 +3,7 @@
 //! call arguments, converting askrene's route shape into sendpay's, and
 //! keeping a payment in one asset on channels in that asset.
 
+use crate::config::Mode;
 use crate::protocol::is_asset_id;
 use crate::State;
 use anyhow::anyhow;
@@ -15,6 +16,21 @@ use std::path::{Path, PathBuf};
 
 /// JSON-RPC "method not found": the node has no contrib/assetchan.
 const METHOD_NOT_FOUND: i32 = -32601;
+
+/// Every client-only RPC (`assetinvoice`/`quoteassetinvoice`/
+/// `payassetinvoice`/`assetbalances`) checks this first: a node running in
+/// `assetswap-mode=server` is the shared swap-provider and has no business
+/// creating/paying its own asset invoices or reporting its own balances -
+/// refuse outright rather than silently doing something a provider never
+/// should.
+pub(crate) fn require_client_mode(p: &Plugin<State>, rpc_name: &str) -> Result<(), anyhow::Error> {
+    if p.state().config.mode != Mode::Client {
+        return Err(anyhow!(
+            "{rpc_name}: this node is in assetswap-mode=server (the swap provider) - {rpc_name} is client-only"
+        ));
+    }
+    Ok(())
+}
 
 pub(crate) fn rpc_path(p: &Plugin<State>) -> PathBuf {
     Path::new(&p.configuration().lightning_dir).join(&p.configuration().rpc_file)
