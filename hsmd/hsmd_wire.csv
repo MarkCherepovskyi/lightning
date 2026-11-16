@@ -18,7 +18,6 @@ tlvtype,hsmd_dev_preinit_tlvs,warn_on_overgrind,5
 tlvdata,hsmd_dev_preinit_tlvs,warn_on_overgrind,enable,bool,
 
 #include <bitcoin/chainparams.h>
-#include <common/channel_asset.h>
 # Start the HSM.
 msgtype,hsmd_init,11
 msgdata,hsmd_init,bip32_key_version,bip32_key_version,
@@ -331,38 +330,17 @@ msgtype,hsmd_sign_mutual_close_tx,21
 msgdata,hsmd_sign_mutual_close_tx,tx,bitcoin_tx,
 msgdata,hsmd_sign_mutual_close_tx,remote_funding_key,pubkey,
 
-# Asset channels (common/channel_asset.h): hsmd_sign_commitment_tx,
-# hsmd_sign_remote_commitment_tx and hsmd_sign_mutual_close_tx for a tx that
-# also spends the channel's L-BTC fee reserve (input 1: the output after the
-# funding one, same 2-of-2), which hsmd signs too.  Same permissions.
-msgtype,hsmd_sign_asset_commitment_tx,4100
-msgdata,hsmd_sign_asset_commitment_tx,peer_id,node_id,
-msgdata,hsmd_sign_asset_commitment_tx,channel_dbid,u64,
-msgdata,hsmd_sign_asset_commitment_tx,tx,bitcoin_tx,
-msgdata,hsmd_sign_asset_commitment_tx,remote_funding_key,pubkey,
-msgdata,hsmd_sign_asset_commitment_tx,commit_num,u64,
-msgdata,hsmd_sign_asset_commitment_tx,asset,channel_asset,
-
-msgtype,hsmd_sign_asset_remote_commitment_tx,4101
-msgdata,hsmd_sign_asset_remote_commitment_tx,tx,bitcoin_tx,
-msgdata,hsmd_sign_asset_remote_commitment_tx,remote_funding_key,pubkey,
-msgdata,hsmd_sign_asset_remote_commitment_tx,remote_per_commit,pubkey,
-msgdata,hsmd_sign_asset_remote_commitment_tx,option_static_remotekey,bool,
-msgdata,hsmd_sign_asset_remote_commitment_tx,commit_num,u64,
-msgdata,hsmd_sign_asset_remote_commitment_tx,num_htlcs,u16,
-msgdata,hsmd_sign_asset_remote_commitment_tx,htlcs,hsm_htlc,num_htlcs
-msgdata,hsmd_sign_asset_remote_commitment_tx,feerate,u32,
-msgdata,hsmd_sign_asset_remote_commitment_tx,asset,channel_asset,
-
-msgtype,hsmd_sign_asset_mutual_close_tx,4102
-msgdata,hsmd_sign_asset_mutual_close_tx,tx,bitcoin_tx,
-msgdata,hsmd_sign_asset_mutual_close_tx,remote_funding_key,pubkey,
-msgdata,hsmd_sign_asset_mutual_close_tx,asset,channel_asset,
-
-# The reply to all three: the funding input's and the fee reserve's.
-msgtype,hsmd_sign_asset_tx_reply,4200
-msgdata,hsmd_sign_asset_tx_reply,sig,bitcoin_signature,
-msgdata,hsmd_sign_asset_tx_reply,fee_reserve_sig,bitcoin_signature,
+# A commitment or mutual close tx may also spend the output right after the
+# funding one, to the same 2-of-2 (an asset channel's fee reserve,
+# common/channel_asset.h).  The usual message signs input 0; this one signs
+# that input 1, SIGHASH_ALL.  peer_id (required) and channel_dbid say whose
+# funding key for the master only: a channel's own client signs for its
+# channel, and sends no peer_id.  Replies with hsmd_sign_tx_reply.
+msgtype,hsmd_sign_funding_sibling_input,4100
+msgdata,hsmd_sign_funding_sibling_input,peer_id,?node_id,
+msgdata,hsmd_sign_funding_sibling_input,channel_dbid,u64,
+msgdata,hsmd_sign_funding_sibling_input,tx,bitcoin_tx,
+msgdata,hsmd_sign_funding_sibling_input,remote_funding_key,pubkey,
 
 # channeld asks HSM to sign splice tx.
 msgtype,hsmd_sign_splice_tx,29

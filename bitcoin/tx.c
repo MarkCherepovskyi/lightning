@@ -20,6 +20,13 @@ struct bitcoin_tx_output *new_tx_output(const tal_t *ctx,
 	return output;
 }
 
+/* Elements: in @asset (33-byte explicit tag; NULL means the chain's fee
+ * asset). */
+static struct wally_tx_output *wally_tx_output_asset(const tal_t *ctx,
+						     const u8 *script,
+						     struct amount_sat amount,
+						     const u8 *asset);
+
 struct wally_tx_output *wally_tx_output(const tal_t *ctx,
 					const u8 *script,
 					struct amount_sat amount)
@@ -27,10 +34,10 @@ struct wally_tx_output *wally_tx_output(const tal_t *ctx,
 	return wally_tx_output_asset(ctx, script, amount, NULL);
 }
 
-struct wally_tx_output *wally_tx_output_asset(const tal_t *ctx,
-					      const u8 *script,
-					      struct amount_sat amount,
-					      const u8 *asset)
+static struct wally_tx_output *wally_tx_output_asset(const tal_t *ctx,
+						     const u8 *script,
+						     struct amount_sat amount,
+						     const u8 *asset)
 {
 	u64 satoshis = amount.satoshis; /* Raw: wally API */
 	struct wally_tx_output *output;

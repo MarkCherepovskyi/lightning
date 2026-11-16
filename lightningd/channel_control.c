@@ -1818,8 +1818,9 @@ bool peer_start_channeld(struct channel *channel,
 	struct bitcoin_txid txid;
 
 	/* Asset channels need the asset channel plugin (which sets the
-	 * feature bit): it keeps them from forwarding into another asset and
-	 * pays for their sweeps. */
+	 * feature bit): it holds payments to their invoices to the invoice's
+	 * asset and reroutes forwards within an asset (core funds their
+	 * sweeps, and refuses forwards into another asset itself). */
 	if (channel->asset
 	    && !feature_offered(ld->our_features->bits[INIT_FEATURE],
 				OPT_CHANNEL_ASSET)) {

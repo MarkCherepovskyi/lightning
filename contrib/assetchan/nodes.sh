@@ -94,7 +94,7 @@ start)
 		--bitcoin-rpcuser="${userpass%:*}" \
 		--bitcoin-rpcpassword="${userpass#*:}" \
 		--bitcoin-cli="$dir/elements-cli" \
-		--plugin="$here/assetchan.py" \
+		--important-plugin="$here/assetchan.py" \
 		--assetchan-asset="$CHANNEL_ASSET" \
 		--assetchan-elements-rpc="$rpc" \
 		--assetchan-elements-wallet="$wallet" \

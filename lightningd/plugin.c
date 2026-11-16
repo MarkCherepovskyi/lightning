@@ -12,6 +12,7 @@
 #include <ccan/utf8/utf8.h>
 #include <common/configvar.h>
 #include <common/deprecation.h>
+#include <common/features.h>
 #include <common/json_command.h>
 #include <common/jsonrpc_io.h>
 #include <common/memleak.h>
@@ -1753,6 +1754,26 @@ static const char *plugin_parse_getmanifest_response(const char *buffer,
 				    plugin->dynamic,
 				    featurestok->end - featurestok->start,
 				    buffer + featurestok->start);
+		}
+
+		/* Asset channels (common/channel_asset.h) rest on their plugin
+		 * checking what core can't (an invoice's asset): only one
+		 * lightningd can't outlive may offer them.  Another's bits are
+		 * dropped (the node runs on, without asset channels). */
+		for (int i = 0; i < ARRAY_SIZE(fset->bits); i++) {
+			size_t len = tal_bytelen(fset->bits[i]);
+
+			if (plugin->important
+			    || !feature_offered(fset->bits[i], OPT_CHANNEL_ASSET))
+				continue;
+			log_unusual(plugin->log,
+				    "Asset channels (feature %u) may only be"
+				    " offered by an important-plugin: ignoring"
+				    " it", OPT_CHANNEL_ASSET);
+			for (u32 b = OPT_CHANNEL_ASSET; b <= OPT_CHANNEL_ASSET + 1; b++) {
+				if (b / 8 < len)
+					fset->bits[i][len - 1 - b / 8] &= ~(1 << (b % 8));
+			}
 		}
 
 		if (!feature_set_or(ld->our_features, fset)) {

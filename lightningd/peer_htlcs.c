@@ -5,6 +5,7 @@
 #include <channeld/channeld_wiregen.h>
 #include <common/amount.h>
 #include <common/blinding.h>
+#include <common/channel_asset.h>
 #include <common/ecdh.h>
 #include <common/json_command.h>
 #include <common/json_parse.h>
@@ -833,10 +834,13 @@ struct channel *best_channel(struct lightningd *ld,
 		if (!amount_msat_greater(spendable, best_spendable))
 			continue;
 
-		/* Don't override if fees differ... */
+		/* Don't override if fees differ, or the asset
+		 * (common/channel_asset.h) does... */
 		if (hint) {
 			if (hint->feerate_base != channel->feerate_base
 			    || hint->feerate_ppm != channel->feerate_ppm)
+				continue;
+			if (!channel_asset_eq(hint->asset, channel->asset))
 				continue;
 		}
 
@@ -879,6 +883,26 @@ static void forward_htlc(struct htlc_in *hin,
 		}
 	} else
 		next = NULL;
+
+	/* Asset channels (common/channel_asset.h): a forward leaves in the
+	 * asset it arrived in, whatever a plugin told us.  The asset channel
+	 * plugin picks the right channel; this keeps the rule when it
+	 * didn't (another plugin's forward_to, or it is gone). */
+	if (next && !channel_asset_eq(hin->key.channel->asset, next->asset)) {
+		log_unusual(hin->key.channel->log,
+			    "Not forwarding HTLC %"PRIu64" from asset %s"
+			    " to channel %s in asset %s",
+			    hin->key.id,
+			    hin->key.channel->asset
+			    ? fmt_channel_asset(tmpctx,
+						hin->key.channel->asset->tag)
+			    : "(chain's coin)",
+			    fmt_channel_id(tmpctx, &next->cid),
+			    next->asset
+			    ? fmt_channel_asset(tmpctx, next->asset->tag)
+			    : "(chain's coin)");
+		next = NULL;
+	}
 
 	/* Unknown peer, or peer not ready. */
 	if (!next || !channel_state_can_add_htlc(next->state)) {

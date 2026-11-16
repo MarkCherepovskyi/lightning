@@ -68,6 +68,7 @@
 #include <lightningd/closed_channel.h>
 #include <lightningd/connect_control.h>
 #include <lightningd/gossip_control.h>
+#include <hsmd/hsmd_wiregen.h>
 #include <lightningd/hsm_control.h>
 #include <lightningd/io_loop_with_timers.h>
 #include <lightningd/lightningd.h>
@@ -1307,6 +1308,16 @@ int main(int argc, char *argv[])
 	trace_span_start("hsmd_init", ld);
 	ld->bip32_base = hsm_init(ld);
 	trace_span_end(ld);
+
+	/*~ Asset channels (common/channel_asset.h), which a plugin offers,
+	 * need the signer to sign their fee reserve input: an external
+	 * signer that can't should stop us now, not at the first asset
+	 * commitment. */
+	if (feature_offered(ld->our_features->bits[INIT_FEATURE],
+			    OPT_CHANNEL_ASSET)
+	    && !hsm_capable(ld, WIRE_HSMD_SIGN_FUNDING_SIBLING_INPUT))
+		fatal("asset channels need an HSM capable of signing"
+		      " hsmd_sign_funding_sibling_input!");
 
 	/*~ We have bearer tokens called `runes` you can use to control access.  They have
 	 * a fascinating history which I shall not go into now, but they're derived from

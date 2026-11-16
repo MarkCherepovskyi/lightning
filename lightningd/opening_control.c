@@ -409,6 +409,7 @@ static void opening_funder_finished(struct subd *openingd, const u8 *resp,
 					   &funding,
 					   &feerate,
 					   &fc->uc->our_config.channel_reserve,
+					   &fc->uc->our_config.max_accepted_htlcs,
 					   &remote_upfront_shutdown_script,
 					   &type)) {
 		log_broken(fc->uc->log,
@@ -535,6 +536,7 @@ static void opening_fundee_finished(struct subd *openingd,
 				     &feerate,
 				     cast_const2(u8 **, &fwd_msg),
 				     &uc->our_config.channel_reserve,
+				     &uc->our_config.max_accepted_htlcs,
 				     &local_upfront_shutdown_script,
 				     &remote_upfront_shutdown_script,
 				     &type)) {
@@ -1058,6 +1060,23 @@ bool peer_start_openingd(struct peer *peer, struct peer_fd *peer_fd)
 	return true;
 }
 
+/* Elements: is this PSET output blinded, or to be blinded? */
+static bool psbt_output_blinded(const struct wally_psbt_output *out)
+{
+	size_t len;
+
+	if (wally_psbt_output_get_blinding_public_key_len(out, &len) != WALLY_OK
+	    || len)
+		return true;
+	if (wally_psbt_output_get_value_commitment_len(out, &len) != WALLY_OK
+	    || len)
+		return true;
+	if (wally_psbt_output_get_asset_commitment_len(out, &len) != WALLY_OK
+	    || len)
+		return true;
+	return false;
+}
+
 static struct command_result *json_fundchannel_complete(struct command *cmd,
 							const char *buffer,
 							const jsmntok_t *obj UNNEEDED,
@@ -1141,6 +1160,16 @@ static struct command_result *json_fundchannel_complete(struct command *cmd,
 					    "asset channel: output %zu"
 					    " must pay the fee reserve"
 					    " to the channel too", reserve);
+		/* A PSET output still shows its explicit asset and amount
+		 * when it is to be blinded (or was): the peer's funding watch
+		 * would never accept it, and our commitments couldn't spend
+		 * it. */
+		for (size_t i = *funding_txout_num; i <= reserve; i++) {
+			if (psbt_output_blinded(&funding_psbt->outputs[i]))
+				return command_fail(cmd, FUNDING_PSBT_INVALID,
+						    "asset channel: output %zu"
+						    " must not be blinded", i);
+		}
 		amt = wally_psbt_output_get_amount(&funding_psbt->outputs
 						   [*funding_txout_num]);
 		if (amt.value == 0
@@ -1364,10 +1393,11 @@ static struct command_result *param_asset(struct command *cmd,
 {
 	*asset = channel_asset_from_hex(cmd, buffer + tok->start,
 					tok->end - tok->start);
-	if (*asset)
+	if (*asset && channel_asset_tag_valid(*asset, tal_bytelen(*asset)))
 		return NULL;
 	return command_fail_badparam(cmd, name, buffer, tok,
-				     "should be a 32-byte asset id");
+				     "should be a 32-byte asset id, not the"
+				     " chain's fee asset");
 }
 
 static struct command_result *json_fundchannel_start(struct command *cmd,
@@ -1626,7 +1656,8 @@ static struct channel *stub_chan(struct command *cmd,
 				 struct shachain shachain,
 				 struct basepoints their_basepoint,
 				 enum side opener,
-				 u16 remote_to_self_delay)
+				 u16 remote_to_self_delay,
+				 const struct tlv_scb_tlvs_asset_channel *asset_channel)
 {
 	struct basepoints basepoints;
 	struct bitcoin_signature *sig;
@@ -1793,6 +1824,19 @@ static struct channel *stub_chan(struct command *cmd,
 	/* We don't want to gossip about this, ever. */
 	channel->channel_gossip = tal_free(channel->channel_gossip);
 
+	/* Asset channel: its asset and fee reserve shape every tx of it,
+	 * and our side goes to its close script (an address of the asset
+	 * wallet), not to our wallet, which can't hold the asset. */
+	if (asset_channel) {
+		channel->asset = channel_asset_new(channel,
+						   asset_channel->asset.tag,
+						   asset_channel->asset.fee_reserve);
+		tal_free(channel->shutdown_scriptpubkey[LOCAL]);
+		channel->shutdown_scriptpubkey[LOCAL]
+			= tal_dup_talarr(channel, u8,
+					 asset_channel->close_script);
+	}
+
 	return channel;
 }
 
@@ -1863,6 +1907,19 @@ static struct command_result *json_recoverchannel(struct command *cmd,
 			&_localfundingpubkey);
 		}
 
+		/* Asset channel (common/channel_asset.h)? */
+		const struct tlv_scb_tlvs_asset_channel *asset_channel
+			= scb_chan->tlvs ? scb_chan->tlvs->asset_channel : NULL;
+		if (asset_channel
+		    && (!chainparams->is_elements
+			|| !channel_asset_tag_valid(asset_channel->asset.tag,
+						    sizeof(asset_channel->asset.tag)))) {
+			log_broken(cmd->ld->log, "SCB for %s: not an asset"
+				   " channel we can restore here",
+				   fmt_channel_id(tmpctx, &scb_chan->cid));
+			continue;
+		}
+
 		struct lightningd *ld = cmd->ld;
 		struct channel *channel= stub_chan(cmd,
 						   scb_chan->id,
@@ -1875,7 +1932,8 @@ static struct command_result *json_recoverchannel(struct command *cmd,
 						   chain,
 						   basepoints,
 						   opener,
-						   remote_to_self_delay);
+						   remote_to_self_delay,
+						   asset_channel);
 
 		/* Returns NULL only when channel already exists, so we skip over it. */
 		if (channel == NULL)

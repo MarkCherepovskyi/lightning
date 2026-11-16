@@ -2059,6 +2059,18 @@ static struct command_result *json_injectpaymentonion(struct command *cmd,
 					    fmt_node_id(tmpctx, &nid));
 	}
 
+	/* A blinded path that starts at us picks our first channel itself,
+	 * from its creator's encrypted data, not from our router (which keeps
+	 * a payment in its asset, common/channel_asset.h). Nothing asked to
+	 * pay in that channel's asset, so never send there: a payee could
+	 * otherwise make us pay N units of a valuable asset for an invoice of
+	 * N units of another. */
+	if (payload->path_key && next->asset)
+		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+				    "Blinded path starting at us leaves over"
+				    " asset channel %s: refused",
+				    fmt_channel_id(tmpctx, &next->cid));
+
 	if (amount_msat_greater(payload->amt_to_forward, next->htlc_maximum_msat)
 	    || amount_msat_less(payload->amt_to_forward, next->htlc_minimum_msat)) {
 		/* Are we in old-range grace-period? */

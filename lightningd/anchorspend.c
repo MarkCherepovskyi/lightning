@@ -136,9 +136,12 @@ struct anchor_details *create_anchor_details(const tal_t *ctx,
 	if (!channel_type_has_anchors(channel->type))
 		return tal_free(adet);
 
-	/* Asset channel commitments pay their fee from the fee reserve, and
-	 * this doesn't build Elements transactions (no fee output). */
-	if (channel->asset)
+	/* This doesn't build Elements transactions (P2TR change, no fee
+	 * output).  Upstream has no anchors on Elements; here a plugin can
+	 * turn them on (asset channels, whose commitments pay their fee
+	 * from the fee reserve, and then ordinary L-BTC channels get them
+	 * too): their commitments pay their own fee, unbumped. */
+	if (chainparams->is_elements)
 		return tal_free(adet);
 
 	if (!hsm_capable(ld, WIRE_HSMD_SIGN_ANCHORSPEND)) {

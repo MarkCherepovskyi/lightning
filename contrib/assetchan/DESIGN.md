@@ -104,8 +104,12 @@ Explicit (unblinded) outputs only.
   `to_remote`, HTLCs in the asset (BOLT 3 anchor-era scripts unchanged); anchors 330 sat
   L-BTC each (BOLT 3 rules); explicit fee output = reserve − anchors. **No fee is taken
   from the asset balances; `update_fee` is a no-op; no change output.** The opener picks
-  a small reserve (plugin default 2,000 sat; Liquid's floor is 0.1 sat/vB, so ≥ 1,000 sat
-  covers the largest commitment; anchors + CPFP cover urgency).
+  a small reserve (plugin default 2,000 sat). The commitment's fee is the same whatever it
+  carries, so core caps the HTLCs to what it pays for at Elements' 0.1 sat/vB relay floor
+  (`asset_commit_max_htlcs`; an explicit HTLC output is ~78 vB): each side accepts at most
+  half (2,000 sat: 164 in all, 82 each; 1,000 sat: 36), and a peer asking for more is
+  refused. Both channel reserves must be at least the dust limit, so a commitment always
+  has a direct output to take whatever the HTLC outputs don't pay out.
 - **HTLC txs**: upstream anchors behaviour (zero fee, `SIGHASH_SINGLE|ANYONECANPAY`,
   broadcaster adds wallet L-BTC); output 0 carries the asset tag.
 - **Mutual close**: legacy `closing_signed` only (`option_simple_close` is skipped for
@@ -117,28 +121,43 @@ Explicit (unblinded) outputs only.
   asset amounts (its L-BTC outputs, anchors and fee, stay out of the channel's
   asset-denominated account). Every asset output we own (`to_local` after CSV,
   `to_remote`, HTLC outputs and HTLC-tx outputs, penalties), and each of our HTLC txs,
-  is spent by a zero-fee transaction: the asset output is input 0 and goes in full to
-  output 0 (the channel's close script, or the HTLC-tx output for HTLC txs), signed
-  `SIGHASH_SINGLE|ANYONECANPAY` (hsmd does so for any input not in the fee asset; HTLC
-  txs already are, by both sides). Core doesn't broadcast it: it hands it to the plugin
-  in the `asset_sweep` notification (with its earliest block and deadline), and the
-  plugin adds an L-BTC input of elementsd's wallet, change back to it and the fee
-  output, has elementsd sign its input, broadcasts, and rebroadcasts every block at a
-  higher fee as the deadline nears (capped by `assetchan-max-sweep-fee`), until the
-  asset output is spent on chain. `to_remote` is swept the same way, from the
-  `onchaind_add_utxo` notification upstream hands the wallet (which can't hold
-  assets). Anchors:
-  `anchorspend.c` is off for asset channels (the commitment pays its own fee; it isn't
-  Elements-aware).
+  is spent by a transaction whose input 0 is the asset output, going in full to output
+  0 (the channel's close script, or the HTLC-tx output for HTLC txs); L-BTC from CLN's
+  own wallet pays the fee (more inputs, P2WPKH change back to the wallet, the explicit
+  fee output), at most the channel's fee reserve per tx. Core builds, signs (SIGHASH_ALL;
+  HTLC txs keep BOLT 3's SIGHASH_SINGLE|ANYONECANPAY from both sides on their HTLC
+  input), broadcasts and rebuilds it every block at the feerate its deadline calls for,
+  the upstream sweep and HTLC-tx paths (`consider_onchain_rebroadcast`,
+  `consider_onchain_htlc_tx_rebroadcast`, `wallet_utxo_boost`), until it is mined;
+  without L-BTC in the wallet it logs that and retries every block. `to_remote` is
+  swept the same way, from the `onchaind_add_utxo` notification upstream hands the
+  wallet (which can't hold assets); onchaind doesn't wait for that sweep, so
+  lightningd keeps the channel (and the sweep's rebroadcasting) until it is mined, even
+  once onchaind is done with everything else. The fee cap ignores deadline urgency
+  (penalties), and dust change goes to the fee, so a fee can exceed the cap by up to
+  the dust limit. No plugin is on this path. (An earlier version had
+  the plugin fund sweeps from elementsd, through SIGHASH_SINGLE|ANYONECANPAY signatures
+  and an `asset_sweep` notification; reviewers showed that exposes penalties to
+  replacement cycling and drops sweeps when the plugin is down, so it went.) Anchors:
+  `anchorspend.c` is off on Elements (it builds no Elements transactions). The plugin's
+  anchors bit is node-wide, so ordinary L-BTC channels between plugin nodes are anchor
+  channels too: their commitments pay their own fee, unbumped, and their zero-fee HTLC
+  txs get wallet L-BTC from the upstream rebroadcast path (P2WPKH change, explicit fee).
 - **Invariants**: one asset per channel (core). A forward leaves in the asset it arrived
   in: the plugin's `htlc_accepted` hook keeps core's outgoing channel (`forward_to`) if
   it is in that asset, else picks the peer's channel in that asset with the same fees
-  that can send the most, else fails it `unknown_next_peer`. Core starts no asset
-  channel without the plugin's feature bit (`peer_start_channeld`), so this can't be
-  skipped by running without the plugin.
-- **Operational**: every node holding asset channels needs some unblinded L-BTC in its
-  elementsd wallet (the plugin pays sweeps and HTLC txs with it; CLN's own wallet needs
-  none) and sets a close address (its elementsd wallet) so swept assets are spendable.
+  that can send the most, else fails it `unknown_next_peer`; core enforces the rule
+  itself too (`forward_htlc` fails a forward into another asset whatever `forward_to` a
+  plugin returned, and `best_channel` never swaps to a channel in another asset), so it
+  holds even if another plugin's hook has the last word or the plugin is gone. At the
+  final hop the plugin checks only HTLCs that pay an invoice of ours (no invoice: core,
+  or a swap plugin, decides). Core starts no asset channel without the plugin's feature
+  bit (`peer_start_channeld`), and the plugin runs only as an `important-plugin` (it
+  disables itself otherwise, which drops the bit), so lightningd stops if it dies.
+- **Operational**: every node holding asset channels needs some L-BTC in CLN's own
+  wallet (`newaddr`, then fund it: core pays sweep and HTLC-tx fees with it) and some
+  unblinded L-BTC in its elementsd wallet (to fund opens), and sets a close address
+  (its elementsd wallet) so swept assets are spendable.
 
 ## 4. CLN core delta ("small improvements")
 
@@ -146,12 +165,12 @@ Explicit (unblinded) outputs only.
 |---|---|---|---|---|
 | C1 | Channel asset identity: feature bit (set by the plugin); TLVs; `channel->asset`, `fee_reserve`; DB columns; `channeld/closingd/onchaind` init fields; `fundchannel_start asset= fee_reserve=`; `listpeerchannels.asset`, `fee_reserve_msat`; `openchannel` hook payload fields; `common/channel_asset.[ch]` (from `common/liquid_asset.c`) | `wire/peer_wire.csv`, `common/features.[ch]`, `openingd/*`, `lightningd/{options,channel,opening_control,peer_control,channel_control,closing_control}.c`, `wallet/{wallet,migrations}.c`, `*_wire.csv`, `doc/schemas` | 450 | daemons must know the asset |
 | C2 | Asset tags on channel tx outputs; fee computation counts only the fee asset; tx parser reads asset amounts instead of asserting L-BTC | `bitcoin/{tx,psbt,tx_parts}.c`, `common/{initial_commit_tx,htlc_tx,close_tx}.c`, `channeld/commit_tx.c` | 150 | tx builders live in daemons |
-| C3 | Reserve input + second signature + `hsmd` signing both inputs; `sign_last_tx`. hsmd gets its own messages for asset channels (`hsmd_sign_asset_commitment_tx`, `_asset_remote_commitment_tx`, `_asset_mutual_close_tx`, reply `hsmd_sign_asset_tx_reply`), with the permissions of their upstream siblings, so ordinary channels and external signers see upstream's messages unchanged | `openingd`, `channeld`, `closingd`, `hsmd/{hsmd,libhsmd}.c`, `hsmd_wire.csv`, `lightningd/peer_control.c` | 400 | protocol + signer |
+| C3 | Reserve input + second signature + `hsmd` signing both inputs; `sign_last_tx`. Input 0 is signed with upstream's messages, which accept a tx that also spends the funding output's next sibling; input 1 with one generic message, `hsmd_sign_funding_sibling_input` (SIGHASH_ALL, input 1 must spend the output after input 0's; hsmd knows nothing of assets), so ordinary channels and external signers see upstream's messages unchanged | `openingd`, `channeld`, `closingd`, `hsmd/{hsmd,libhsmd}.c`, `hsmd_wire.csv`, `lightningd/peer_control.c` | 400 | protocol + signer |
 | C4 | Anchors on Elements come from the plugin's feature bits (no core change); skip fee subtraction; fee output = reserve − anchors; ignore `update_fee` | `channeld/{commit_tx,channeld}.c` | 30 | |
-| C5 | Asset sweeps: `onchaind_tx_unsigned` builds a zero-fee 1-in-1-out spend (asset in → asset out to the close script), hsmd signs inputs not in the fee asset `SIGHASH_SINGLE\|ANYONECANPAY`, and lightningd hands it and our HTLC txs to the plugin (`asset_sweep` notification) instead of broadcasting; `to_remote` swept from the upstream `add_utxo` notification; `anchorspend` off. Funding, broadcast and fee bumping: the plugin | `lightningd/{onchain_control,notification}.c`, `hsmd/libhsmd.c`, `onchaind/onchaind.c`, `lightningd/anchorspend.c` | 250 | `onchaind` + channel keys |
+| C5 | Asset sweeps: `onchaind_tx_unsigned` builds the asset-in → asset-out spend plus L-BTC wallet inputs, change and fee (capped at the fee reserve), all signed SIGHASH_ALL (hsmd allows wallet inputs next to an asset input); HTLC txs get wallet L-BTC on the upstream path; core broadcasts and bumps both; `to_remote` swept from the upstream `add_utxo` notification; `anchorspend` off | `lightningd/onchain_control.c`, `hsmd/libhsmd.c`, `onchaind/onchaind.c`, `lightningd/anchorspend.c` | 450 | `onchaind` + channel keys + fee safety |
 | C6 | `fundchannel_complete` verifies output n (asset, amount, explicit) and n+1 (L-BTC, reserve); funding watch by asset | `lightningd/opening_control.c`, `lightningd/watch.c` | 60 | safety |
 | C7 | `liquid-testnet` chainparams | `bitcoin/chainparams.c` | 35 | |
-| C8 | Gossip can verify an asset channel: the block scan records every explicit P2WSH output (any asset, its units as the amount) in the utxoset and filtered blocks, and `fundchannel_start` no longer insists on `announce=false` | `lightningd/{chaintopology,bitcoind,opening_control}.c` | 10 | gossip verification is in lightningd |
+| ~~C8~~ | (Reverted on `feat/clean-up`.) Gossip verification of asset channels: recording every explicit P2WSH output, any asset, as "sats" let anyone back fake-capacity announcements with a self-issued asset, on every node of the fork. Asset channels are private again; the plugin refuses `announce=true` and offers of announced ones | — | 0 | |
 
 Target was ≈ 1,500 lines (vs 4,370 on `liquid-merged`). **Measured** (`git diff --stat
 master`, 2026-11-05, without `contrib/assetchan`, the pytest and the generated
@@ -237,10 +256,8 @@ build context and in `run-tests.sh`.
   asset, else `fail` with `temporary_channel_failure` (no `channel_update`): the payer
   then disables the channel it used for the last hop and tries other paths, where
   `incorrect_or_unknown_payment_details` would make it give up on the invoice.
-- **Notifications**: `invoice_payment` (drop datastore entry); `asset_sweep` and
-  `block_added`: fund, broadcast and bump core's asset sweeps (`assetchan-sweeps` lists
-  them). Elements transactions are spliced with a small codec in `elements.py`
-  (elementsd signs only our L-BTC input; core's witness goes back on input 0). Runs as `important-plugin`; loaded before `htlcs_resubmit`
+- **Notifications**: `invoice_payment` (drop datastore entry). The plugin has no part
+  in sweeps (core funds them from its own wallet, §3). Runs as `important-plugin`; loaded before `htlcs_resubmit`
   (`lightningd/lightningd.c:1422-1437`).
 
 ## 6. POC
@@ -318,31 +335,72 @@ Reuse map (`git show liquid-merged:<path>`): `common/liquid_asset.[ch]`,
   explicit `createpsbt` flow, §5); `fundchannel_complete` accepts the PSET (verified on
   liquid-regtest); `createinvoice` preserving an unknown tagged field (v2 invoices).
 - Fixed fee wastes reserve − anchors on every close: acceptable at 2,000 sat; a change
-  output to the opener (as on the branch) is a later refinement. Core only requires
-  reserve > 660 sat (the anchors); whether the rest relays is the plugin's policy
-  (`assetchan-min-fee-reserve`), so a node must not accept reserves below Liquid's
-  relay floor for the largest commitment it allows.
-- The affordability checks (`full_channel.c`, `channeld`, `openingd`) still reserve
-  660 "sat" for anchors out of the opener's balance; on an asset channel those are asset
-  units the opener can't spend. Harmless, but wrong by 660 units; a later cleanup.
+  output to the opener (as on the branch) is a later refinement. That the commitment
+  relays with every HTLC it can carry is core's (see §3, HTLC cap).
+- The anchors (660 sat) come out of the fee reserve, never the asset balances: the
+  affordability checks in `full_channel.c`, `channeld`, `openingd/common.c` and
+  `lightningd/peer_control.c` skip them for asset channels.
 - Dust limit / `htlc_minimum` are negotiated in "satoshis" but mean asset units:
   plugin policy per asset later.
-- **Gossip** (`test_gossip`). Announced asset channels propagate like any other once
-  lightningd's block scan keeps explicit asset outputs for gossip verification (C8; before
-  it, every node rejected the announcement with "no unspent txout"): the 2-of-2 script
-  matches and the amount read is the asset's units, so every node lists them with
-  capacity = units and nothing in
-  `channel_announcement`/`channel_update` says which asset they are in; private ones are
-  reachable only through the invoice's hints. The plugin tells gossiped channels apart by
-  their funding output's asset tag and keeps its per-asset askrene layers accordingly, so
-  `assetchan-pay` (in an asset or in `lbtc`) is routed over the right channels at once.
-  A payer without the plugin (or plain `xpay`) may take an asset path for an L-BTC
-  payment when gossip makes it look cheapest: its units travel asset-to-asset through
-  the intermediates, the recipient's hook fails the HTLC as a temporary failure of the
-  last channel, and the payer routes around it (one failed part); a wrong-asset forward
-  is refused by the plugin (`unknown_next_peer`), so funds never cross assets. A node with no
-  channel in the asset cannot pay an asset invoice at all. Proper per-asset gossip (an
-  asset in `channel_update`, or a `channel_announcement` TLV) stays a later core PR; until
-  then announcing asset channels is a choice (`assetchan-open announce=true`), default off.
+- **Gossip** (`test_gossip`). Asset channels are never announced: nothing in
+  `channel_announcement`/`channel_update` says which asset a channel is in, and counting
+  asset units as capacity (the reverted C8) let any self-issued asset fake capacity. So
+  gossip is all L-BTC; an asset payment goes over the payer's own asset channels and the
+  invoice's route hints (`assetchan-invoice` adds them), which the plugin's per-asset
+  askrene layer (`assetchan-layer`) leaves enabled while disabling everything else. A
+  payer without the plugin can't stray onto asset channels it doesn't know. Proper
+  per-asset gossip (an asset in `channel_update`, or a `channel_announcement` TLV, and the
+  asset kept in the utxoset) stays a later core PR.
 - Upstream review will ask about TLV numbers, the reserve, and anchors on Elements;
   the plugin is unaffected by whichever protocol detail changes.
+
+## 8. Clean-up (`feat/clean-up`, 2026-11-12)
+
+Reviewed by three models independently (and the hook question by four); what changed:
+
+- Core, generic bug fixes (upstreamable on their own): the `htlc_accepted`/`peer_connected`
+  hook staying "in use" after a chain-ending answer (`plugin_hook.c`); onchaind replay
+  dropping a tx that spends two watched outputs when onchaind wanted only one
+  (`onchain_control.c`, `test_onchaind_replay_tx_spending_two_watched`); a use-after-free
+  when a plugin rejects `openchannel2_changed`/`_sign` (`dual_open_control.c`).
+- Core, asset delta made fail-closed and smaller: forwards can't cross assets (above);
+  C8 reverted; `anchorspend` off on all of Elements; hsmd signs to-us txs only with one
+  input again (a `SIGHASH_SINGLE` signature on an input without an output commits to no
+  outputs) for ordinary channels; a channel's asset must be an explicit tag and not
+  L-BTC (`channel_asset_tag_valid`, checked by `fundchannel_start` and the fundee).
+- Sweeps (decided after a second, four-model review of plugin hooks, which rejected a
+  plugin-declared funding check outright and found plugin-funded sweeps unsafe as built):
+  core funds asset sweeps and asset HTLC txs from CLN's own L-BTC wallet, signed
+  SIGHASH_ALL, and bumps them itself; the `asset_sweep` notification, hsmd's
+  SINGLE|ANYONECANPAY override for asset inputs, and the plugin's sweep code (and
+  `elements.py`'s tx codec) are gone.
+- Plugin: must run as `important-plugin`; final-hop check only for our invoices (after
+  `keysend`); unknown channel = refuse; `assetchan-layer` (used by assetswap too);
+  `assetchan-open`/`-pay` run in threads so the HTLC hook isn't held up; no gossip
+  scanning of elementsd; no sweep code.
+- Second pass (ten-model review of what more could leave core; `simplify/CONSOLIDATED`):
+  about 1,100-1,500 core lines can't, while one node holds several Liquid assets and
+  Elements has no package relay (the reserve input and its signatures, asset tags, the
+  fundee's funding check, the start guard); a generic "channel tx profile" or moving the
+  negotiation behind plugin-owned TLVs (H1) only renames that and grows core, so neither
+  was done. Done: the HTLC cap above; reserves ≥ dust; the 660 deductions; one generic
+  hsmd message for input 1 instead of four asset ones; assetswap takes new swaps only as
+  an important plugin. Kept on purpose: `fundchannel_complete`'s asset/reserve checks
+  (without them a raw-RPC opener could lock funds in a funding tx no commitment can
+  spend) and onchaind's per-channel asset (moving its accounting out isn't simpler).
+- Static channel backups (`staticbackup`, `emergency.recover`, peer storage) carry an
+  asset channel's asset, fee reserve and close script (`scb_tlvs.asset_channel`, even
+  type 4242: a node that can't restore an asset channel refuses rather than restore it
+  as an ordinary one). `recoverchannel` rebuilds the stub as an asset channel, so when
+  the peer closes, core sweeps our asset to the old close address (fee from the CLN
+  wallet; `test_recover_asset_channel`). Restoring one also needed an upstream onchaind
+  fix: grinding for a lease-CSV `to_remote`/`to_local` on an output it couldn't place
+  overwrote the expected script, so a later output that was ours went unrecognised
+  (always possible on a restored stub, which can't place the peer's `to_local`).
+- Third pass (found while documenting, `contrib/assets-vault/`): every signature of ours is
+  `SIGHASH_ALL`, HTLC txs and HTLC claims off the peer's commitment included (upstream
+  `efdfcc6da`, ported: wallet inputs are added before signing, and our HTLC-tx input is
+  signed again on every fee bump); asset channels hand watchtowers no penalty tx (upstream's
+  can't spend an asset output); hsmd advertises `hsmd_sign_funding_sibling_input` and
+  lightningd won't start offering asset channels with a signer that lacks it; closingd has no
+  "trimmed" close variant for asset channels; `payassetinvoice` waits until leg 1 settles.

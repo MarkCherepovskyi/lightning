@@ -17,6 +17,7 @@
 #include <common/fee_states.h>
 #include <common/initial_channel.h>
 #include <common/channel_asset.h>
+#include <common/initial_commit_tx.h>
 #include <common/memleak.h>
 #include <common/peer_billboard.h>
 #include <common/peer_failed.h>
@@ -273,6 +274,23 @@ static void set_remote_upfront_shutdown(struct state *state,
 		peer_failed_err(state->pps, &state->channel_id, "%s", err);
 }
 
+/* Asset channels: accept only as many HTLCs as half of what the fee
+ * reserve pays for (the peer does the same), so the commitment always pays
+ * the relay floor (see check_config_bounds). */
+static void limit_asset_htlcs(struct state *state)
+{
+	size_t half = asset_commit_max_htlcs(state->asset) / 2;
+
+	if (state->localconf.max_accepted_htlcs > half) {
+		status_debug("Asset channel: fee reserve %s pays for %zu HTLCs:"
+			     " accepting %zu, not %u",
+			     fmt_amount_sat(tmpctx, state->asset->fee_reserve),
+			     half * 2, half,
+			     state->localconf.max_accepted_htlcs);
+		state->localconf.max_accepted_htlcs = half;
+	}
+}
+
 /* We start the 'open a channel' negotation with the supplied peer, but
  * stop when we get to the part where we need the funding txid */
 static u8 *funder_channel_start(struct state *state, u8 channel_flags,
@@ -337,6 +355,7 @@ static u8 *funder_channel_start(struct state *state, u8 channel_flags,
 					   "Asset channels need option_anchors");
 			return NULL;
 		}
+		limit_asset_htlcs(state);
 	}
 
 	/* If they use the same settings as us, would we fail?  If so, do that now. */
@@ -613,32 +632,33 @@ static void sign_remote_commitment(const tal_t *ctx,
 					    OPT_STATIC_REMOTEKEY);
 	struct bitcoin_signature reserve_sig;
 	const u8 *msg;
-	bool ok;
 
 	/* No htlcs, so commit_num and feerate are 0. */
-	if (state->asset)
-		msg = towire_hsmd_sign_asset_remote_commitment_tx(NULL, tx,
-					remote_fundingkey, remote_point,
-					static_remotekey, 0, NULL, 0,
-					state->asset);
-	else
-		msg = towire_hsmd_sign_remote_commitment_tx(NULL, tx,
+	msg = towire_hsmd_sign_remote_commitment_tx(NULL, tx,
 					remote_fundingkey, remote_point,
 					static_remotekey, 0, NULL, 0);
 	wire_sync_write(HSM_FD, take(msg));
-
 	msg = wire_sync_read(tmpctx, HSM_FD);
-	if (state->asset)
-		ok = fromwire_hsmd_sign_asset_tx_reply(msg, sig, &reserve_sig);
-	else
-		ok = fromwire_hsmd_sign_tx_reply(msg, sig);
-	if (!ok)
+	if (!fromwire_hsmd_sign_tx_reply(msg, sig))
 		status_failed(STATUS_FAIL_HSM_IO,
 			      "Bad sign_remote_commitment_tx reply %s",
 			      tal_hex(tmpctx, msg));
-	*fee_reserve_sig = state->asset
-		? tal_dup(ctx, secp256k1_ecdsa_signature, &reserve_sig.s)
-		: NULL;
+
+	/* Asset channels: and the fee reserve input (input 1). */
+	*fee_reserve_sig = NULL;
+	if (state->asset) {
+		msg = towire_hsmd_sign_funding_sibling_input(NULL, NULL, 0,
+							     tx,
+							     remote_fundingkey);
+		wire_sync_write(HSM_FD, take(msg));
+		msg = wire_sync_read(tmpctx, HSM_FD);
+		if (!fromwire_hsmd_sign_tx_reply(msg, &reserve_sig))
+			status_failed(STATUS_FAIL_HSM_IO,
+				      "Bad sign_funding_sibling_input reply %s",
+				      tal_hex(tmpctx, msg));
+		*fee_reserve_sig = tal_dup(ctx, secp256k1_ecdsa_signature,
+					   &reserve_sig.s);
+	}
 }
 
 static bool funder_finalize_channel_setup(struct state *state,
@@ -920,6 +940,7 @@ static u8 *funder_channel_complete(struct state *state)
 					   &state->funding,
 					   state->feerate_per_kw,
 					   state->localconf.channel_reserve,
+					   state->localconf.max_accepted_htlcs,
 					   state->upfront_shutdown_script[REMOTE],
 					   state->channel_type);
 }
@@ -990,7 +1011,8 @@ static u8 *fundee_channel(struct state *state, const u8 *open_channel_msg)
 			return NULL;
 		}
 		if (!chainparams->is_elements
-		    || tal_bytelen(open_tlvs->channel_asset) != ELEMENTS_ASSET_LEN
+		    || !channel_asset_tag_valid(open_tlvs->channel_asset,
+						tal_bytelen(open_tlvs->channel_asset))
 		    || !open_tlvs->fee_reserve) {
 			negotiation_failed(state,
 					   "Bad asset channel request");
@@ -1132,6 +1154,9 @@ static u8 *fundee_channel(struct state *state, const u8 *open_channel_msg)
 		return NULL;
 	}
 
+	if (state->asset)
+		limit_asset_htlcs(state);
+
 	/* These checks are the same whether we're opener or accepter... */
 	if (!check_config_bounds(tmpctx, state->funding_sats,
 				 state->feerate_per_kw,
@@ -1205,6 +1230,20 @@ static u8 *fundee_channel(struct state *state, const u8 *open_channel_msg)
 	if (reserve != NULL) {
 		set_reserve_absolute(state, state->remoteconf.dust_limit,
 				     *reserve);
+		/* An asset channel's reserves stay at least both dust
+		 * limits (check_config_bounds, above, and
+		 * channel_asset_finish_tx rely on it), whatever the
+		 * openchannel hook asked for. */
+		if (state->asset) {
+			struct amount_sat dust
+				= state->remoteconf.dust_limit;
+
+			if (amount_sat_greater(state->localconf.dust_limit, dust))
+				dust = state->localconf.dust_limit;
+			if (amount_sat_greater(dust,
+					       state->localconf.channel_reserve))
+				state->localconf.channel_reserve = dust;
+		}
 	}
 
 	/* OK, we accept! */
@@ -1439,6 +1478,7 @@ static u8 *fundee_channel(struct state *state, const u8 *open_channel_msg)
 				     state->feerate_per_kw,
 				     msg,
 				     state->localconf.channel_reserve,
+				     state->localconf.max_accepted_htlcs,
 				     state->upfront_shutdown_script[LOCAL],
 				     state->upfront_shutdown_script[REMOTE],
 				     state->channel_type);

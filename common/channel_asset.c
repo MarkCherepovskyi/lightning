@@ -6,6 +6,7 @@
 #include <ccan/str/hex/hex.h>
 #include <common/channel_asset.h>
 #include <common/utils.h>
+#include <wally_script.h>
 #include <wire/wire.h>
 #include <stdlib.h>
 #include <string.h>
@@ -19,6 +20,14 @@ struct channel_asset *channel_asset_new(const tal_t *ctx,
 	memcpy(asset->tag, tag, sizeof(asset->tag));
 	asset->fee_reserve = fee_reserve;
 	return asset;
+}
+
+bool channel_asset_tag_valid(const u8 *tag, size_t len)
+{
+	if (len != ELEMENTS_ASSET_LEN || tag[0] != 0x01)
+		return false;
+	return !chainparams->fee_asset_tag
+		|| !memeq(tag, len, chainparams->fee_asset_tag, ELEMENTS_ASSET_LEN);
 }
 
 bool channel_asset_eq(const struct channel_asset *a,
@@ -106,6 +115,25 @@ bool check_fee_reserve_sig(struct bitcoin_tx *tx,
 		return false;
 	return psbt_input_set_signature(tx->psbt, 1, their_funding_pubkey,
 					&bsig);
+}
+
+int channel_asset_add_burn(struct bitcoin_tx *tx,
+			   const struct channel_asset *asset,
+			   struct amount_sat burned)
+{
+	u8 *script;
+
+	if (amount_sat_is_zero(burned))
+		return -1;
+	script = tal_arr(tmpctx, u8, 1);
+	script[0] = OP_RETURN;
+	return bitcoin_tx_add_asset_output(tx, script, NULL, burned,
+					   asset->tag);
+}
+
+bool channel_asset_is_burn(const struct wally_tx_output *out)
+{
+	return out->script_len == 1 && out->script[0] == OP_RETURN;
 }
 
 void channel_asset_finish_tx(struct bitcoin_tx *tx,

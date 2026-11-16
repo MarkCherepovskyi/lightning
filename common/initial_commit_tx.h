@@ -77,6 +77,12 @@ static inline struct amount_sat commit_tx_base_fee(const struct channel_asset *a
 						   option_anchors_zero_fee_htlc_tx));
 }
 
+/* Asset channels (common/channel_asset.h): the most untrimmed HTLC outputs
+ * a commitment can carry while its fixed fee (the fee reserve minus the
+ * anchors) still pays Elements' default relay floor; 0 if it can't even
+ * with none. */
+size_t asset_commit_max_htlcs(const struct channel_asset *asset);
+
 /**
  * initial_commit_tx: create (unsigned) commitment tx to spend the funding tx output
  * @ctx: context to allocate transaction and @htlc_map from.

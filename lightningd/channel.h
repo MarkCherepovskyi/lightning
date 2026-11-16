@@ -225,6 +225,13 @@ struct channel {
 	/* Height we're replaying at (if onchaind_replay_watches set) */
 	u32 onchaind_replay_height;
 
+	/* Asset channels: our to_remote outputs we sweep ourselves, not yet
+	 * seen spent (onchaind doesn't wait for them), and whether onchaind
+	 * is done with everything else: we only forget the channel, and stop
+	 * rebuilding those sweeps, once they are spent. */
+	struct bitcoin_outpoint *asset_sweeps;
+	bool forget_after_asset_sweeps;
+
 	/* Our original funds, in funding amount */
 	struct amount_sat our_funds;
 

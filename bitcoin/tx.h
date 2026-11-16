@@ -126,13 +126,6 @@ struct wally_tx_output *wally_tx_output(const tal_t *ctx,
 					const u8 *script,
 					struct amount_sat amount);
 
-/* Elements: as above, but in @asset (33-byte explicit tag; NULL means the
- * chain's fee asset). */
-struct wally_tx_output *wally_tx_output_asset(const tal_t *ctx,
-					      const u8 *script,
-					      struct amount_sat amount,
-					      const u8 *asset);
-
 /* Add one output to tx. */
 int bitcoin_tx_add_output(struct bitcoin_tx *tx, const u8 *script,
 			  const u8 *wscript,

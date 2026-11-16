@@ -1,6 +1,7 @@
 #include <bitcoin/tx.h>
 #include <ccan/crypto/shachain/shachain.h>
 #include <common/amount.h>
+#include <common/channel_asset.h>
 #include <common/channel_id.h>
 #include <common/channel_type.h>
 #include <common/derive_basepoints.h>
@@ -17,6 +18,13 @@ tlvtype,scb_tlvs,opener,5,
 tlvdata,scb_tlvs,opener,opener,enum side,
 tlvtype,scb_tlvs,remote_to_self_delay,7,
 tlvdata,scb_tlvs,remote_to_self_delay,remote_to_self_delay,u16,
+# Asset channels (common/channel_asset.h): the asset and fee reserve, without
+# which no transaction of the channel can be rebuilt, and the script our
+# side goes to (the wallet can't hold the asset).  Even: a node that can't
+# restore an asset channel must refuse, not restore it as an ordinary one.
+tlvtype,scb_tlvs,asset_channel,4242,
+tlvdata,scb_tlvs,asset_channel,asset,channel_asset,
+tlvdata,scb_tlvs,asset_channel,close_script,u8,...
 
 # legacy_scb_chan stores min. info required to sweep the peer's force close.
 subtype,legacy_scb_chan

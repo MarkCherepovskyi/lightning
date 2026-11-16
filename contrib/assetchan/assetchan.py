@@ -12,23 +12,30 @@ plugin does the rest, with an elementsd wallet holding the assets:
   and, like `assetchan-open` and `assetchan-close`, makes our side of a
   channel close to an address of that wallet, so swept assets are spendable;
 - `assetchan-invoice` ties an invoice to an asset, and the `htlc_accepted`
-  hook refuses payments that arrive in another one;
-- `assetchan-pay` pays over channels in the invoice's asset only: gossip
-  doesn't say which asset a channel is in, so the plugin reads it off the
-  funding output (`assetchan-listchannels` shows that) and keeps an askrene
-  layer per asset;
-- after a unilateral close, core hands us each spend of an asset output of
-  ours (`asset_sweep`), signed but paying no fee: the plugin adds L-BTC from
-  elementsd to pay it, broadcasts it and bumps its fee until it confirms
-  (`assetchan-sweeps` lists them).
+  hook refuses payments that arrive in another one, and forwards that would
+  leave in another asset (core refuses those too);
+- `assetchan-pay` pays over channels in the invoice's asset only, through an
+  askrene layer per asset (`assetchan-layer`): asset channels are never
+  announced, so every gossiped channel is an ordinary L-BTC one, and an
+  asset payment goes over our own channels and the invoice's route hints;
+- after a unilateral close, core sweeps our asset outputs to our close
+  address itself, paying the fees with L-BTC from CLN's own wallet (keep
+  some there; elementsd's wallet only funds opens).
+
+It must run as an important plugin (`important-plugin=`), and refuses to
+start otherwise: without it, a node would take asset-channel offers in any
+asset, and payments in the wrong asset.
 
 Amounts are in the asset's base units; on the wire a unit is 1000 msat.
 """
-from elements import ElementsError, ElementsRpc, Tx, TxIn, TxOut, base_units, coins, config_value, rpc_url
-from pyln.client import Plugin, RpcError, RpcException
+from elements import ElementsError, ElementsRpc, base_units, coins, config_value, rpc_url
+from pyln.client import Millisatoshi, Plugin, RpcError, RpcException
 
 import hashlib
 import json
+import os
+import sys
+import threading
 
 # Asset channels' feature bit (common/features.h OPT_CHANNEL_ASSET, odd:
 # optional).  Plugins can only set feature bits at startup.
@@ -43,9 +50,8 @@ plugin = Plugin(dynamic=False,
 plugin.elements = None       # ElementsRpc, built on first use
 plugin.lbtc = None           # L-BTC's asset id
 plugin.invoice_assets = {}   # payment_hash -> asset of that invoice of ours
-plugin.gossip_assets = {}    # gossiped scid -> asset of its funding output (None: can't tell)
 plugin.layers = {}           # askrene layer we created -> scids disabled in it
-plugin.sweeps = {}           # 'txid:vout' an asset sweep spends -> its state
+plugin.layers_lock = threading.Lock()
 
 LBTC = 'lbtc'                           # the "asset" of an ordinary channel
 INVOICE_KEY = ['assetchan', 'invoice']  # datastore: + [payment_hash] -> asset
@@ -77,9 +83,15 @@ def rpc_password(cfg):
     path, _, linenum = opt.get('source', '').rpartition(':')
     if not path or not linenum.isdigit():
         return None
-    with open(path) as f:
-        line = f.read().splitlines()[int(linenum) - 1]
-    return line.split('=', 1)[1].strip()
+    try:
+        with open(path) as f:
+            line = f.read().splitlines()[int(linenum) - 1]
+        key, sep, value = line.partition('=')
+    except (OSError, IndexError):
+        return None
+    if not sep or key.strip() != 'bitcoin-rpcpassword':
+        return None
+    return value.strip()
 
 
 def elements(plugin):
@@ -187,37 +199,6 @@ def our_channels(plugin):
     return plugin.rpc.listpeerchannels()['channels']
 
 
-def gossiped_channel_asset(plugin, scid):
-    """The asset a gossiped channel is in: gossip doesn't say, its funding
-    output's asset tag does (read from elementsd, cached).  'lbtc' for an
-    ordinary channel, None if we can't tell (cached too, when the output
-    is gone or has no tag; not when elementsd failed)."""
-    if scid in plugin.gossip_assets:
-        return plugin.gossip_assets[scid]
-    try:
-        height, index, outnum = (int(x) for x in scid.split('x'))
-        ed = elements(plugin)
-        txid = ed.call('getblock', ed.call('getblockhash', height), 1)['tx'][index]
-        out = ed.call('gettxout', txid, outnum, False)
-    except (ElementsError, IndexError, ValueError, KeyError) as e:
-        plugin.log("can't tell the asset of channel {}: {}".format(scid, e), 'info')
-        return None
-    asset = None
-    if out and 'asset' in out:
-        asset = LBTC if out['asset'] == lbtc_asset(plugin) else out['asset']
-    plugin.gossip_assets[scid] = asset
-    return asset
-
-
-def gossiped_assets(plugin, chans):
-    """scid -> asset (None if we can't tell) for listchannels' `chans`,
-    forgetting the channels gossip no longer has."""
-    scids = {c['short_channel_id'] for c in chans}
-    for scid in set(plugin.gossip_assets) - scids:
-        del plugin.gossip_assets[scid]
-    return {scid: gossiped_channel_asset(plugin, scid) for scid in scids}
-
-
 def find_channel(plugin, id):
     """The one channel `id` names (channel id, scid, alias, or a peer with a
     single channel), or None."""
@@ -252,11 +233,23 @@ def allowed_assets(plugin):
 
 
 def channel_asset(plugin, scid, channels=None):
-    """The asset of our channel with this scid (or local alias)."""
+    """The asset of our channel with this scid (or local alias), or None if
+    we have no such channel: callers must then refuse, not guess."""
     for c in channels if channels is not None else our_channels(plugin):
         if scid in (c.get('short_channel_id'), c.get('alias', {}).get('local')):
             return c.get('asset', LBTC)
-    return LBTC
+    return None
+
+
+def in_background(request, fn, *args, **kwargs):
+    """Run a method that waits on elementsd or on a payment in a thread of
+    its own, so our hooks (htlc_accepted!) aren't held up meanwhile."""
+    def run():
+        try:
+            request.set_result(fn(*args, **kwargs))
+        except Exception as e:
+            request.set_exception(e)
+    threading.Thread(target=run, name=request.method, daemon=True).start()
 
 
 # ------------------------------------------------------------------ methods
@@ -273,13 +266,24 @@ def cancel_funding(plugin, peer_id, inputs):
             plugin.log(str(e), level='warn')
 
 
-@plugin.method('assetchan-open')
-def assetchan_open(plugin, id, amount, asset, fee_reserve=None, announce=False, close_to=None):
+@plugin.async_method('assetchan-open')
+def assetchan_open(plugin, request, id, amount, asset, fee_reserve=None, announce=False,
+                   close_to=None):
     """Open a channel to (connected) peer {id} holding {amount} units of
     {asset}, funded by elementsd's wallet, with {fee_reserve} sat of L-BTC
     next to it for on-chain fees (default assetchan-default-fee-reserve).
-    Our side closes to {close_to} (default: a fresh address of that wallet)."""
+    Our side closes to {close_to} (default: a fresh address of that wallet).
+    Asset channels are private: gossip can't say which asset a channel is
+    in, so {announce} must stay false."""
+    in_background(request, open_channel, plugin, id, amount, asset, fee_reserve, announce,
+                  close_to)
+
+
+def open_channel(plugin, id, amount, asset, fee_reserve, announce, close_to):
     check_asset(asset)
+    if announce:
+        raise RpcException('asset channels are private (announce=false): gossip'
+                           " can't say which asset a channel is in")
     amount = int(amount)
     if fee_reserve is None:
         fee_reserve = plugin.get_option('assetchan-default-fee-reserve')
@@ -289,7 +293,7 @@ def assetchan_open(plugin, id, amount, asset, fee_reserve=None, announce=False, 
     ed = elements(plugin)
     lbtc = lbtc_asset(plugin)
 
-    params = {'id': id, 'amount': amount, 'announce': bool(announce),
+    params = {'id': id, 'amount': amount, 'announce': False,
               'asset': asset, 'fee_reserve': fee_reserve}
     if close_to:
         params['close_to'] = close_to
@@ -376,22 +380,19 @@ def assetchan_send(plugin, addr, asset, amount):
 
 @plugin.method('assetchan-listchannels')
 def assetchan_listchannels(plugin, asset=None):
-    """The gossiped channels with the asset each is in ('lbtc' for an
-    ordinary channel; from the funding output, as gossip doesn't say),
-    only those in {asset} if given."""
+    """The gossiped channels with the asset each is in, only those in
+    {asset} if given.  Asset channels are never announced, and core only
+    takes announcements whose funding output is L-BTC, so every gossiped
+    channel is an ordinary one ('lbtc')."""
     if asset is not None:
         check_asset_or_lbtc(asset)
-    out = []
-    chans = plugin.rpc.listchannels()['channels']
-    assets = gossiped_assets(plugin, chans)
-    for c in chans:
-        found = assets[c['short_channel_id']]
-        if asset is None or found == asset:
-            out.append({'short_channel_id': c['short_channel_id'],
-                        'direction': c['direction'], 'source': c['source'],
-                        'destination': c['destination'],
-                        'amount_msat': c['amount_msat'], 'asset': found})
-    return {'channels': out}
+    if asset not in (None, LBTC):
+        return {'channels': []}
+    return {'channels': [{'short_channel_id': c['short_channel_id'],
+                          'direction': c['direction'], 'source': c['source'],
+                          'destination': c['destination'],
+                          'amount_msat': c['amount_msat'], 'asset': LBTC}
+                         for c in plugin.rpc.listchannels()['channels']]}
 
 
 @plugin.method('assetchan-newaddr')
@@ -426,53 +427,88 @@ def assetchan_invoice(plugin, amount, asset, label, description, expiry=None):
     one): it must be paid over a channel in that asset, and it hints at our
     channels in it."""
     check_asset_or_lbtc(asset)
-    inv = plugin.rpc.invoice(int(amount) * 1000, label, description, expiry=expiry,
-                             exposeprivatechannels=asset_hints(plugin, asset))
-    plugin.rpc.datastore(key=INVOICE_KEY + [inv['payment_hash']], string=asset,
-                         mode='create-or-replace')
-    plugin.invoice_assets[inv['payment_hash']] = asset
+    hints = asset_hints(plugin, asset)
+    # The asset is noted before the invoice exists, so an invoice of ours
+    # can never be paid while we'd take it for an L-BTC one (a failed
+    # datastore write after the invoice would have left exactly that).
+    preimage = os.urandom(32)
+    payment_hash = hashlib.sha256(preimage).hexdigest()
+    plugin.rpc.datastore(key=INVOICE_KEY + [payment_hash], string=asset,
+                         mode='must-create')
+    plugin.invoice_assets[payment_hash] = asset
+    try:
+        inv = plugin.rpc.invoice(int(amount) * 1000, label, description, expiry=expiry,
+                                 preimage=preimage.hex(), exposeprivatechannels=hints)
+    except Exception:
+        plugin.invoice_assets.pop(payment_hash, None)
+        plugin.rpc.deldatastore(key=INVOICE_KEY + [payment_hash])
+        raise
     inv['asset'] = asset
     return inv
 
 
 def asset_layer(plugin, asset):
-    """The askrene layer `assetchan.<asset>`: every channel we know to be
-    in another asset disabled (ours, and the gossiped ones by their funding
-    output), so a payment in `asset` is only routed over channels in it."""
+    """The askrene layer `assetchan.<asset>`: every channel known to be in
+    another asset disabled, so a payment in `asset` is only routed over
+    channels in it.  Those are our channels in other assets (by scid and
+    local alias) and, for an asset other than L-BTC, every gossiped
+    channel: asset channels are never announced, so gossip is all L-BTC.
+    (The invoice's route hints, which askrene adds, stay usable.)"""
     layer = 'assetchan.' + asset
-    disabled = plugin.layers.get(layer)
-    if disabled is None:
-        layers = plugin.rpc.call('askrene-listlayers', {})['layers']
-        if layer not in [lay['layer'] for lay in layers]:
-            plugin.rpc.call('askrene-create-layer', {'layer': layer, 'persistent': False})
-        disabled = plugin.layers[layer] = set()
+    with plugin.layers_lock:
+        disabled = plugin.layers.get(layer)
+        if disabled is None:
+            layers = plugin.rpc.call('askrene-listlayers', {})['layers']
+            if layer not in [lay['layer'] for lay in layers]:
+                plugin.rpc.call('askrene-create-layer', {'layer': layer, 'persistent': False})
+            disabled = plugin.layers[layer] = set()
 
-    def disable(scid):
-        if scid in disabled:
-            return
-        for direction in (0, 1):
-            plugin.rpc.call('askrene-update-channel',
-                            {'layer': layer, 'enabled': False,
-                             'short_channel_id_dir': '{}/{}'.format(scid, direction)})
-        disabled.add(scid)
+        def disable(scid):
+            if scid in disabled:
+                return
+            for direction in (0, 1):
+                plugin.rpc.call('askrene-update-channel',
+                                {'layer': layer, 'enabled': False,
+                                 'short_channel_id_dir': '{}/{}'.format(scid, direction)})
+            disabled.add(scid)
 
-    for c in our_channels(plugin):
-        # (what askrene calls the channel: its scid, or its local alias)
-        scid = c.get('short_channel_id') or c.get('alias', {}).get('local')
-        if scid is not None and c.get('asset', LBTC) != asset:
-            disable(scid)
-    gossiped = gossiped_assets(plugin, plugin.rpc.listchannels()['channels'])
-    for scid, other in gossiped.items():
-        if other is not None and other != asset:
-            disable(scid)
+        ours = set()
+        for c in our_channels(plugin):
+            names = [n for n in (c.get('short_channel_id'), c.get('alias', {}).get('local'))
+                     if n is not None]
+            ours.update(names)
+            if c.get('asset', LBTC) != asset:
+                for scid in names:
+                    disable(scid)
+        if asset != LBTC:
+            for c in plugin.rpc.listchannels()['channels']:
+                if c['short_channel_id'] not in ours:
+                    disable(c['short_channel_id'])
     return layer
 
 
-@plugin.method('assetchan-pay')
-def assetchan_pay(plugin, bolt11, asset, maxfee=None):
+@plugin.method('assetchan-layer')
+def assetchan_layer(plugin, asset):
+    """The askrene layer (brought up to date) that keeps a payment in
+    {asset} ('lbtc' for an ordinary payment) on channels in that asset."""
+    check_asset_or_lbtc(asset)
+    return {'layer': asset_layer(plugin, asset), 'asset': asset}
+
+
+@plugin.async_method('assetchan-pay')
+def assetchan_pay(plugin, request, bolt11, asset, maxfee=None):
     """Pay {bolt11} in {asset} ('lbtc' for an ordinary payment): xpay, kept
     off every channel known to be in another asset; {maxfee} as xpay's."""
     check_asset_or_lbtc(asset)
+    # bolt11 only: assetchan-invoice makes those, and a BOLT12 invoice's
+    # blinded path could name our first channel itself (core refuses one
+    # starting at us over an asset channel; this says why up front).
+    if plugin.rpc.decode(bolt11).get('type') != 'bolt11 invoice':
+        raise RpcException('assetchan-pay takes a bolt11 invoice')
+    in_background(request, pay, plugin, bolt11, asset, maxfee)
+
+
+def pay(plugin, bolt11, asset, maxfee):
     params = {'invstring': bolt11, 'layers': [asset_layer(plugin, asset)]}
     if maxfee is not None:
         params['maxfee'] = maxfee
@@ -482,6 +518,131 @@ def assetchan_pay(plugin, bolt11, asset, maxfee=None):
 
 
 # -------------------------------------------------------------------- hooks
+# Every payment command that routes for itself, with its params in order
+# (for positional calls).  Those taking askrene layers get ours; the others
+# are rewritten (pay, keysend) or given exclusions (renepay).  A raw
+# sendpay/sendonion names its own first hop, and is the caller's choice.
+XPAY_PARAMS = ['invstring', 'amount_msat', 'maxfee', 'layers', 'retry_for', 'partial_msat',
+               'maxdelay', 'payer_note', 'label', 'localinvreqid']
+LAYERED = {
+    'xpay': XPAY_PARAMS,
+    'xpay-as-pay': XPAY_PARAMS,
+    'sendamount': ['invstring', 'amount_msat', 'maxfee', 'layers', 'retry_for', 'maxdelay',
+                   'payer_note', 'label'],
+    'xkeysend': ['destination', 'amount_msat', 'label', 'maxfee', 'layers', 'retry_for',
+                 'maxdelay', 'extratlvs'],
+}
+PAY_PARAMS = ['bolt11', 'amount_msat', 'label', 'riskfactor', 'maxfeepercent', 'retry_for',
+              'maxdelay', 'exemptfee', 'localinvreqid', 'exclude', 'maxfee', 'description',
+              'partial_msat']
+KEYSEND_PARAMS = ['destination', 'amount_msat', 'label', 'maxfeepercent', 'retry_for', 'maxdelay',
+                  'exemptfee', 'extratlvs', 'routehints', 'maxfee']
+RENEPAY_PARAMS = ['invstring', 'amount_msat', 'maxfee', 'maxdelay', 'retry_for', 'description',
+                  'label', 'exclude']
+PARAMS = {**LAYERED, 'pay': PAY_PARAMS, 'keysend': KEYSEND_PARAMS, 'renepay': RENEPAY_PARAMS}
+# pay's params as xpay-as-pay's (what xpay does when it takes pay over);
+# riskfactor and description it ignores too.
+PAY_AS_XPAY = {'bolt11': 'invstring', 'invstring': 'invstring', 'amount_msat': 'amount_msat',
+               'label': 'label', 'retry_for': 'retry_for', 'maxdelay': 'maxdelay',
+               'localinvreqid': 'localinvreqid', 'maxfee': 'maxfee', 'partial_msat': 'partial_msat'}
+KEYSEND_AS_XKEYSEND = {k: k for k in ('destination', 'amount_msat', 'label', 'retry_for',
+                                      'maxdelay', 'extratlvs', 'maxfee')}
+
+
+def fee_as_maxfee(plugin, params, out, amount):
+    """pay's and keysend's maxfeepercent/exemptfee (defaults 0.5% and
+    5000 msat) as a maxfee, as xpay does when it takes pay over."""
+    if 'maxfeepercent' in params or 'exemptfee' in params:
+        if 'maxfee' in params:
+            raise RpcException('maxfee and maxfeepercent/exemptfee: use one or the other')
+        amount = int(Millisatoshi(amount))
+        pct = float(params.get('maxfeepercent', 0.5))
+        exempt = int(Millisatoshi(params.get('exemptfee', 5000)))
+        out['maxfee'] = max(exempt, int(amount * pct / 100))
+    return out
+
+
+def pay_as_xpay(plugin, params):
+    """pay's params as xpay-as-pay's."""
+    if params.get('exclude'):
+        raise RpcException("pay's exclude is not supported with asset channels: use xpay's layers")
+    out = {PAY_AS_XPAY[k]: v for k, v in params.items() if k in PAY_AS_XPAY}
+    amount = params.get('amount_msat')
+    if amount is None and ('maxfeepercent' in params or 'exemptfee' in params):
+        amount = plugin.rpc.decode(out['invstring'])['amount_msat']
+    return fee_as_maxfee(plugin, params, out, amount)
+
+
+def keysend_as_xkeysend(plugin, params):
+    """keysend's params as xkeysend's (which takes layers)."""
+    if params.get('routehints'):
+        raise RpcException("keysend's routehints are not supported with asset channels: use xkeysend")
+    out = {KEYSEND_AS_XKEYSEND[k]: v for k, v in params.items() if k in KEYSEND_AS_XKEYSEND}
+    return fee_as_maxfee(plugin, params, out, params['amount_msat'])
+
+
+def asset_exclusions(plugin):
+    """Both directions of each of our asset channels (scid and local
+    alias), as renepay's `exclude` takes them."""
+    out = []
+    for c in our_channels(plugin):
+        if c.get('asset', LBTC) == LBTC:
+            continue
+        for scid in (c.get('short_channel_id'), c.get('alias', {}).get('local')):
+            if scid is not None:
+                out += ['{}/0'.format(scid), '{}/1'.format(scid)]
+    return out
+
+
+def named(params, names):
+    """Positional params as named ones.  More than we know the names of
+    (a newer version's, or a dev_ one) is refused: we can't tell what
+    they do to the route."""
+    if isinstance(params, dict):
+        return dict(params)
+    if len(params) > len(names):
+        raise RpcException('{} positional parameters: pass them by name'.format(len(params)))
+    return {n: v for n, v in zip(names, params) if v is not None}
+
+
+# Before xpay, which takes `pay` (and `keysend`) over by replacing it with
+# an xpay command that no other rpc_command hook sees: ours wins.
+@plugin.hook('rpc_command', filters=list(PARAMS), before=['cln-xpay'])
+def on_rpc_command(plugin, rpc_command, **kwargs):
+    """A plain payment is an L-BTC payment: keep it off our asset channels,
+    which would otherwise carry N units of their asset for an invoice of N
+    sat, 1:1 (to a payee with an asset channel to us, say).  A command that
+    names an assetchan layer (assetchan-pay, payassetinvoice) already says
+    which asset it pays in, and is left alone.  `pay` and `keysend` become
+    xpay's `xpay-as-pay` and `xkeysend` with the L-BTC layer (what xpay does
+    with them anyway, but its own takeover would skip every later hook);
+    renepay gets our asset channels excluded.  Anything we can't vouch for
+    is refused: fail closed."""
+    method = rpc_command.get('method')
+    try:
+        params = named(rpc_command.get('params') or {}, PARAMS[method])
+        if method in LAYERED:
+            layers = list(params.get('layers') or [])
+            if any(lay.startswith('assetchan.') for lay in layers):
+                return {'result': 'continue'}
+            params['layers'] = layers + [asset_layer(plugin, LBTC)]
+        elif method == 'pay':
+            params = pay_as_xpay(plugin, params)
+            params['layers'] = [asset_layer(plugin, LBTC)]
+            rpc_command = {**rpc_command, 'method': 'xpay-as-pay'}
+        elif method == 'keysend':
+            params = keysend_as_xkeysend(plugin, params)
+            params['layers'] = [asset_layer(plugin, LBTC)]
+            rpc_command = {**rpc_command, 'method': 'xkeysend'}
+        else:   # renepay
+            params['exclude'] = list(params.get('exclude') or []) + asset_exclusions(plugin)
+    except Exception as e:
+        return {'return': {'error': {'code': -32600,
+                                     'message': 'assetchan: cannot keep this payment off asset channels: '
+                                                '{}'.format(e)}}}
+    return {'replace': {**rpc_command, 'jsonrpc': '2.0', 'params': params}}
+
+
 @plugin.hook('openchannel')
 def on_openchannel(plugin, openchannel, **kwargs):
     """Take asset-channel offers in an allowed asset with a sane fee reserve,
@@ -489,6 +650,10 @@ def on_openchannel(plugin, openchannel, **kwargs):
     asset = openchannel.get('asset')
     if asset is None:
         return {'result': 'continue'}
+    if int(openchannel.get('channel_flags', 0)) & 1:
+        return {'result': 'reject',
+                'error_message': "asset channels are private: gossip can't say"
+                                 ' which asset a channel is in'}
     if asset not in allowed_assets(plugin):
         return {'result': 'reject',
                 'error_message': 'asset {} is not one we take channels in'.format(asset)}
@@ -526,17 +691,24 @@ def forward_channel(channels, cid, asset, amount_msat):
     return max(same, key=lambda c: c['spendable_msat'])['channel_id']
 
 
-@plugin.hook('htlc_accepted')
+# After keysend's hook, which makes the invoice a keysend payment pays: we
+# then see that invoice (an ordinary one) like any other.
+@plugin.hook('htlc_accepted', after=['keysend'])
 def on_htlc_accepted(plugin, htlc, onion, forward_to=None, **kwargs):
     """A forward must leave in the asset it arrived in (amounts are in each
     channel's asset: another one would swap them 1:1).  At the final hop
-    the HTLC must arrive in the invoice's asset, that is by a channel in
-    that asset."""
+    an HTLC paying an invoice of ours must arrive in the invoice's asset,
+    that is by a channel in that asset.  (Should this raise, pyln fails
+    the HTLC.)"""
     if 'short_channel_id' in onion or 'next_node_id' in onion:
         if forward_to is None:
             return {'result': 'continue'}  # core fails it: no such channel
         channels = our_channels(plugin)
         asset = channel_asset(plugin, htlc['short_channel_id'], channels)
+        if asset is None:
+            plugin.log('Refusing to forward {}: no channel {} of ours'
+                       .format(htlc['payment_hash'], htlc['short_channel_id']), level='unusual')
+            return {'result': 'fail', 'failure_message': '400a'}  # unknown_next_peer
         cid = forward_channel(channels, forward_to, asset, int(onion['forward_msat']))
         if cid == forward_to:
             return {'result': 'continue'}
@@ -545,7 +717,13 @@ def on_htlc_accepted(plugin, htlc, onion, forward_to=None, **kwargs):
         plugin.log('Refusing to forward {} from {} to channel {}: not in {}'
                    .format(htlc['payment_hash'], htlc['short_channel_id'], forward_to, asset))
         return {'result': 'fail', 'failure_message': '400a'}  # unknown_next_peer
-    want = plugin.invoice_assets.get(htlc['payment_hash'], LBTC)
+    want = plugin.invoice_assets.get(htlc['payment_hash'])
+    if want is None:
+        if not plugin.rpc.listinvoices(payment_hash=htlc['payment_hash'])['invoices']:
+            # No invoice of ours: core fails it, unless another plugin
+            # takes it (a swap provider's leg 1, say).
+            return {'result': 'continue'}
+        want = LBTC   # an ordinary invoice
     got = channel_asset(plugin, htlc['short_channel_id'])
     if got == want:
         return {'result': 'continue'}
@@ -556,171 +734,6 @@ def on_htlc_accepted(plugin, htlc, onion, forward_to=None, **kwargs):
     # that channel (incorrect_or_unknown_payment_details would make them
     # give up on the invoice).
     return {'result': 'fail', 'failure_message': '10070000'}
-
-
-# ------------------------------------------------------------- asset sweeps
-# Core signs each spend of an asset output of ours SIGHASH_SINGLE|ANYONECANPAY
-# (the asset input and its asset output, all of it to our close address)
-# and pays no fee: an asset can't.  We add an L-BTC input of elementsd's
-# wallet, change back to it and the fee output, have elementsd sign its
-# input, and put core's witness back on input 0.  Every block we rebroadcast
-# it, at a higher fee when the deadline gets close, until the asset output
-# is spent on chain (by us, or by the peer where it may).
-
-SWEEP_SEQUENCE = 0xfffffffd   # our L-BTC input signals RBF
-SWEEP_DUST = 546              # smallest L-BTC change worth an output
-
-
-def sweep_feerate(ed, blocks_left):
-    """sat/vB for a sweep that must be mined within blocks_left: what
-    elementsd estimates for that target (or the relay floor without an
-    estimate), doubled for each block inside the last three."""
-    info = ed.call('getmempoolinfo')
-    floor = float(max(info['mempoolminfee'], info['minrelaytxfee'])) * 1e5
-    est = ed.call('estimatesmartfee', max(1, min(1008, blocks_left)))
-    rate = max(floor, float(est['feerate']) * 1e5 if 'feerate' in est else 0)
-    if blocks_left < 3:
-        rate *= 2 ** (3 - max(blocks_left, 0))
-    return rate
-
-
-def lock_coin(ed, coin, lock):
-    """Lock (or unlock) a coin of elementsd's wallet; False if we can't
-    (someone else locked it first, or it's spent already)."""
-    try:
-        ed.call('lockunspent', not lock, [{'txid': coin['txid'], 'vout': coin['vout']}])
-        return True
-    except ElementsError:
-        return False
-
-
-def sweep_coin(plugin, ed, sweep, units):
-    """An unblinded, confirmed L-BTC UTXO of elementsd's wallet worth at
-    least units, kept locked for this sweep (and its fee bumps)."""
-    coin = sweep.get('coin')
-    if coin and coin['units'] >= units:
-        return coin
-    utxos = [u for u in ed.call('listunspent', 1, 9999999, [], False,
-                                {'asset': lbtc_asset(plugin)})
-             if is_explicit(u) and base_units(u['amount']) >= units]
-    if not utxos:
-        return None
-    u = min(utxos, key=lambda u: base_units(u['amount']))
-    new = {'txid': u['txid'], 'vout': u['vout'], 'units': base_units(u['amount'])}
-    if not lock_coin(ed, new, True):
-        return None  # another sweep took it meanwhile: next block
-    if coin:
-        lock_coin(ed, coin, False)
-    sweep['coin'] = new
-    return new
-
-
-def sweep_tx(plugin, ed, sweep, coin, fee):
-    """Core's sweep plus our L-BTC input, change and fee, signed."""
-    core = Tx.parse(sweep['tx'])
-    tx = Tx.parse(sweep['tx'])
-    tx.inputs.append(TxIn(coin['txid'], coin['vout'], SWEEP_SEQUENCE))
-    lbtc = lbtc_asset(plugin)
-    change = coin['units'] - fee
-    tx.outputs = tx.outputs[:1]
-    if change >= SWEEP_DUST:
-        tx.outputs.append(TxOut.explicit(lbtc, change, bytes.fromhex(sweep['change_script'])))
-    else:
-        fee = coin['units']
-    tx.outputs.append(TxOut.explicit(lbtc, fee, b''))
-    signed = Tx.parse(ed.call('signrawtransactionwithwallet', tx.hex())['hex'])
-    if not signed.inputs[1].witness:
-        raise ElementsError('elementsd did not sign our L-BTC input')
-    signed.inputs[0].witness = core.inputs[0].witness
-    return signed, fee
-
-
-def sweep_done(ed, sweep):
-    """Is the asset output it spends spent on chain (by anyone)?"""
-    return ed.call('gettxout', sweep['txid'], sweep['vout'], False) is None
-
-
-def try_sweep(plugin, key):
-    """(Re)broadcast a sweep, at the fee its deadline calls for."""
-    sweep = plugin.sweeps[key]
-    ed = elements(plugin)
-    if sweep_done(ed, sweep):
-        if sweep.get('coin'):
-            lock_coin(ed, sweep['coin'], False)  # if our sweep didn't spend it
-        plugin.log('asset sweep of {} done'.format(key))
-        del plugin.sweeps[key]
-        return
-    height = ed.call('getblockcount')
-    if height + 1 < sweep['minblock']:
-        return
-    rate = sweep_feerate(ed, sweep['deadline'] - height)
-    cap = plugin.get_option('assetchan-max-sweep-fee')
-    # Size it with a guessed fee, then pay for that size.
-    fee = sweep.get('fee', 0)
-    vsize = sweep.get('vsize', 300)
-    want = min(cap, max(int(rate * vsize) + 1, fee))
-    if sweep.get('hex') is None or want > fee:
-        if fee:
-            # A replacement must pay for its own relay on top.
-            want = min(cap, max(want, fee + vsize))
-        coin = sweep_coin(plugin, ed, sweep, want + SWEEP_DUST)
-        if coin is None:
-            plugin.log('asset sweep of {}: no L-BTC UTXO of {} sat in elementsd:'
-                       ' retrying next block'.format(key, want + SWEEP_DUST), level='warn')
-            return
-        tx, paid = sweep_tx(plugin, ed, sweep, coin, want)
-        vsize = tx.vsize()
-        want = min(cap, max(want, int(rate * vsize) + 1))
-        if want > paid:
-            tx, paid = sweep_tx(plugin, ed, sweep, coin, want)
-        sweep.update(hex=tx.hex(), fee=paid, vsize=tx.vsize())
-    try:
-        txid = ed.call('sendrawtransaction', sweep['hex'])
-        if txid != sweep.get('broadcast'):
-            plugin.log('asset sweep of {}: {} paying {} sat'.format(key, txid, sweep['fee']))
-        sweep['broadcast'] = txid
-    except ElementsError as e:
-        if 'already' not in str(e) and 'txn-mempool-conflict' not in str(e):
-            plugin.log('asset sweep of {}: {}'.format(key, e), level='warn')
-
-
-@plugin.subscribe('asset_sweep')
-def on_asset_sweep(plugin, **kwargs):
-    """Core has a spend of an asset output of ours for us to fund."""
-    s = kwargs.get('asset_sweep', kwargs)
-    spent = Tx.parse(s['tx']).inputs[0]
-    key = '{}:{}'.format(spent.txid, spent.vout)
-    old = plugin.sweeps.get(key, {})
-    if old.get('tx') == s['tx']:
-        return  # onchaind asked again (restart, reorg): nothing new
-    plugin.sweeps[key] = {'tx': s['tx'], 'txid': spent.txid, 'vout': spent.vout,
-                          'minblock': s['minblock'], 'deadline': s['deadline'],
-                          'channel_id': s['channel_id'], 'asset': s['asset'],
-                          'coin': old.get('coin'),
-                          'change_script': elements(plugin).call(
-                              'getaddressinfo', new_address(plugin))['scriptPubKey']}
-    try:
-        try_sweep(plugin, key)
-    except (ElementsError, ValueError) as e:
-        plugin.log('asset sweep of {}: {} (retrying next block)'.format(key, e), level='warn')
-
-
-@plugin.subscribe('block_added')
-def on_block_added(plugin, **kwargs):
-    for key in list(plugin.sweeps):
-        try:
-            try_sweep(plugin, key)
-        except (ElementsError, ValueError) as e:
-            plugin.log('asset sweep of {}: {}'.format(key, e), level='warn')
-
-
-@plugin.method('assetchan-sweeps')
-def assetchan_sweeps(plugin):
-    """The asset sweeps we are funding and broadcasting."""
-    return {'sweeps': [{'outpoint': k, 'channel_id': s['channel_id'], 'asset': s['asset'],
-                        'minblock': s['minblock'], 'deadline': s['deadline'],
-                        'txid': s.get('broadcast'), 'fee': s.get('fee')}
-                       for k, s in plugin.sweeps.items()]}
 
 
 # ------------------------------------------------------------ notifications
@@ -736,10 +749,26 @@ def on_invoice_payment(plugin, invoice_payment, **kwargs):
         plugin.log('deldatastore: {}'.format(e), level='warn')
 
 
+def is_important(plugin):
+    """Were we started with important-plugin=?  Then lightningd stops if we
+    die: it never runs asset channels without us (core's guard only checks
+    our feature bit, which outlives us)."""
+    opt = plugin.rpc.listconfigs('important-plugin')['configs'].get('important-plugin', {})
+    paths = opt.get('values_str', [])
+    if 'value_str' in opt:
+        paths = paths + [opt['value_str']]
+    me = os.path.realpath(sys.argv[0])
+    return any(os.path.realpath(p) == me for p in paths)
+
+
 @plugin.init()
 def init(options, configuration, plugin, **kwargs):
     if not configuration['network'].startswith('liquid'):
         return {'disable': 'asset channels only exist on Liquid'}
+    # Disabled, we offer no feature bit, and core starts no asset channel.
+    if not is_important(plugin):
+        return {'disable': 'must run as important-plugin= (asset channels are'
+                           ' unsafe if it stops: unchecked offers and payments)'}
     if not allowed_assets(plugin):
         return {'disable': 'no assetchan-asset configured'}
     try:
@@ -767,9 +796,6 @@ plugin.add_option('assetchan-max-fee-reserve', 10000,
 plugin.add_option('assetchan-default-fee-reserve', 2000,
                   'L-BTC fee reserve (sat) assetchan-open puts up by default',
                   opt_type='int')
-plugin.add_option('assetchan-max-sweep-fee', 20000,
-                  'Most L-BTC (sat) we pay for one sweep of an asset output after a'
-                  ' unilateral close', opt_type='int')
 plugin.add_option('assetchan-close-to', 'elements',
                   "Where our asset goes when a channel closes: a fresh address of"
                   " elementsd's wallet (elements), or whatever core picks (none)")

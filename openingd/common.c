@@ -42,6 +42,49 @@ bool check_config_bounds(const tal_t *ctx,
 		return false;
 	}
 
+	/* Asset channels (common/channel_asset.h): the fee reserve pays the
+	 * commitment's fee, the same whatever it carries.  With enough HTLC
+	 * outputs that's below the relay floor, and the commitment couldn't
+	 * be broadcast (no CPFP on Elements): so every HTLC both sides may
+	 * add must fit. */
+	if (asset) {
+		size_t max = asset_commit_max_htlcs(asset);
+		struct amount_sat dust
+			= amount_sat_greater(remoteconf->dust_limit,
+					     localconf->dust_limit)
+			? remoteconf->dust_limit : localconf->dust_limit;
+
+		/* The asset can't pay fees, so every commitment pays out
+		 * all of it, and what isn't an output tops up a direct
+		 * output (channel_asset_finish_tx): one must always be
+		 * there, which reserves of at least the dust limit make
+		 * sure of. */
+		if (amount_sat_less(remoteconf->channel_reserve, dust)
+		    || amount_sat_less(localconf->channel_reserve, dust)) {
+			*err_reason = tal_fmt(ctx, "asset channel reserves"
+					      " %s and %s must be at least"
+					      " the dust limit %s",
+					      fmt_amount_sat(tmpctx,
+							     remoteconf->channel_reserve),
+					      fmt_amount_sat(tmpctx,
+							     localconf->channel_reserve),
+					      fmt_amount_sat(tmpctx, dust));
+			return false;
+		}
+		if ((size_t)remoteconf->max_accepted_htlcs
+		    + localconf->max_accepted_htlcs > max) {
+			*err_reason = tal_fmt(ctx, "fee reserve %s pays for at"
+					      " most %zu HTLCs, but"
+					      " max_accepted_htlcs is %u + %u",
+					      fmt_amount_sat(tmpctx,
+							     asset->fee_reserve),
+					      max,
+					      remoteconf->max_accepted_htlcs,
+					      localconf->max_accepted_htlcs);
+			return false;
+		}
+	}
+
 	/* BOLT #2:
 	 *
 	 * The receiving node MAY fail the channel if:
@@ -71,8 +114,10 @@ bool check_config_bounds(const tal_t *ctx,
 	 *   - MUST be able to additionally pay for `to_local_anchor` and
 	 *    `to_remote_anchor` above its reserve.
 	 */
-	/* (We simply include in "reserve" here if they opened). */
-	if (option_anchors_zero_fee_htlc_tx
+	/* (We simply include in "reserve" here if they opened).  Asset
+	 * channels: the fee reserve pays them, not the balances, which are
+	 * in the asset. */
+	if (option_anchors_zero_fee_htlc_tx && !asset
 	    && !amount_sat_add(&reserve, reserve, AMOUNT_SAT(660))) {
 		*err_reason = tal_fmt(ctx,
 				      "cannot add anchors to reserve %s",

@@ -229,8 +229,10 @@ struct bitcoin_tx *commit_tx(const tal_t *ctx,
 #endif
 
 	/* Worst-case sizing: both to-local and to-remote outputs, and anchors
-	 * (asset channels also spend the fee reserve). */
-	tx = bitcoin_tx(ctx, chainparams, asset ? 2 : 1, untrimmed + 2 + 2, 0);
+	 * (asset channels also spend the fee reserve, and may burn trimmed
+	 * HTLCs). */
+	tx = bitcoin_tx(ctx, chainparams, asset ? 2 : 1,
+			untrimmed + 2 + 2 + (asset ? 1 : 0), 0);
 
 	/* We keep track of which outputs have which HTLCs */
 	*htlcmap = tal_arr(tx, const struct htlc *, tx->wtx->outputs_allocation_len);
@@ -382,11 +384,28 @@ struct bitcoin_tx *commit_tx(const tal_t *ctx,
 		redeem = NULL;
 	}
 
-	/* Asset channel: the asset leftovers (trimmed HTLCs, rounding) go to
-	 * the opener, not to fees. */
-	if (asset)
+	/* Asset channel: trimmed HTLCs are burned (as on Bitcoin they go to
+	 * fees, which an asset can't pay), and the leftover rounding goes to
+	 * the opener. */
+	if (asset) {
+		struct amount_sat burned = AMOUNT_SAT(0);
+
+		for (size_t i = 0; i < tal_count(htlcs); i++) {
+			if (!trim(htlcs[i], feerate_per_kw, dust_limit,
+				  option_anchor_outputs,
+				  option_anchors_zero_fee_htlc_tx, side))
+				continue;
+			if (!amount_sat_add(&burned, burned,
+					    amount_msat_to_sat_round_down(htlcs[i]->amount)))
+				abort();
+		}
+		if (channel_asset_add_burn(tx, asset, burned) >= 0) {
+			(*htlcmap)[n] = NULL;
+			n++;
+		}
 		channel_asset_finish_tx(tx, asset, funding_sats,
 					outnum[opener], outnum[!opener]);
+	}
 
 	/* BOLT #3:
 	 *

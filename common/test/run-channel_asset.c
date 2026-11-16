@@ -125,6 +125,59 @@ static void test_explicit(void)
 	chainparams = chainparams_for_network("liquid-regtest");
 }
 
+/* An explicit asset with a confidential value is as unknown as a blinded
+ * output: its value commitment is never read as an amount, and its tag
+ * never matches L-BTC (or a channel asset). */
+static void test_confidential_value_amount(void)
+{
+	struct wally_tx_output out;
+	struct amount_asset amt;
+	u8 asset[ELEMENTS_ASSET_LEN], value[33];
+
+	memcpy(asset, chainparams->fee_asset_tag, sizeof(asset));
+	memset(value, 0xff, sizeof(value));
+	memset(&out, 0, sizeof(out));
+	out.asset = asset;
+	out.asset_len = sizeof(asset);
+	out.value = value;
+
+	/* Explicit: 0x01 and 8 bytes big-endian. */
+	value[0] = 0x01;
+	memset(value + 1, 0, 8);
+	value[8] = 0xe8;
+	value[7] = 0x03;
+	out.value_len = 9;
+	amt = wally_tx_output_get_amount(&out);
+	assert(amount_asset_is_main(&amt));
+	assert(amt.value == 1000);
+
+	/* Confidential: a 33-byte commitment, whatever its bytes say. */
+	memset(value, 0xff, sizeof(value));
+	value[0] = 0x08;
+	out.value_len = 33;
+	amt = wally_tx_output_get_amount(&out);
+	assert(!amount_asset_is_main(&amt));
+	assert(amt.value == 0);
+	assert(!channel_asset_tag_eq(amt.asset, chainparams->fee_asset_tag));
+}
+
+static void test_tag_valid(void)
+{
+	u8 tag[ELEMENTS_ASSET_LEN];
+
+	memset(tag, 0x42, sizeof(tag));
+	tag[0] = 0x01;
+	assert(channel_asset_tag_valid(tag, sizeof(tag)));
+	/* Wrong length. */
+	assert(!channel_asset_tag_valid(tag, sizeof(tag) - 1));
+	/* Not explicit (a blinded asset commitment's prefix). */
+	tag[0] = 0x0a;
+	assert(!channel_asset_tag_valid(tag, sizeof(tag)));
+	/* The fee asset is an ordinary channel's, not an asset channel's. */
+	assert(!channel_asset_tag_valid(chainparams->fee_asset_tag,
+					ELEMENTS_ASSET_LEN));
+}
+
 static void test_finish_tx(void)
 {
 	const u8 *tag = channel_asset_from_hex(tmpctx, ID, strlen(ID));
@@ -166,6 +219,23 @@ static void test_finish_tx(void)
 	amt = bitcoin_tx_output_get_amount(tx, 1);
 	assert(amt.value == 39500);
 
+	/* Trimmed HTLCs are burned, not paid to anyone: 900 units of them to
+	 * an OP_RETURN, and only the 100 left (rounding) to the opener. */
+	tx = bitcoin_tx(tmpctx, chainparams, 2, 4, 0);
+	bitcoin_tx_add_asset_output(tx, script, NULL, AMOUNT_SAT(60000), tag);
+	bitcoin_tx_add_asset_output(tx, script, NULL, AMOUNT_SAT(39000), tag);
+	assert(channel_asset_add_burn(tx, asset, AMOUNT_SAT(0)) == -1);
+	assert(channel_asset_add_burn(tx, asset, AMOUNT_SAT(900)) == 2);
+	assert(channel_asset_is_burn(&tx->wtx->outputs[2]));
+	assert(!channel_asset_is_burn(&tx->wtx->outputs[0]));
+	amt = bitcoin_tx_output_get_amount(tx, 2);
+	assert(memeq(amt.asset, ELEMENTS_ASSET_LEN, tag, ELEMENTS_ASSET_LEN) && amt.value == 900);
+	channel_asset_finish_tx(tx, asset, AMOUNT_SAT(100000), 0, 1);
+	amt = bitcoin_tx_output_get_amount(tx, 0);
+	assert(amt.value == 60100);
+	amt = bitcoin_tx_output_get_amount(tx, 1);
+	assert(amt.value == 39000);
+
 	/* The fee reserve sits right after the funding output. */
 	{
 		struct bitcoin_outpoint funding, reserve;
@@ -187,6 +257,8 @@ int main(int argc, char *argv[])
 	test_wire();
 	test_fee_reserve_outpoint();
 	test_explicit();
+	test_confidential_value_amount();
+	test_tag_valid();
 	test_finish_tx();
 
 	common_shutdown();

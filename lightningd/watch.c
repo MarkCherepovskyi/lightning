@@ -496,7 +496,10 @@ bool watch_check_tx_outputs(const struct chain_topology *topo,
 			}
 			/* An asset channel's funding is in the asset. */
 			if (w->expected_asset) {
-				if (!channel_asset_tag_eq(outasset.asset,
+				/* Both explicit: a confidential value can't
+				 * be checked against the funding amount. */
+				if (!elements_output_is_explicit(txout)
+				    || !channel_asset_tag_eq(outasset.asset,
 							  w->expected_asset->tag)) {
 					bad_amount = true;
 					continue;

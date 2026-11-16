@@ -1073,27 +1073,13 @@ static struct bitcoin_signature *calc_commitsigs(const tal_t *ctx,
 	struct pubkey local_htlckey;
 	const u8 *msg;
 	struct bitcoin_signature *htlc_sigs, reserve_sig;
-	bool ok;
 
 	status_debug("calc_commitsigs(%p, %p, %p, %p, %p, %d, %p, %p)",
 		     ctx, peer, txs, funding_wscript, htlc_map,
 		     (int)commit_index, remote_per_commit, commit_sig);
 
 	htlcs = collect_htlcs(tmpctx, htlc_map);
-	/* For asset channels hsmd also signs the fee reserve input, and
-	 * that signature goes to the peer in a TLV. */
-	if (peer->channel->asset)
-		msg = towire_hsmd_sign_asset_remote_commitment_tx(NULL, txs[0],
-						    &remote_funding_pubkey,
-						    remote_per_commit,
-						    channel_has(peer->channel,
-								OPT_STATIC_REMOTEKEY),
-						    commit_index,
-						    htlcs,
-						    channel_feerate(peer->channel, REMOTE),
-						    peer->channel->asset);
-	else
-		msg = towire_hsmd_sign_remote_commitment_tx(NULL, txs[0],
+	msg = towire_hsmd_sign_remote_commitment_tx(NULL, txs[0],
 						    &remote_funding_pubkey,
 						    remote_per_commit,
 						    channel_has(peer->channel,
@@ -1101,20 +1087,27 @@ static struct bitcoin_signature *calc_commitsigs(const tal_t *ctx,
 						    commit_index,
 						    htlcs,
 						    channel_feerate(peer->channel, REMOTE));
-
 	msg = hsm_req(tmpctx, take(msg));
-	if (peer->channel->asset)
-		ok = fromwire_hsmd_sign_asset_tx_reply(msg, commit_sig,
-						       &reserve_sig);
-	else
-		ok = fromwire_hsmd_sign_tx_reply(msg, commit_sig);
-	if (!ok)
+	if (!fromwire_hsmd_sign_tx_reply(msg, commit_sig))
 		status_failed(STATUS_FAIL_HSM_IO,
 			      "Reading sign_remote_commitment_tx reply: %s",
 			      tal_hex(tmpctx, msg));
-	*fee_reserve_sig = peer->channel->asset
-		? tal_dup(ctx, secp256k1_ecdsa_signature, &reserve_sig.s)
-		: NULL;
+
+	/* Asset channels: hsmd also signs the fee reserve input (input 1),
+	 * and that signature goes to the peer in a TLV. */
+	*fee_reserve_sig = NULL;
+	if (peer->channel->asset) {
+		msg = towire_hsmd_sign_funding_sibling_input(NULL, NULL, 0,
+							     txs[0],
+							     &remote_funding_pubkey);
+		msg = hsm_req(tmpctx, take(msg));
+		if (!fromwire_hsmd_sign_tx_reply(msg, &reserve_sig))
+			status_failed(STATUS_FAIL_HSM_IO,
+				      "Reading sign_funding_sibling_input reply: %s",
+				      tal_hex(tmpctx, msg));
+		*fee_reserve_sig = tal_dup(ctx, secp256k1_ecdsa_signature,
+					   &reserve_sig.s);
+	}
 
 	status_debug("Creating commit_sig signature %"PRIu64" %s for tx %s wscript %s key %s",
 		     commit_index,
@@ -2696,7 +2689,12 @@ static u8 *got_revoke_msg(struct peer *peer, u64 revoke_num,
 
 	pbase = penalty_base_by_commitnum(tmpctx, peer, revoke_num);
 
-	if (pbase) {
+	/* Asset channels (common/channel_asset.h): the penalty tx we hand
+	 * watchtowers (commitment_revocation hook) is upstream's 1-in-1-out
+	 * spend paying its fee out of the output, which an output in an
+	 * asset can't do, so none.  Our own penalties are onchaind's, funded
+	 * by lightningd from the wallet. */
+	if (pbase && !peer->channel->asset) {
 		/* DTODO we need penalty tx's per splice candidate */
 		ptx = penalty_tx_create(
 		    NULL, peer->channel, peer->feerate_penalty,
