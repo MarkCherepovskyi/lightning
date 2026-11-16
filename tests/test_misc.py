@@ -3267,7 +3267,13 @@ def test_emergencyrecoverpenaltytxn(node_factory, bitcoind):
     l1.daemon.wait_for_log('Resolved THEIR_REVOKED_UNILATERAL/DELAYED_CHEAT_OUTPUT_TO_THEM by our proposal OUR_PENALTY_TX')
 
     assert(l1.rpc.listfunds()["channels"][0]["state"] == "ONCHAIN")
-    assert(l1.rpc.listfunds()["outputs"][0]["txid"] == txid)
+    # The penalty's output, and our to_remote on their commitment: a stub
+    # can't place their anchor (it doesn't know their funding key), and
+    # onchaind used to lose our to_remote when such an output came first.
+    outputs = l1.rpc.listfunds()["outputs"]
+    assert txid in [o["txid"] for o in outputs]
+    cheat = bitcoind.rpc.getrawtransaction(txid, True)["vin"][0]["txid"]
+    assert cheat in [o["txid"] for o in outputs]
 
 
 @unittest.skipIf(os.getenv('TEST_DB_PROVIDER', 'sqlite3') != 'sqlite3', "deletes database, which is assumed sqlite3")

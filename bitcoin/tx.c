@@ -862,10 +862,18 @@ wally_tx_output_get_amount(const struct wally_tx_output *output)
 		/* We currently only support explicit value
 		 * asset tags, others are confidential, so
 		 * don't even try to assign a value to it. */
-		if (output->asset[0] == 0x01) {
+		if (output->asset[0] == 0x01
+		    && output->value_len == 9 && output->value[0] == 0x01) {
 			memcpy(&raw, output->value + 1, sizeof(raw));
 			amount.value = be64_to_cpu(raw);
 		} else {
+			/* An explicit asset with a confidential value
+			 * (a commitment, not 0x01 + 8 bytes) is as
+			 * unknown to us as a blinded one: never read
+			 * the commitment as an amount, and never let
+			 * the tag match L-BTC or a channel asset. */
+			if (output->asset[0] == 0x01)
+				memset(&amount.asset, 0, sizeof(amount.asset));
 			amount.value = 0;
 		}
 	} else {

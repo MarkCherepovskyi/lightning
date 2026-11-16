@@ -901,6 +901,28 @@ def test_openchannel_hook_chaining(node_factory, bitcoind):
 
 @pytest.mark.openchannel('v1')
 @pytest.mark.openchannel('v2')
+def test_openchannel_hook_close_to_then_another_plugin(node_factory, bitcoind):
+    """The first openchannel hook sets close_to, a second one answers later:
+    the close_to script must outlive that wait (it was parsed onto tmpctx,
+    freed before the hook chain ended, and lightningd crashed using it)."""
+    opts = [{}, {'plugin': [
+        os.path.join(os.getcwd(), 'tests/plugins/openchannel_hook_accepter.py'),
+        os.path.join(os.getcwd(), 'tests/plugins/openchannel_hook_accept.py'),
+    ]}]
+    l1, l2 = node_factory.line_graph(2, fundchannel=False, opts=opts)
+    l1.fundwallet(10**6)
+
+    # 100003sat: openchannel_hook_accepter.py answers with a close_to.
+    l1.rpc.fundchannel(l2.info['id'], 100003)
+    assert l2.daemon.is_in_log("accept on principle")
+    bitcoind.generate_block(6, wait_for_mempool=1)
+    wait_for(lambda: only_one(l2.rpc.listpeerchannels()['channels'])['state'] == 'CHANNELD_NORMAL')
+    assert (only_one(l2.rpc.listpeerchannels()['channels'])['close_to_addr']
+            == 'bcrt1q7gtnxmlaly9vklvmfj06amfdef3rtnrdazdsvw')
+
+
+@pytest.mark.openchannel('v1')
+@pytest.mark.openchannel('v2')
 def test_channel_state_changed_bilateral(node_factory, bitcoind):
     """ We open and close a channel and check notifications both sides.
 
@@ -1270,6 +1292,31 @@ def test_htlc_accepted_hook_replaced_after_fail(node_factory):
         l1.rpc.pay(l2.rpc.invoice(1000, 'second', 'second')['bolt11'])
     assert l2.rpc.listinvoices('second')['invoices'][0]['status'] == 'unpaid'
     assert not l2.daemon.is_in_log('Deferring registration of hook htlc_accepted')
+
+
+def test_peer_connected_hook_replaced_after_disconnect(node_factory):
+    """As test_htlc_accepted_hook_replaced_after_fail, for another hook whose
+    answer ends the chain: peer_connected's "disconnect"."""
+    plugin = os.path.join(os.getcwd(), 'tests/plugins/reject.py')
+    l1, l2 = node_factory.get_nodes(2, opts=[{'plugin': plugin, 'allow_warning': True},
+                                             {'allow_warning': True}])
+
+    def rejected():
+        l1.rpc.reject(l2.info['id'])
+        try:
+            l2.connect(l1)
+        except RpcError as err:
+            assert "disconnected during connection" in err.error['message']
+        l1.daemon.wait_for_log(f"{l2.info['id']} is in reject list")
+        wait_for(lambda: not l1.rpc.listpeers(l2.info['id'])['peers']
+                 or not only_one(l1.rpc.listpeers(l2.info['id'])['peers'])['connected'])
+
+    rejected()
+    # Replace the plugin: the new instance must be called on the next connect.
+    l1.rpc.plugin_stop(plugin)
+    l1.rpc.plugin_start(plugin)
+    rejected()
+    assert not l1.daemon.is_in_log('Deferring registration of hook peer_connected')
 
 
 def test_htlc_accepted_hook_fail(node_factory):
