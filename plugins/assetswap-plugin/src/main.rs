@@ -21,6 +21,7 @@
 //! this one calls via a plain local RPC call (`protocol::fetch_price_tiers`).
 
 mod assetinvoice;
+mod cltv;
 mod config;
 mod htlc;
 mod pay;
@@ -30,29 +31,44 @@ mod rpc;
 use anyhow::{anyhow, Error};
 use cln_plugin::{Builder, HookBuilder};
 use cln_rpc::primitives::PublicKey;
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::str::FromStr;
+use std::sync::{Arc, Mutex};
 
 #[derive(Clone)]
 struct State {
     config: config::Config,
+    /// Seconds per block of each node asked (by RPC socket), found once.
+    block_secs: Arc<Mutex<HashMap<PathBuf, u64>>>,
+    /// payment_hashes a live hook call of this process has claimed.
+    inflight: Arc<Mutex<HashSet<String>>>,
+    /// Do we take new swaps (as a provider)?  Only as an important
+    /// plugin; settling swaps already under way doesn't depend on it.
+    provider: bool,
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
     log_panics::init();
 
+    // Not dynamic: a provider must be loaded (from its config file) before
+    // lightningd replays a held leg 1 after a restart, and must not be
+    // stoppable mid-swap -- `plugin stop` would make lightningd continue
+    // the hook and fail leg 1 while leg 2 may still be in flight.
     let Some(plugin) = Builder::new(tokio::io::stdin(), tokio::io::stdout())
-        .dynamic()
         .option(config::OPT_PROVIDER)
         .option(config::OPT_REMOTE)
         .option(config::OPT_SAFETY_BLOCKS)
         .option(config::OPT_MIN_HOP_BUDGET)
-        // Before contrib/assetchan's hook: a leg 1 that lands here in an
-        // issued asset has no invoice of ours, so assetchan's final-hop
-        // check would fail it as being in the wrong asset.
-        .hook_from_builder(
-            HookBuilder::new("htlc_accepted", htlc::on_htlc_accepted).before(vec!["assetchan.py".into()]),
-        )
+        .option(config::OPT_BLOCK_SECONDS)
+        .option(config::OPT_LEG2_MAXFEE_PPM)
+        .option(config::OPT_LEG2_MAXFEE_BASE)
+        // No ordering against contrib/assetchan's htlc_accepted hook:
+        // assetchan only enforces its final-hop asset check on HTLCs for an
+        // invoice of its own, and a leg 1 has none here, so whichever hook
+        // runs first, a leg 1 reaches this one.
+        .hook_from_builder(HookBuilder::new("htlc_accepted", htlc::on_htlc_accepted))
         .rpcmethod(
             "assetinvoice",
             "Create an invoice and package it with the asset it requires \
@@ -93,14 +109,59 @@ async fn main() -> Result<(), Error> {
             .unwrap_or_default(),
     )?;
 
+    let block_seconds = config::parse_block_seconds(
+        &plugin
+            .option_str("assetswap-block-seconds")?
+            .and_then(|v| v.as_str_arr().cloned())
+            .unwrap_or_default(),
+    )?;
+
+    let int = |name: &str, default: i64| -> Result<i64, Error> {
+        Ok(plugin.option_str(name)?.and_then(|v| v.as_i64()).unwrap_or(default))
+    };
     let config = config::Config {
         providers,
         remotes,
-        safety_blocks: plugin.option_str("assetswap-cltv-safety-blocks")?.and_then(|v| v.as_i64()).unwrap_or(18) as u32,
-        min_hop_budget: plugin.option_str("assetswap-min-hop-budget")?.and_then(|v| v.as_i64()).unwrap_or(34) as u32,
+        block_seconds,
+        safety_blocks: config::non_negative("assetswap-cltv-safety-blocks", int("assetswap-cltv-safety-blocks", 18)?)?,
+        min_hop_budget: config::non_negative("assetswap-min-hop-budget", int("assetswap-min-hop-budget", 34)?)?,
+        leg2_maxfee_ppm: config::non_negative("assetswap-leg2-maxfee-ppm", int("assetswap-leg2-maxfee-ppm", 5000)?)?,
+        leg2_maxfee_base_msat: config::non_negative(
+            "assetswap-leg2-maxfee-base-msat",
+            int("assetswap-leg2-maxfee-base-msat", 5000)?,
+        )?,
     };
 
-    let state = State { config };
+    // Only an important plugin takes new swaps (config::is_important).
+    let rpc_file = std::path::Path::new(&plugin.configuration().lightning_dir)
+        .join(&plugin.configuration().rpc_file);
+    let provider = async {
+        let mut rpc = cln_rpc::ClnRpc::new(&rpc_file).await?;
+        let cfg: serde_json::Value = rpc
+            .call_raw("listconfigs", &serde_json::json!({"config": "important-plugin"}))
+            .await
+            .map_err(|e| anyhow!("listconfigs: {e}"))?;
+        Ok::<_, Error>(config::is_important(&cfg, &std::env::current_exe()?))
+    }
+    .await
+    .unwrap_or_else(|e| {
+        log::warn!("assetswap: can't tell whether we're an important plugin ({e}): taking no new swaps");
+        false
+    });
+    if !provider {
+        log::warn!(
+            "assetswap: not started with important-plugin=: paying and settling earlier swaps \
+             only, no new swaps as a provider (if this plugin died while holding a leg 1, \
+             lightningd would fail it while leg 2 may still be paid)"
+        );
+    }
+
+    let state = State {
+        config,
+        block_secs: Arc::new(Mutex::new(HashMap::new())),
+        inflight: Arc::new(Mutex::new(HashSet::new())),
+        provider,
+    };
 
     let plugin = plugin.start(state).await?;
     plugin.join().await?;

@@ -10,8 +10,9 @@ here `assetswap-plugin` works with those instead:
 - **Asset names.** An issued Liquid asset is its 64-hex id; anything else
   names a node's native coin (`lbtc` on Liquid, `eth` on an EVM node). A
   native coin is invoiced and paid plainly; an issued asset goes through
-  assetchan (`assetchan-invoice`, and an askrene layer `assetswap.<asset>`
-  that keeps routes on channels in that asset, as `assetchan-pay` does).
+  assetchan (`assetchan-invoice`, and assetchan's askrene layer for that
+  asset, from `assetchan-layer`, which keeps routes on channels in it, as
+  `assetchan-pay` does).
 - **A provider across two chains** is two nodes of one operator, one per
   chain. The one that receives leg 1 loads both plugins and names the
   other with `assetswap-remote=<asset>:<its lightning-rpc>`; leg 2 is
@@ -26,193 +27,41 @@ here `assetswap-plugin` works with those instead:
 
   The payer sets `assetswap-provider=<that Liquid node's id>`; the payee
   (the EVM node) makes the invoice with `assetinvoice ... asset=eth`.
-- **Hook order.** `htlc_accepted` runs before `assetchan.py`'s, which
-  would otherwise fail a leg 1 that arrives in an asset no invoice asks for.
+- **Hook order doesn't matter.** assetchan's `htlc_accepted` hook only
+  checks the asset of an HTLC that pays an invoice of ours, so it leaves a
+  leg 1 (no invoice on the provider) to assetswap, whichever runs first.
+- **Load them for good.** assetswap is not a dynamic plugin: a provider
+  must have it before lightningd replays held leg-1 HTLCs. Run assetchan
+  (and, on a provider, assetswap) as `important-plugin=`: assetchan refuses
+  to run otherwise, and assetswap then only pays and settles, taking no new
+  swaps (lightningd mustn't outlive it while it holds a leg 1).
 - **Tests:** `contrib/liquid-poc/asset-swap/run-tests.sh` runs
   `plugins/assetswap-plugin/tests/test_liquid_evm_swap.py` in Docker
   (elementsd + anvil): L-BTC -> ETH, issued asset -> ETH, leg 2 failing,
   and an underpaid leg 1.
 
-Not done yet:
+How a provider stays safe:
 
-- **CLTVs across chains are compared as raw block counts.** The provider
-  checks leg 1's expiry (Liquid blocks) against leg 2's (EVM blocks) and
-  passes `xpay` a `maxdelay` derived from Liquid blocks. That is only safe
-  if an EVM block is no longer than a Liquid one; it needs a conversion by
-  block time before real funds.
-- The Liquid-only tests (`test_cross_asset_swap.py` and the others here)
-  still use `liquid-merged`'s `fund_asset_channel` and need porting to
-  assetchan.
-- Sections 2-7 below describe `liquid-merged`'s `lnpoc.py` network and UI,
-  which this branch doesn't have.
+- **CLTVs are compared by time, not blocks.** Each side's seconds per block
+  come from `assetswap-block-seconds=<asset>:<secs>`, else the node itself
+  (`evm-status`'s `interval` on an EVM node, 60 s on Liquid, 600 s on
+  Bitcoin). Leg 2's `maxdelay` is what fits in leg 1's remaining time minus
+  the safety margin; a leg 1 too short for leg 2's final CLTV is refused.
+- **Leg 2's routing fee is priced in.** The floor is priced on the leg-2
+  amount plus `assetswap-leg2-maxfee-ppm` / `-base-msat`, and that maxfee is
+  what xpay may spend.
+- **Leg 1 is never failed while leg 2 may still succeed.** A quote goes
+  `claimed` -> `paying` (recording the node that pays leg 2) -> `complete`
+  or `failed`. Pending, unreachable or erroring leg 2 means hold and poll
+  again; leg 1 is failed only when every leg-2 part failed, or when leg 1's
+  own expiry is close. A `complete` hash is answered from the stored
+  preimage, a `failed` one re-claimed only once the paying node shows
+  nothing pending.
 
-## On liquid-merged
+Tests: `plugins/assetswap-plugin/tests/test_liquid_evm_swap.py` (Docker,
+above). The other test files there are from `liquid-merged` and need
+porting to assetchan (`tests/test_assetchan.py`'s helpers); see their
+module docstrings.
 
-Step-by-step for running a cross-asset swap-provider ("server") and a payer
-("client") on top of the `contrib/liquid-poc` network, and for creating and
-paying invoices, same-asset or cross-asset. Design background:
-[`CROSS_ASSET_SWAP.md`](CROSS_ASSET_SWAP.md). All commands below are
-run from `contrib/liquid-poc/`.
-
-## 1. Plugins required
-
-Two Rust plugins, both already built into the `cln` Docker image and loaded
-on **every** node from startup — nothing to install or enable by hand in
-this PoC:
-
-- `assetswap-plugin` — the swap mechanics (`assetinvoice`, `payassetinvoice`,
-  `quoteassetinvoice` RPCs; the provider-side `htlc_accepted` hook).
-- `pricetiers-plugin` — the pricing policy (`pricetiers` RPC), only
-  consulted on a node configured as a provider.
-
-`docker-compose.yml`'s shared `x-cln` entrypoint is what actually loads
-them, with a `--plugin=` flag per plugin on every node's command line:
-
-```yaml
---plugin=/opt/lightning/libexec/c-lightning/plugins/assetswap-plugin
---plugin=/opt/lightning/libexec/c-lightning/plugins/pricetiers-plugin
-```
-
-Outside this PoC's Docker setup, a provider node needs both loaded via a
-`plugin=` line in its `config` file (not `lightning-cli plugin start` —
-a dynamically-started plugin isn't reloaded on restart, and a provider must
-have it loaded before `lightningd` can replay a pending HTLC; see
-`CROSS_ASSET_SWAP.md` §7).
-
-## 2. UI example
-
-The same flows are available from the web UI (`./lqui.py`, see the main
-`README.md`'s "Web page" section), without touching the command line:
-
-1. **Make a node a swap-provider**: "Add node" tab → check "Set up as a
-   swap service" → pick the pair and rate. (An existing node can also be
-   made one with `swap-provider` on the command line, step 2 below — the
-   UI only wires this up for a newly added node.) Provider nodes show up in
-   the "Network" map with a dashed outline and a "SWAP SERVICE" tag, and as
-   a "Swap service" pill in the Nodes list.
-2. **Create a cross-asset invoice**: "Invoice" tab → pick the node to be
-   paid and the asset it wants (its own asset, or L-BTC) → the hint line
-   shows the live swap rate for that pair → submit to get the wrapped
-   invoice string.
-3. **Pay it**: "Pay invoice" tab → pick the paying node, paste the invoice
-   string, leave "Asset to pay with" on "Auto" (direct payment, swapping
-   only if the node doesn't hold the invoice's asset) or pick one
-   explicitly, choose a tier → submit. The hint line shows what the swap
-   will actually cost before you confirm.
-
-If you're a true Mandalorian that respects raw CLI commands - next steps are for you!
-
-*This is the way*
-
-## 3. Launch the swap-provider ("server")
-
-A provider is just a node that already holds channels in both assets and is
-configured with a price for the pair.
-
-1. Start the network and have the provider node (e.g. `bob`) hold channels
-   in both assets, e.g.:
-   ```bash
-   ./lnpoc.py up && ./lnpoc.py setup
-   ./lnpoc.py open-lbtc  alice bob 5000000
-   ./lnpoc.py open-asset bob carol 5000000
-   ```
-   (`./lnpoc.py start` does `up` + `setup` + the web UI in one call.)
-2. Configure the pricing for the pair it will quote:
-   ```bash
-   ./lnpoc.py swap-provider bob lbtc <asset> 1000000 --fee-base-msat 500
-   ```
-   `rate_ppm` is msat of `from_asset` required per 1,000,000 msat worth of
-   `to_asset`; `1000000` = 1:1. This writes a persistent
-   `pricetiers-pair=lbtc:<asset>:1000000:500` line to bob's config and
-   restarts him — no separate pricing config file.
-
-That's it — the node is now a provider. It needs no connection step: a
-payer's leg-1 payment reaches it like any other routed payment.
-
-## 4. Launch a swap client ("payer")
-
-1. Point the payer at the provider's node id (also persistent, survives a
-   restart):
-   ```bash
-   ./lnpoc.py swap-payer alice bob
-   ```
-   This just writes `assetswap-provider=<bob's node id>` to alice's config.
-2. Make sure alice has a path to bob in whichever asset she'll pay leg 1
-   with (an ordinary channel/route — no direct peering with bob required).
-
-## 5. Invoices and payments
-
-### Same asset on both sides (no swap)
-
-- `./lnpoc.py invoice <node> <amount_msat> [--asset ID | --lbtc]` — create a
-  bolt11 invoice requiring that asset.
-- `./lnpoc.py pay <frm> <to> <amount_msat> [--asset ID | --lbtc]` — invoices
-  `to` and pays it from `frm` over a path `lnpoc.py` finds itself (private
-  channels, `sendpay`).
-- `./lnpoc.py xpay <frm> <to> <amount_msat> [--asset ID | --lbtc]` — same,
-  but routed by `xpay`/gossip (channels must be `--announce`d).
-
-### Cross-asset (swap through a provider)
-
-- `./lnpoc.py assetinvoice <node> <amount_msat> <asset>` — create the
-  invoice on the payee and wrap it (bolt11 + asset) into one opaque string.
-- `./lnpoc.py quoteassetinvoice <node> <assetinvoice-string>` — *optional*:
-  ask a node's own local pricing what paying that string would cost, without
-  paying (only meaningful run against the provider itself).
-- `./lnpoc.py payassetinvoice <node> <assetinvoice-string> [--tier low|medium|high] [--from-asset ID] [--from-amount-msat N]` —
-  pay the wrapped invoice from `node`. With no `--from-asset`, it tries a
-  direct same-asset payment first and falls back to a swap via the
-  configured provider.
-- `./lnpoc.py swap <frm> <to> <amount_msat> <asset> [--tier low|medium|high]` —
-  does the two steps above in one call: invoices `to` in `asset`, then pays
-  it from `frm`.
-
-Either way, the receiver and the direct-payment path never need to know a
-swap happened — `assetinvoice`/`payassetinvoice` are drop-in replacements
-for `invoice`/`pay` when the payer doesn't hold the invoice's asset.
-
-## 6. Testing the RPCs directly (shell)
-
-`lnpoc.py`'s swap commands are thin wrappers around `assetswap-plugin`'s own
-RPCs; the same calls work directly against any node with `lightning-cli`
-(`docker compose exec <node> lightning-cli --network=liquid-regtest
---lightning-dir=/data ...`, same pattern as the main `README.md`), useful
-for poking at the plugin itself:
-
-```bash
-# payee (carol): wrap an invoice for 1,000,000,000 msat of <asset>
-docker compose exec carol lightning-cli --network=liquid-regtest --lightning-dir=/data \
-  -k assetinvoice amount_msat=1000000000 label=lnpoc-test description="test invoice" asset=<asset>
-# -> prints the wrapped assetinvoice string
-
-# optional: ask what paying it would cost (only meaningful against the provider itself)
-docker compose exec bob lightning-cli --network=liquid-regtest --lightning-dir=/data \
-  -k quoteassetinvoice assetinvoice="<assetinvoice-string>"
-
-# payer (alice): pay it -- auto (direct, falling back to the configured provider)
-docker compose exec alice lightning-cli --network=liquid-regtest --lightning-dir=/data \
-  -k payassetinvoice assetinvoice="<assetinvoice-string>"
-
-# ... or force a swap priced in a specific asset/amount instead of auto
-docker compose exec alice lightning-cli --network=liquid-regtest --lightning-dir=/data \
-  -k payassetinvoice assetinvoice="<assetinvoice-string>" tier=medium from_asset=lbtc from_amount_msat=1000500
-```
-
-Plain same-asset invoices are just the underlying core RPCs:
-
-```bash
-docker compose exec carol lightning-cli --network=liquid-regtest --lightning-dir=/data \
-  -k invoice amount_msat=1000000000 label=lnpoc-test description="test invoice" asset=<asset>
-docker compose exec alice lightning-cli --network=liquid-regtest --lightning-dir=/data \
-  -k xpay invstring=<bolt11> asset=<asset>
-```
-
-## 7. End-to-end example
-
-```bash
-./lnpoc.py swap-demo
-```
-
-Does all of the above in one shot: opens alice↔bob (L-BTC) and bob↔carol
-(the test asset), makes bob a provider between them, points alice at bob,
-then runs `swap alice carol <amount> <asset>` and prints balances.
+Design background (written for `liquid-merged`, whose asset channels were
+in core; the swap protocol itself is unchanged): `CROSS_ASSET_SWAP.md`.

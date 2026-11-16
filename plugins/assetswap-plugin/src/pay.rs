@@ -25,9 +25,10 @@
 //! happens to hold the same `pricetiers-pair=` config as the provider (see
 //! its own doc comment).
 
-use crate::assetinvoice::decode_wrapper;
+use crate::assetinvoice::checked_wrapper;
+use crate::cltv::{block_seconds, payer_leg1_final_cltv};
 use crate::protocol::{encode_swap_metadata, fetch_price_tiers, SwapMetadata};
-use crate::rpc::{asset_layers, getroutes_path_to_sendpay_route, new_rpc, param};
+use crate::rpc::{asset_layers, getroutes_path_to_sendpay_route, new_rpc, param, rpc_path};
 use crate::State;
 use anyhow::{anyhow, Error};
 use cln_plugin::Plugin;
@@ -39,13 +40,14 @@ use cln_rpc::primitives::{Amount, Sha256};
 use serde_json::{json, Value};
 use std::str::FromStr;
 
-/// CLTV blocks requested for leg 1 over the invoice's own
-/// `min_final_cltv_expiry`, covering the provider's default
-/// `assetswap-cltv-safety-blocks` (18) + `assetswap-min-hop-budget` (34) +
-/// slack. Not negotiated -- if a provider configured with a bigger budget
-/// rejects it, the payer just needs to retry with more (same failure mode
-/// as sending too little for the price).
-const LEG1_CLTV_MARGIN: u32 = 60;
+/// The provider knobs a payer assumes when asking for leg 1's CLTV: the
+/// defaults of `assetswap-cltv-safety-blocks` (leg-1 blocks) and
+/// `assetswap-min-hop-budget` (leg-2 blocks). Not negotiated -- if a
+/// provider configured with a bigger budget rejects it, the payer just
+/// needs to retry with more (same failure mode as sending too little for
+/// the price).
+const PROVIDER_SAFETY_BLOCKS: u32 = 18;
+const PROVIDER_MIN_HOP_BUDGET: u32 = 34;
 
 /// Ask this node's own `pricetiers-plugin` what paying `assetinvoice` would
 /// cost, for display purposes. This is NOT a quote from the swap provider
@@ -60,9 +62,8 @@ pub(crate) async fn quoteassetinvoice(p: Plugin<State>, args: Value) -> Result<V
     let encoded = param(&args, 0, "assetinvoice")
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("Missing assetinvoice"))?;
-    let wrapper = decode_wrapper(encoded)?;
-
     let mut rpc = new_rpc(&p).await?;
+    let wrapper = checked_wrapper(&mut rpc, encoded).await?;
     let priced = fetch_price_tiers(&mut rpc, &wrapper.asset, wrapper.amount_msat).await?;
     Ok(json!(priced))
 }
@@ -97,9 +98,8 @@ pub(crate) async fn payassetinvoice(p: Plugin<State>, args: Value) -> Result<Val
     // node that happens to also hold that config.
     let from_asset = param(&args, 2, "from_asset").and_then(Value::as_str).map(str::to_string);
     let from_amount_override = param(&args, 3, "from_amount_msat").and_then(Value::as_u64);
-    let wrapper = decode_wrapper(encoded)?;
-
     let mut rpc = new_rpc(&p).await?;
+    let wrapper = checked_wrapper(&mut rpc, encoded).await?;
 
     let want_direct = from_asset.as_deref().is_none_or(|a| a == wrapper.asset);
     let direct_err = if want_direct {
@@ -196,7 +196,16 @@ pub(crate) async fn payassetinvoice(p: Plugin<State>, args: Value) -> Result<Val
     let leg2_final_cltv = decoded
         .min_final_cltv_expiry
         .ok_or_else(|| anyhow!("invoice has no min_final_cltv_expiry"))?;
-    let final_cltv = leg2_final_cltv + LEG1_CLTV_MARGIN;
+    // Leg 1 is in this chain's blocks (the provider's leg-1 node is on our
+    // chain), leg 2's final CLTV in the payee's: convert by time. The
+    // payee's block time is what its wrapper says, or else taken as ours.
+    let s1 = block_seconds(&p, &from_asset, &rpc_path(&p), &mut rpc).await?;
+    let s2 = match p.state().config.block_seconds.get(&wrapper.asset) {
+        Some(&s) => s,
+        None => wrapper.block_seconds.filter(|&s| s > 0).unwrap_or(s1),
+    };
+    let final_cltv = payer_leg1_final_cltv(leg2_final_cltv, PROVIDER_SAFETY_BLOCKS, PROVIDER_MIN_HOP_BUDGET, s1, s2)
+        .ok_or_else(|| anyhow!("leg 2's final CLTV of {leg2_final_cltv} blocks of {s2}s is too long"))?;
 
     let my_id = rpc.call_typed(&GetinfoRequest {}).await?.id;
     let maxfee_msat = from_amount_msat / 100; // 1% leg-1 routing-fee budget
@@ -249,11 +258,15 @@ pub(crate) async fn payassetinvoice(p: Plugin<State>, args: Value) -> Result<Val
         route,
     })
     .await?;
+    // Until leg 1 settles, however long the provider holds it (it waits for
+    // leg 2, and holds while leg 2 may still succeed): a timeout here would
+    // report a failure for a payment that can still complete.  It settles
+    // at the latest when leg 1's CLTV runs out.
     let res = rpc
         .call_typed(&WaitsendpayRequest {
             groupid: None,
             partid: None,
-            timeout: Some(60),
+            timeout: None,
             payment_hash: Sha256::from_str(&wrapper.payment_hash)?,
         })
         .await?;

@@ -1,32 +1,68 @@
 //! The swap-provider's `htlc_accepted` hook: decode what a candidate leg-1
 //! HTLC's `payment_metadata` is asking for, price it live, atomically
-//! claim it, run leg 2, and resolve or fail leg 1 — plus the
-//! restart-replay idempotency path for an HTLC we already committed to
-//! before a prior process exited. There's no prior quote to look up: the
-//! provider decides live, on arrival, whether this HTLC is profitable at
-//! its current price (see pay.rs's doc comment for why).
+//! claim it, run leg 2, and resolve or fail leg 1 -- plus the
+//! restart-replay path for an HTLC we already committed to before a prior
+//! process exited. There's no prior quote to look up: the provider decides
+//! live, on arrival, whether this HTLC is profitable at its current price
+//! (see pay.rs's doc comment for why).
+//!
+//! The one rule everything here keeps: leg 1 is never failed while leg 2
+//! may still succeed (that would pay the payee for nothing). Once leg 2
+//! may have been sent (record "paying", see `protocol::QuoteRecord`), leg
+//! 1 is settled only by `settle`, from what the node paying leg 2 says of
+//! it, holding leg 1 for as long as that takes, past leg 1's own expiry if
+//! need be: leg 2 bounded by its `maxdelay` (`cltv::leg2_cltv_gate`) only
+//! makes it *expire* first; its payee can still settle it until our timeout
+//! of it confirms. The hook runs in a task of its own per HTLC
+//! (cln-plugin spawns one per request), so holding one HTLC doesn't hold
+//! up any other.
+//!
+//! **Operational note**: replay only works if the plugin is loaded before
+//! lightningd replays the pending HTLC -- from persistent config (`plugin=`
+//! in its `config` file), not `plugin start` (this plugin isn't dynamic).
 
-use crate::protocol::{decode_swap_metadata, fetch_price_tiers, is_asset_id, quote_key, QuoteRecord};
-use crate::rpc::{asset_layers, channel_asset, leg2_rpc, new_rpc};
+use crate::cltv::{block_seconds, giveup_margin, leg2_cltv_gate};
+use crate::protocol::{
+    check_asset, decode_swap_metadata, fetch_price_tiers, is_asset_id, leg2_maxfee, quote_key, QuoteRecord,
+    RECORD_VERSION,
+};
+use crate::rpc::{asset_layers, channel_asset, getinfo, leg2_path, leg2_rpc, new_rpc, rpc_path};
 use crate::State;
 use anyhow::{anyhow, Error};
 use cln_plugin::Plugin;
 use cln_rpc::model::requests::{
-    DatastoreMode, DatastoreRequest, DecodeRequest, ListdatastoreRequest, ListsendpaysRequest,
-    WaitsendpayRequest, XpayRequest,
+    DatastoreMode, DatastoreRequest, DecodeRequest, ListdatastoreRequest, ListsendpaysRequest, XpayRequest,
 };
 use cln_rpc::model::responses::ListsendpaysPaymentsStatus;
-use cln_rpc::primitives::Secret;
+use cln_rpc::primitives::{Amount, Secret, Sha256};
 use cln_rpc::ClnRpc;
 use serde_json::{json, Value};
+use std::str::FromStr;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-/// How long to wait on a still-`pending` leg-2 payment during restart-replay
-/// idempotency handling before giving up and failing leg 1. See
-/// `resolve_from_leg2_status`.
-const RESTART_LEG2_WAIT_SECS: u32 = 30;
+/// Polling leg 2's status: first after this, then twice as long each time
+/// up to `POLL_MAX`.
+const POLL_MIN: Duration = Duration::from_secs(2);
+const POLL_MAX: Duration = Duration::from_secs(30);
+/// At most one log line per held HTLC this often.
+const LOG_EVERY: Duration = Duration::from_secs(60);
 
-/// How often a restart replay retries reaching the node that paid leg 2.
-const REMOTE_RETRY_SECS: u64 = 5;
+/// How long xpay keeps starting new attempts (passed as its `retry_for`).
+const XPAY_RETRY_FOR: u32 = 60;
+/// After an `xpay` call that didn't return a verdict (e.g. the connection
+/// to the remote node dropped), xpay may still be routing: until this long
+/// after "paying", leg 2 having no live part isn't taken as failed.
+const XPAY_GRACE_SECS: u64 = 2 * XPAY_RETRY_FOR as u64;
+
+/// xpay's errors for a payment it gave up on (and so stopped sending):
+/// invalid parameters, and PAY_DESTINATION_PERM_FAIL, PAY_ROUTE_NOT_FOUND,
+/// PAY_ROUTE_TOO_EXPENSIVE, PAY_INVOICE_EXPIRED, PAY_UNSPECIFIED_ERROR
+/// (its "failed after N attempts"), PAY_STOPPED_RETRYING,
+/// PAY_INVOICE_REQUEST_INVALID, PAY_INSUFFICIENT_FUNDS, PAY_UNREACHABLE,
+/// PAY_DESTINATION_INSUFFICIENT_CAPACITY. Even then, leg 1 is only failed
+/// once `listsendpays` shows no part pending or complete: xpay may return
+/// before every part it sent has settled.
+const XPAY_GAVE_UP: [i32; 11] = [-32602, 203, 205, 206, 207, 209, 210, 212, 215, 216, 220];
 
 /// incorrect_or_unknown_payment_details (BOLT4 0x400f), with a zeroed
 /// htlc_msat+height tail — real nodes accept a bogus tail here (see
@@ -44,7 +80,28 @@ fn parse_msat(v: &Value) -> Option<u64> {
     }
 }
 
-async fn lookup_quote(rpc: &mut ClnRpc, payment_hash: &str) -> Result<Option<QuoteRecord>, Error> {
+fn now_unix() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+fn secret_hex(s: Secret) -> Option<String> {
+    match serde_json::to_value(s) {
+        Ok(Value::String(hex)) => Some(hex),
+        _ => None,
+    }
+}
+
+fn resolve_with_hex(preimage: Option<&str>) -> Value {
+    match preimage {
+        Some(hex) if hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()) => {
+            json!({"result": "resolve", "payment_key": hex})
+        }
+        _ => fail_incorrect_details(),
+    }
+}
+
+/// The quote record for `payment_hash` and its datastore generation.
+async fn lookup_quote(rpc: &mut ClnRpc, payment_hash: &str) -> Result<Option<(QuoteRecord, Option<u64>)>, Error> {
     let res = rpc
         .call_typed(&ListdatastoreRequest {
             key: Some(quote_key(payment_hash)),
@@ -53,163 +110,234 @@ async fn lookup_quote(rpc: &mut ClnRpc, payment_hash: &str) -> Result<Option<Quo
     match res.datastore.into_iter().next() {
         Some(d) => {
             let s = d.string.ok_or_else(|| anyhow!("quote record has no string value"))?;
-            Ok(Some(serde_json::from_str(&s)?))
+            Ok(Some((serde_json::from_str(&s)?, d.generation)))
         }
         None => Ok(None),
     }
 }
 
-/// Atomic claim via datastore's generation CAS: only the first HTLC for a
-/// given payment_hash wins, so a replayed/duplicated HTLC can't
-/// double-commit (and a second attempt after an earlier "failed" verdict
-/// is allowed to retry, rather than being permanently wedged). Returns the
-/// record's new generation on success, so a caller can chain a further
-/// state transition ("claimed" -> "failed") without a second round-trip to
-/// learn it.
-async fn claim_quote_atomically(
+/// Write `rec` with the datastore's CAS: create it (`prev` None), or
+/// replace the one at generation `prev`. Returns the new generation.
+async fn write_record(
     rpc: &mut ClnRpc,
     payment_hash: &str,
     rec: &QuoteRecord,
-) -> Result<Option<u64>, Error> {
-    let cur = rpc
-        .call_typed(&ListdatastoreRequest {
-            key: Some(quote_key(payment_hash)),
-        })
-        .await?;
-    let existing = cur.datastore.into_iter().next();
-    let mode = if existing.is_some() { DatastoreMode::MUST_REPLACE } else { DatastoreMode::MUST_CREATE };
-    let generation = existing.and_then(|d| d.generation);
-    let claimed = QuoteRecord {
-        state: "claimed".into(),
-        ..rec.clone()
+    prev: Option<Option<u64>>,
+) -> Result<u64, Error> {
+    let (mode, generation) = match prev {
+        None => (DatastoreMode::MUST_CREATE, None),
+        Some(g) => (DatastoreMode::MUST_REPLACE, g),
     };
-    match rpc
+    let res = rpc
         .call_typed(&DatastoreRequest {
             generation,
             hex: None,
             mode: Some(mode),
-            string: Some(serde_json::to_string(&claimed)?),
+            string: Some(serde_json::to_string(rec)?),
             key: quote_key(payment_hash),
         })
-        .await
-    {
-        Ok(res) => Ok(Some(res.generation)),
-        Err(_) => Ok(None),
+        .await?;
+    Ok(res.generation)
+}
+
+/// Move the record to "complete" (with the preimage) or "failed",
+/// re-reading it so a concurrent writer isn't overwritten blindly.
+/// "complete" is final: nothing moves a record out of it.
+async fn finalize(p: &Plugin<State>, payment_hash: &str, state: &str, preimage: Option<String>) {
+    for _ in 0..5 {
+        let res = async {
+            let mut rpc = new_rpc(p).await?;
+            let Some((cur, generation)) = lookup_quote(&mut rpc, payment_hash).await? else {
+                return Err(anyhow!("no record"));
+            };
+            if cur.state == "complete" || cur.state == state {
+                return Ok(());
+            }
+            let rec = QuoteRecord {
+                state: state.into(),
+                preimage: preimage.clone().or(cur.preimage.clone()),
+                ..cur
+            };
+            write_record(&mut rpc, payment_hash, &rec, Some(generation)).await.map(|_| ())
+        }
+        .await;
+        match res {
+            Ok(()) => return,
+            Err(e) => log::debug!("assetswap: marking {payment_hash} {state}: {e}, retrying"),
+        }
+    }
+    log::warn!("assetswap: couldn't mark quote {payment_hash} as {state}");
+}
+
+/// What a node's `listsendpays` says of leg 2.
+#[derive(Debug, PartialEq)]
+enum Leg2<T> {
+    /// A part completed: here is the preimage.
+    Complete(T),
+    /// Every part (`parts` of them, maybe none) failed for good.
+    Failed { parts: usize },
+    /// A part is still in flight.
+    Pending,
+    /// The node couldn't be asked, or answered oddly.
+    Unknown(String),
+    /// The node configured for the asset isn't the one that paid leg 2.
+    WrongNode(String),
+}
+
+fn classify<T>(parts: impl IntoIterator<Item = (ListsendpaysPaymentsStatus, Option<T>)>) -> Leg2<T> {
+    let (mut n, mut pending, mut odd) = (0, false, false);
+    for (status, preimage) in parts {
+        n += 1;
+        match (status, preimage) {
+            (ListsendpaysPaymentsStatus::COMPLETE, Some(pre)) => return Leg2::Complete(pre),
+            (ListsendpaysPaymentsStatus::COMPLETE, None) => odd = true,
+            (ListsendpaysPaymentsStatus::PENDING, _) => pending = true,
+            (ListsendpaysPaymentsStatus::FAILED, _) => {}
+        }
+    }
+    if odd {
+        Leg2::Unknown("a complete part without a preimage".into())
+    } else if pending {
+        Leg2::Pending
+    } else {
+        Leg2::Failed { parts: n }
     }
 }
 
-/// Move a quote record to a terminal "failed" state after leg 2 doesn't go
-/// through, so it's never left dangling in "claimed" with no resolution
-/// (which would look like an in-flight swap forever).
-async fn mark_quote_failed(
-    rpc: &mut ClnRpc,
-    payment_hash: &str,
-    rec: &QuoteRecord,
-    claimed_generation: u64,
-) {
-    let failed = QuoteRecord {
-        state: "failed".into(),
-        ..rec.clone()
+/// Ask the node that pays leg 2 for `rec`'s asset what became of it.
+async fn leg2_status(p: &Plugin<State>, payment_hash: &str, rec: &QuoteRecord) -> Leg2<Secret> {
+    let mut rpc2 = match leg2_rpc(p, &rec.to_asset).await {
+        Ok(r) => r,
+        Err(e) => return Leg2::Unknown(e.to_string()),
     };
-    let Ok(string) = serde_json::to_string(&failed) else {
-        return;
+    if let Some(want) = &rec.leg2_node {
+        match getinfo(&mut rpc2).await {
+            Ok(info) if info["id"].as_str() == Some(want.as_str()) => {}
+            Ok(info) => {
+                return Leg2::WrongNode(format!(
+                    "leg 2 was paid by node {want}, but the node now configured for {} is {}: \
+                     restore its assetswap-remote to settle leg 1",
+                    rec.to_asset, info["id"]
+                ))
+            }
+            Err(e) => return Leg2::Unknown(e.to_string()),
+        }
+    }
+    let Ok(hash) = Sha256::from_str(payment_hash) else {
+        return Leg2::Unknown(format!("bad payment_hash {payment_hash}"));
     };
-    if let Err(e) = rpc
-        .call_typed(&DatastoreRequest {
-            generation: Some(claimed_generation),
-            hex: None,
-            mode: Some(DatastoreMode::MUST_REPLACE),
-            string: Some(string),
-            key: quote_key(payment_hash),
-        })
-        .await
-    {
-        log::warn!("assetswap: couldn't mark quote {payment_hash} as failed: {e}");
-    }
-}
-
-fn resolve_with_preimage(preimage: Secret) -> Value {
-    match serde_json::to_value(preimage) {
-        Ok(Value::String(hex)) => json!({"result": "resolve", "payment_key": hex}),
-        _ => fail_incorrect_details(),
-    }
-}
-
-/// Idempotency for the restart-replay case: a "claimed" record means we
-/// already decided to attempt leg 2 before a prior process exited (crash
-/// or restart) without lightningd ever getting our verdict. Re-derive the
-/// right answer from leg 2's own payment status instead of guessing or
-/// re-running it. `complete` means it already paid out, so resolve leg 1
-/// with that preimage. A still-`pending` attempt means leg 2 was genuinely
-/// in flight at restart (the common case right after a crash) — rather
-/// than failing leg 1 prematurely while leg 2 might still land a moment
-/// later (which would leave us out of pocket, having paid leg 2 with
-/// nothing to show for it), wait on it with `waitsendpay` before deciding.
-/// No attempt found, or an already-`failed` one, means it's safe to fail
-/// leg 1 outright.
-///
-/// **Operational note**: this logic only ever runs if the plugin is
-/// loaded before lightningd replays the pending HTLC — which requires the
-/// provider to load it from persistent config (`plugin=` in its `config`
-/// file), not `plugin start`. See CROSS_ASSET_SWAP.md §7.
-async fn resolve_from_leg2_status(rpc: &mut ClnRpc, rec: &QuoteRecord) -> Value {
-    let res = rpc
+    match rpc2
         .call_typed(&ListsendpaysRequest {
-            bolt11: Some(rec.final_bolt11.clone()),
+            bolt11: None,
             index: None,
             limit: None,
-            payment_hash: None,
+            payment_hash: Some(hash),
             start: None,
             status: None,
         })
-        .await;
-    let Ok(res) = res else {
-        return fail_incorrect_details();
-    };
-
-    if let Some(pm) = res
-        .payments
-        .iter()
-        .find(|pm| pm.status == ListsendpaysPaymentsStatus::COMPLETE)
+        .await
     {
-        return match pm.payment_preimage {
-            Some(preimage) => resolve_with_preimage(preimage),
-            None => fail_incorrect_details(),
-        };
+        Ok(res) => classify(res.payments.into_iter().map(|pm| (pm.status, pm.payment_preimage))),
+        Err(e) => Leg2::Unknown(format!("listsendpays: {e}")),
     }
+}
 
-    if let Some(pm) = res
-        .payments
-        .iter()
-        .find(|pm| pm.status == ListsendpaysPaymentsStatus::PENDING)
-    {
-        let outcome = rpc
-            .call_typed(&WaitsendpayRequest {
-                groupid: Some(pm.groupid),
-                partid: pm.partid,
-                timeout: Some(RESTART_LEG2_WAIT_SECS),
-                payment_hash: pm.payment_hash,
-            })
-            .await;
-        return match outcome {
-            Ok(res) => match res.payment_preimage {
-                Some(preimage) => resolve_with_preimage(preimage),
-                None => fail_incorrect_details(),
-            },
-            Err(_) => fail_incorrect_details(), // failed, or timed out waiting
+/// Settle leg 1 (expiring at block `cltv_expiry`) from leg 2's outcome,
+/// for a record that may have reached `xpay`: resolve it with leg 2's
+/// preimage once a part completes; fail it once every part has failed
+/// (and xpay can't send another: `xpay_done`, or `XPAY_GRACE_SECS` after
+/// "paying"); otherwise hold it and ask again, whatever the error.
+///
+/// Never on a deadline: a leg 2 that is still pending can still be settled
+/// by the payee, off-chain or on-chain, even after its CLTV, until our
+/// timeout of it confirms. Failing leg 1 then would pay the payee for
+/// nothing (invariant S1). This is what any forwarding node does with an
+/// HTLC whose outgoing side is unresolved: past leg 1's expiry the payer
+/// may close the channel to time leg 1 out on chain, and if leg 2 does
+/// complete, the preimage still claims it there. From `giveup_margin`
+/// blocks before leg 1 expires the wait is only logged as an error.
+async fn settle(p: &Plugin<State>, payment_hash: &str, cltv_expiry: u32, rec: &QuoteRecord, xpay_done: bool) -> Value {
+    let late_height = cltv_expiry.saturating_sub(giveup_margin(p.state().config.safety_blocks));
+    let mut delay = POLL_MIN;
+    let mut logged: Option<Instant> = None;
+    let mut logged_error = false;
+    loop {
+        let (why, error) = match leg2_status(p, payment_hash, rec).await {
+            Leg2::Complete(pre) => {
+                let hex = secret_hex(pre);
+                finalize(p, payment_hash, "complete", hex.clone()).await;
+                return resolve_with_hex(hex.as_deref());
+            }
+            Leg2::Failed { parts } => {
+                let xpay_may_send = !xpay_done && rec.paying_since.is_some_and(|t| now_unix() < t + XPAY_GRACE_SECS);
+                if !xpay_may_send {
+                    log::info!("assetswap: leg 2 for {payment_hash} failed ({parts} parts): failing leg 1");
+                    finalize(p, payment_hash, "failed", None).await;
+                    return fail_incorrect_details();
+                }
+                (format!("leg 2 has no live part ({parts} failed), xpay may still send"), false)
+            }
+            Leg2::Pending => ("leg 2 is pending".to_string(), false),
+            Leg2::Unknown(e) => (format!("leg 2's status is unknown: {e}"), false),
+            Leg2::WrongNode(e) => (e, true),
         };
-    }
 
-    fail_incorrect_details() // no leg-2 attempt found at all
+        let height = async { getinfo(&mut new_rpc(p).await?).await }
+            .await
+            .and_then(|i| i["blockheight"].as_u64().ok_or_else(|| anyhow!("getinfo has no blockheight")));
+        let (why, error) = match height {
+            Ok(h) if h >= u64::from(late_height) => (
+                format!(
+                    "{why} at block {h}, leg 1 expires at {cltv_expiry}: still holding it, as leg 2 may \
+                     still be settled (the payer may close the channel to time leg 1 out on chain)"
+                ),
+                true,
+            ),
+            Ok(h) => (format!("{why} (block {h}, leg 1 expires at {cltv_expiry})"), error),
+            Err(e) => (format!("{why} (block height unknown: {e})"), error),
+        };
+
+        // Once a minute, and at once when it turns into an error.
+        if logged.is_none_or(|t| t.elapsed() >= LOG_EVERY) || (error && !logged_error) {
+            logged_error = error;
+            if error {
+                log::error!("assetswap: holding leg 1 of {payment_hash}: {why}");
+            } else {
+                log::warn!("assetswap: holding leg 1 of {payment_hash}: {why}");
+            }
+            logged = Some(Instant::now());
+        }
+        tokio::time::sleep(delay).await;
+        delay = (delay * 2).min(POLL_MAX);
+    }
+}
+
+/// Marks `payment_hash` as handled by a live hook call of this process
+/// while it lives, so a "claimed" record is told apart from one a prior
+/// run left behind.
+struct Inflight<'a> {
+    p: &'a Plugin<State>,
+    hash: String,
+}
+
+impl Drop for Inflight<'_> {
+    fn drop(&mut self) {
+        self.p.state().inflight.lock().unwrap_or_else(|e| e.into_inner()).remove(&self.hash);
+    }
+}
+
+fn is_inflight(p: &Plugin<State>, hash: &str) -> bool {
+    p.state().inflight.lock().unwrap_or_else(|e| e.into_inner()).contains(hash)
 }
 
 pub(crate) async fn on_htlc_accepted(p: Plugin<State>, v: Value) -> Result<Value, Error> {
-    // Only a final hop (no onion.short_channel_id/next hop) can be a swap
-    // settlement — never second-guess an HTLC we're meant to forward on.
-    let is_final = v
-        .get("onion")
-        .and_then(|o| o.get("short_channel_id"))
-        .is_none();
+    // Only a final hop (no onion.short_channel_id, nor a blinded path's
+    // next_node_id) can be a swap settlement: never second-guess an HTLC
+    // we're meant to forward on.
+    let onion = v.get("onion");
+    let is_final = ["short_channel_id", "next_node_id"]
+        .iter()
+        .all(|k| onion.and_then(|o| o.get(*k)).is_none());
     if !is_final {
         return Ok(json!({"result": "continue"}));
     }
@@ -237,32 +365,53 @@ pub(crate) async fn on_htlc_accepted(p: Plugin<State>, v: Value) -> Result<Value
 
     let mut rpc = new_rpc(&p).await?;
 
-    // Restart-replay idempotency: if we already committed to this swap
-    // before a prior process exited, don't re-decide -- re-derive the
-    // verdict from leg 2's own status (see resolve_from_leg2_status). A
-    // "failed" record means we already gave a verdict in a prior run; let
-    // a fresh attempt (same payment_hash, e.g. the payer retrying with a
-    // bigger amount) fall through and be judged again from scratch.
-    match lookup_quote(&mut rpc, &payment_hash).await {
-        Ok(Some(r)) if r.state == "claimed" => {
-            // Leg 2's outcome is on the node that paid it. Until it can be
-            // asked, hold leg 1: failing it while leg 2 may have been paid
-            // would lose us that payment.
-            let mut rpc2 = loop {
-                match leg2_rpc(&p, &r.to_asset).await {
-                    Ok(r2) => break r2,
-                    Err(e) => {
-                        log::warn!("assetswap: replaying {payment_hash}, retrying in {REMOTE_RETRY_SECS}s: {e}");
-                        tokio::time::sleep(std::time::Duration::from_secs(REMOTE_RETRY_SECS)).await;
+    // Leg 1's absolute expiry, which bounds how long we may hold it.
+    let cltv_expiry = match htlc.get("cltv_expiry").and_then(Value::as_u64) {
+        Some(c) => c as u32,
+        None => {
+            let h = getinfo(&mut rpc).await?["blockheight"].as_u64().unwrap_or(0) as u32;
+            h + cltv_expiry_relative
+        }
+    };
+
+    // What we already know of this hash. A record on the way to leg 2, or
+    // past it, is settled from leg 2's own status (restart replay, or
+    // another HTLC with the same hash), never decided afresh.
+    // Fail closed: if we can't read the record, it may say leg 2 is being
+    // paid, and a `continue` would have lightningd fail leg 1 (no invoice).
+    // An error here makes lightningd stop instead, like our other RPC errors.
+    let existing = lookup_quote(&mut rpc, &payment_hash)
+        .await
+        .map_err(|e| anyhow!("datastore lookup failed for {payment_hash}: {e}"))?;
+    if let Some((rec, generation)) = &existing {
+        match rec.state.as_str() {
+            "complete" => return Ok(resolve_with_hex(rec.preimage.as_deref())),
+            "paying" => return Ok(settle(&p, &payment_hash, cltv_expiry, rec, false).await),
+            // From before "paying" existed: leg 2 may have been sent, on
+            // the node configured for the asset (there's no other).
+            "claimed" if rec.v < RECORD_VERSION => {
+                return Ok(settle(&p, &payment_hash, cltv_expiry, rec, false).await)
+            }
+            "claimed" => {
+                // Not ours now: a prior run claimed it and stopped before
+                // leg 2 (or "paying" would say so). Nothing was sent.
+                if !is_inflight(&p, &payment_hash) {
+                    log::info!("assetswap: {payment_hash} was claimed but leg 2 never attempted: failing leg 1");
+                    let failed = QuoteRecord {
+                        state: "failed".into(),
+                        ..rec.clone()
+                    };
+                    if let Err(e) = write_record(&mut rpc, &payment_hash, &failed, Some(*generation)).await {
+                        log::warn!("assetswap: couldn't mark quote {payment_hash} as failed: {e}");
                     }
                 }
-            };
-            return Ok(resolve_from_leg2_status(&mut rpc2, &r).await);
-        }
-        Ok(_) => {}
-        Err(e) => {
-            log::warn!("assetswap: datastore lookup failed for {payment_hash}: {e}");
-            return Ok(json!({"result": "continue"}));
+                return Ok(fail_incorrect_details());
+            }
+            "failed" => {} // judged afresh below, after a leg-2 check
+            other => {
+                log::warn!("assetswap: quote {payment_hash} in unknown state {other:?}");
+                return Ok(fail_incorrect_details());
+            }
         }
     }
 
@@ -276,6 +425,14 @@ pub(crate) async fn on_htlc_accepted(p: Plugin<State>, v: Value) -> Result<Value
     let Ok(meta) = decode_swap_metadata(metadata_hex) else {
         return Ok(json!({"result": "continue"}));
     };
+    // A new swap: only for a provider that lightningd won't outlive.
+    if !p.state().provider {
+        log::info!("assetswap: leg 1 {payment_hash} for a swap, but we're not an important plugin: not taking it");
+        return Ok(fail_incorrect_details());
+    }
+    if check_asset(&meta.to_asset).is_err() {
+        return Ok(fail_incorrect_details());
+    }
 
     // Leg 2 is paid by this node, or, for an asset on another chain, by
     // the node of ours `assetswap-remote` names (its invoice is for that
@@ -295,6 +452,7 @@ pub(crate) async fn on_htlc_accepted(p: Plugin<State>, v: Value) -> Result<Value
     else {
         return Ok(fail_incorrect_details());
     };
+    let payee = decoded.payee.map(|k| k.to_string());
     let (Some(to_amount_msat), Some(final_payment_hash), Some(leg2_final_cltv)) = (
         decoded.amount_msat.map(|a| a.msat()),
         decoded.payment_hash.map(|h| h.to_string()),
@@ -310,10 +468,18 @@ pub(crate) async fn on_htlc_accepted(p: Plugin<State>, v: Value) -> Result<Value
     }
 
     // Live pricing: this is the only check that decides whether we'd lose
-    // money, since nothing was pre-approved. Ask pricetiers-plugin for
-    // today's rate and require at least its cheapest tier -- anything above
+    // money, since nothing was pre-approved. Leg 2 costs its amount plus up
+    // to `maxfee` in routing fees; ask pricetiers-plugin for today's rate
+    // on both and require at least its cheapest tier -- anything above
     // that is just extra profit, there's no fixed amount to match exactly.
-    let priced = match fetch_price_tiers(&mut rpc, &meta.to_asset, to_amount_msat).await {
+    let cfg = &p.state().config;
+    let Some(maxfee_msat) = leg2_maxfee(to_amount_msat, cfg.leg2_maxfee_base_msat, cfg.leg2_maxfee_ppm) else {
+        return Ok(fail_incorrect_details());
+    };
+    let Some(cost_msat) = to_amount_msat.checked_add(maxfee_msat) else {
+        return Ok(fail_incorrect_details());
+    };
+    let priced = match fetch_price_tiers(&mut rpc, &meta.to_asset, cost_msat).await {
         Ok(p) => p,
         Err(_) => return Ok(fail_incorrect_details()), // not a pair we quote
     };
@@ -330,35 +496,124 @@ pub(crate) async fn on_htlc_accepted(p: Plugin<State>, v: Value) -> Result<Value
         return Ok(fail_incorrect_details());
     };
     let expected_chan_asset = is_asset_id(&priced.from_asset).then_some(priced.from_asset.as_str());
-    let budget = leg2_final_cltv + p.state().config.safety_blocks + p.state().config.min_hop_budget;
-    if chan_asset.as_deref() != expected_chan_asset || cltv_expiry_relative < budget {
+    if chan_asset.as_deref() != expected_chan_asset {
         return Ok(fail_incorrect_details());
     }
 
-    let rec = QuoteRecord {
-        state: "claimed".into(), // claim_quote_atomically always writes this state regardless
+    // CLTVs by time: leg 1's in this chain's blocks, leg 2's in its own.
+    let s1 = block_seconds(&p, &priced.from_asset, &rpc_path(&p), &mut rpc).await;
+    let s2 = block_seconds(&p, &meta.to_asset, &leg2_path(&p, &meta.to_asset), &mut rpc2).await;
+    let (s1, s2) = match (s1, s2) {
+        (Ok(a), Ok(b)) => (a, b),
+        (Err(e), _) | (_, Err(e)) => {
+            log::warn!("assetswap: {payment_hash}: {e}");
+            return Ok(fail_incorrect_details());
+        }
+    };
+    let Some(maxdelay) = leg2_cltv_gate(
+        cltv_expiry_relative,
+        leg2_final_cltv,
+        cfg.safety_blocks,
+        cfg.min_hop_budget,
+        s1,
+        s2,
+    ) else {
+        log::debug!(
+            "assetswap: {payment_hash}: leg 1's {cltv_expiry_relative} blocks of {s1}s leave too little for \
+             leg 2's final {leg2_final_cltv} blocks of {s2}s"
+        );
+        return Ok(fail_incorrect_details());
+    };
+
+    // Which node pays leg 2, as "paying" will record it.
+    let leg2_node = match getinfo(&mut rpc2).await {
+        Ok(info) => match info["id"].as_str() {
+            Some(id) => id.to_string(),
+            None => return Ok(fail_incorrect_details()),
+        },
+        Err(e) => {
+            log::warn!("assetswap: {payment_hash}: node paying leg 2: {e}");
+            return Ok(fail_incorrect_details());
+        }
+    };
+
+    // Leg 2 must pay someone else. An invoice of our own (either node)
+    // would be "paid" by our own funds -- marked paid in exchange for a
+    // leg 1 priced in another asset -- and xpay to ourselves never even
+    // leaves the node, so no channel's asset check sees it.
+    let leg1_node = match getinfo(&mut rpc).await {
+        Ok(info) => info["id"].as_str().map(str::to_string),
+        Err(_) => None,
+    };
+    match (&payee, &leg1_node) {
+        (Some(payee), Some(leg1_node)) if payee != &leg2_node && payee != leg1_node => {}
+        _ => {
+            log::info!("assetswap: {payment_hash}: leg 2's invoice is ours (or has no payee): refused");
+            return Ok(fail_incorrect_details());
+        }
+    }
+
+    // A hash whose earlier swap failed may be tried again only if nothing
+    // of that leg 2 is still in flight or got through: else a payer could
+    // have us pay the payee twice. One that did get through is settled.
+    if let Some((rec, _)) = &existing {
+        match leg2_status(&p, &payment_hash, rec).await {
+            Leg2::Failed { .. } => {}
+            Leg2::Complete(pre) => {
+                log::info!("assetswap: {payment_hash}: an earlier leg 2 completed after all: resolving leg 1");
+                let hex = secret_hex(pre);
+                finalize(&p, &payment_hash, "complete", hex.clone()).await;
+                return Ok(resolve_with_hex(hex.as_deref()));
+            }
+            other => {
+                log::warn!("assetswap: {payment_hash}: not retrying, earlier leg 2: {other:?}");
+                return Ok(fail_incorrect_details());
+            }
+        }
+    }
+
+    // Claim the hash (CAS): only one HTLC goes on to pay leg 2.
+    let _inflight = {
+        p.state().inflight.lock().unwrap_or_else(|e| e.into_inner()).insert(payment_hash.clone());
+        Inflight {
+            p: &p,
+            hash: payment_hash.clone(),
+        }
+    };
+    let mut rec = QuoteRecord {
+        state: "claimed".into(),
         from_asset: priced.from_asset.clone(),
         to_asset: meta.to_asset.clone(),
         final_bolt11: meta.final_bolt11.clone(),
+        v: RECORD_VERSION,
+        leg2_node: None,
+        paying_since: None,
+        preimage: None,
     };
-    let Some(claimed_generation) = claim_quote_atomically(&mut rpc, &payment_hash, &rec)
-        .await
-        .unwrap_or(None)
-    else {
-        return Ok(fail_incorrect_details()); // replay: someone already claimed this hash
+    let prev = existing.as_ref().map(|(_, g)| *g);
+    let Ok(claimed_generation) = write_record(&mut rpc, &payment_hash, &rec, prev).await else {
+        return Ok(fail_incorrect_details()); // someone else claimed this hash
     };
 
-    // xpay's maxdelay bounds leg 2's whole CLTV, the payee's final one
-    // included: leg 2 must time out safety_blocks before leg 1 does.
-    let maxdelay = cltv_expiry_relative.saturating_sub(p.state().config.safety_blocks);
     let layers = match asset_layers(&mut rpc2, &rec.to_asset).await {
         Ok(l) => l,
         Err(e) => {
             log::warn!("assetswap: leg 2 for {payment_hash}: {e}");
-            mark_quote_failed(&mut rpc, &payment_hash, &rec, claimed_generation).await;
+            finalize(&p, &payment_hash, "failed", None).await;
             return Ok(fail_incorrect_details());
         }
     };
+
+    // From here on leg 2 may be sent: only `settle` fails leg 1.
+    rec.state = "paying".into();
+    rec.leg2_node = Some(leg2_node);
+    rec.paying_since = Some(now_unix());
+    if let Err(e) = write_record(&mut rpc, &payment_hash, &rec, Some(Some(claimed_generation))).await {
+        log::warn!("assetswap: {payment_hash}: couldn't record paying: {e}");
+        finalize(&p, &payment_hash, "failed", None).await;
+        return Ok(fail_incorrect_details());
+    }
+
     match rpc2
         .call_typed(&XpayRequest {
             invstring: rec.final_bolt11.clone(),
@@ -367,19 +622,47 @@ pub(crate) async fn on_htlc_accepted(p: Plugin<State>, v: Value) -> Result<Value
             label: None,
             localinvreqid: None,
             maxdelay: Some(maxdelay),
-            maxfee: None,
+            maxfee: Some(Amount::from_msat(maxfee_msat)),
             partial_msat: None,
             payer_note: None,
-            retry_for: None,
+            retry_for: Some(XPAY_RETRY_FOR),
             layers: Some(layers),
         })
         .await
     {
-        Ok(res) => Ok(resolve_with_preimage(res.payment_preimage)),
+        Ok(res) => {
+            let hex = secret_hex(res.payment_preimage);
+            finalize(&p, &payment_hash, "complete", hex.clone()).await;
+            Ok(resolve_with_hex(hex.as_deref()))
+        }
         Err(e) => {
             log::warn!("assetswap: leg 2 (xpay) failed for {payment_hash}: {e}");
-            mark_quote_failed(&mut rpc, &payment_hash, &rec, claimed_generation).await;
-            Ok(fail_incorrect_details())
+            let gave_up = e.code.is_some_and(|c| XPAY_GAVE_UP.contains(&c));
+            Ok(settle(&p, &payment_hash, cltv_expiry, &rec, gave_up).await)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ListsendpaysPaymentsStatus::{COMPLETE, FAILED, PENDING};
+
+    #[test]
+    fn classify_parts() {
+        assert_eq!(classify::<u8>([]), Leg2::Failed { parts: 0 });
+        assert_eq!(classify::<u8>([(FAILED, None), (FAILED, None)]), Leg2::Failed { parts: 2 });
+        assert_eq!(classify::<u8>([(FAILED, None), (PENDING, None)]), Leg2::Pending);
+        // Any complete part settles it, even with others pending or failed.
+        assert_eq!(classify([(FAILED, None), (PENDING, None), (COMPLETE, Some(7u8))]), Leg2::Complete(7));
+        assert!(matches!(classify::<u8>([(COMPLETE, None)]), Leg2::Unknown(_)));
+    }
+
+    #[test]
+    fn preimage_hex() {
+        let hex = "11".repeat(32);
+        assert_eq!(resolve_with_hex(Some(&hex))["result"], "resolve");
+        assert_eq!(resolve_with_hex(Some("zz"))["result"], "fail");
+        assert_eq!(resolve_with_hex(None)["result"], "fail");
     }
 }

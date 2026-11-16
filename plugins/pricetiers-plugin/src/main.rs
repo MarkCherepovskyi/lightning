@@ -69,17 +69,25 @@ struct Tier {
 /// fail, at the cost of a worse worst-case rate for the payer.
 const MARGINS: [(&str, u64); 3] = [("low", 2010), ("medium", 2030), ("high", 2060)];
 
-fn make_tiers(pair: &Pair, to_amount_msat: u64) -> Vec<Tier> {
+/// The tiers for `to_amount_msat` of `pair`'s to_asset. Products are taken
+/// in u128; a result that doesn't fit back in a u64 is an error, never a
+/// wrapped (and so far too cheap) price.
+fn make_tiers(pair: &Pair, to_amount_msat: u64) -> Result<Vec<Tier>, Error> {
+    let too_big = || anyhow!("price for {to_amount_msat} msat of {} doesn't fit in a u64", pair.to_asset);
     MARGINS
         .iter()
         .map(|(name, permille)| {
-            let rate_ppm = pair.rate_ppm * permille / 1000;
-            let from_amount_msat = to_amount_msat * rate_ppm / 1_000_000 + pair.fee_base_msat;
-            Tier {
+            let rate_ppm =
+                u64::try_from(u128::from(pair.rate_ppm) * u128::from(*permille) / 1000).map_err(|_| too_big())?;
+            let from_amount_msat = u64::try_from(u128::from(to_amount_msat) * u128::from(rate_ppm) / 1_000_000)
+                .ok()
+                .and_then(|m| m.checked_add(pair.fee_base_msat))
+                .ok_or_else(too_big)?;
+            Ok(Tier {
                 name: name.to_string(),
                 rate_ppm,
                 from_amount_msat,
-            }
+            })
         })
         .collect()
 }
@@ -111,7 +119,7 @@ async fn pricetiers(p: Plugin<State>, args: Value) -> Result<Value, Error> {
         "from_asset": pair.from_asset,
         "rate_ppm": pair.rate_ppm,
         "fee_base_msat": pair.fee_base_msat,
-        "tiers": make_tiers(pair, to_amount_msat),
+        "tiers": make_tiers(pair, to_amount_msat)?,
     }))
 }
 
@@ -145,4 +153,49 @@ async fn main() -> Result<(), Error> {
     let plugin = plugin.start(State { pairs }).await?;
     plugin.join().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pair(rate_ppm: u64, fee_base_msat: u64) -> Pair {
+        Pair {
+            from_asset: "lbtc".into(),
+            to_asset: "eth".into(),
+            rate_ppm,
+            fee_base_msat,
+        }
+    }
+
+    fn amounts(t: &[Tier]) -> Vec<u64> {
+        t.iter().map(|t| t.from_amount_msat).collect()
+    }
+
+    #[test]
+    fn tiers_unchanged_for_normal_amounts() {
+        // 1:1 rate: 2.01x / 2.03x / 2.06x (tests/test_liquid_evm_swap.py's 20,300).
+        let t = make_tiers(&pair(1_000_000, 0), 10_000_000).unwrap();
+        assert_eq!(amounts(&t), vec![20_100_000, 20_300_000, 20_600_000]);
+        assert_eq!(t[1].rate_ppm, 2_030_000);
+        let t = make_tiers(&pair(500_000, 7), 1_000).unwrap();
+        assert_eq!(amounts(&t), vec![1_005 + 7, 1_015 + 7, 1_030 + 7]);
+    }
+
+    #[test]
+    fn no_overflow_where_u64_products_would() {
+        // to_amount * rate_ppm is past u64 here, the result isn't.
+        let t = make_tiers(&pair(1_000_000, 0), u64::MAX / 4).unwrap();
+        assert_eq!(t[0].from_amount_msat, (u128::from(u64::MAX / 4) * 2_010_000 / 1_000_000) as u64);
+        // rate_ppm * permille is past u64, rate_ppm * permille / 1000 isn't.
+        let t = make_tiers(&pair(u64::MAX / 1000, 0), 0).unwrap();
+        assert_eq!(t[0].rate_ppm, (u128::from(u64::MAX / 1000) * 2010 / 1000) as u64);
+    }
+
+    #[test]
+    fn results_past_u64_are_errors() {
+        assert!(make_tiers(&pair(1_000_000, 0), u64::MAX).is_err());
+        assert!(make_tiers(&pair(u64::MAX, 0), 1).is_err());
+        assert!(make_tiers(&pair(1_000_000, u64::MAX), 1_000).is_err());
+    }
 }
