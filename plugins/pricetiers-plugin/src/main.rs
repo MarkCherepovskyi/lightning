@@ -14,23 +14,22 @@
 //! implement the same RPC contract: {to_asset, to_amount_msat} ->
 //! {from_asset, rate_ppm, fee_base_msat, tiers}.
 //!
-//! `pricetiers-pair` options only set a pair's *starting* rate, at boot.
-//! `setpricetier` (`lightning-cli setpricetier from_asset to_asset
-//! rate_ppm [fee_base_msat]`) changes it live, with no restart - and
-//! persists it to lightningd's own datastore (see `rpc::price_key`), so a
-//! later restart keeps the operator-set rate rather than reverting to
-//! the boot-time option for the same `to_asset`.
-
-mod rpc;
+//! Two sources for the pairs, never mixed: `pricetiers-ember-url` (an
+//! ember deployment's internal endpoint, polled every
+//! `pricetiers-ember-refresh-secs` and replacing the whole set each time -
+//! ember is the source of truth, managed with `ember-cli set-price-pair`),
+//! or, when that's unset, the static `pricetiers-pair` options. Every node
+//! polling the same ember means payer and provider price with the very same
+//! table, so a payer's own local estimate (assetswap-plugin's
+//! `quoteassetinvoice`) matches what the provider will accept.
 
 use anyhow::{anyhow, Error};
-use cln_plugin::options::StringArrayConfigOption;
+use cln_plugin::options::{DefaultIntegerConfigOption, StringArrayConfigOption, StringConfigOption};
 use cln_plugin::{Builder, Plugin};
-use cln_rpc::model::requests::{DatastoreMode, DatastoreRequest, ListdatastoreRequest};
-use rpc::{new_rpc, price_key, price_prefix};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::RwLock;
 
 const OPT_PAIR: StringArrayConfigOption = StringArrayConfigOption::new_str_arr_no_default(
@@ -39,24 +38,27 @@ const OPT_PAIR: StringArrayConfigOption = StringArrayConfigOption::new_str_arr_n
      many msat of from_asset are required per 1_000_000 msat worth of to_asset at \
      today's reference price. Repeatable. Asset ids are opaque strings to this plugin \
      (e.g. assetswap-plugin's convention of the literal \"lbtc\" for L-BTC) -- never \
-     interpreted, just matched against what a `pricetiers` caller asks for.",
+     interpreted, just matched against what a `pricetiers` caller asks for. Ignored \
+     when pricetiers-ember-url is set.",
+);
+const OPT_EMBER_URL: StringConfigOption = StringConfigOption::new_str_no_default(
+    "pricetiers-ember-url",
+    "Base URL of an ember deployment's internal endpoint (e.g. \
+     http://ember-server-internal.ember-nodes.svc.cluster.local:8080). When set, the \
+     quotable pairs come only from ember's GET /v1/price-pairs, polled periodically.",
+);
+const OPT_EMBER_REFRESH: DefaultIntegerConfigOption = DefaultIntegerConfigOption::new_i64_with_default(
+    "pricetiers-ember-refresh-secs",
+    30,
+    "How often to re-poll pricetiers-ember-url (default 30s)",
 );
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 struct Pair {
     from_asset: String,
     to_asset: String,
     rate_ppm: u64,
     fee_base_msat: u64,
-}
-
-/// Inserts `pair`, replacing any existing entry with the same `to_asset`
-/// (the same uniqueness `pricetiers`'s own lookup assumes).
-fn upsert_pair(pairs: &mut Vec<Pair>, pair: Pair) {
-    match pairs.iter_mut().find(|pr| pr.to_asset == pair.to_asset) {
-        Some(existing) => *existing = pair,
-        None => pairs.push(pair),
-    }
 }
 
 fn parse_pair(s: &str) -> Result<Pair, Error> {
@@ -76,13 +78,9 @@ fn parse_pair(s: &str) -> Result<Pair, Error> {
 
 #[derive(Clone)]
 struct State {
-    /// Shared with every RPC call: `setpricetier` writes here so a change
-    /// takes effect for the very next `pricetiers`/`setpricetier` call, no
-    /// restart needed - same instant-effect convention as ember-server's
-    /// `ember-cli set-idle-timeout`/`set-swap-service`.
+    /// Replaced wholesale by the ember poller; read by every `pricetiers`
+    /// call, so a price change in ember takes effect within one refresh.
     pairs: Arc<RwLock<Vec<Pair>>>,
-    lightning_dir: String,
-    rpc_file: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -132,7 +130,7 @@ async fn pricetiers(p: Plugin<State>, args: Value) -> Result<Value, Error> {
     let pair = pairs
         .iter()
         .find(|pr| pr.to_asset == to_asset)
-        .ok_or_else(|| anyhow!("no pricetiers-pair configured with to_asset {to_asset:?}"))?;
+        .ok_or_else(|| anyhow!("no price pair configured with to_asset {to_asset:?}"))?;
 
     Ok(json!({
         "from_asset": pair.from_asset,
@@ -142,61 +140,41 @@ async fn pricetiers(p: Plugin<State>, args: Value) -> Result<Value, Error> {
     }))
 }
 
-/// Sets (or creates) the quotable pair for `to_asset`, live - the very
-/// next `pricetiers` call for it reflects the change, no restart needed.
-/// Also persists it to lightningd's own datastore (`rpc::price_key`), so
-/// it survives one too, taking precedence over whatever `pricetiers-pair`
-/// option was set at boot (see `main`'s startup merge).
-async fn setpricetier(p: Plugin<State>, args: Value) -> Result<Value, Error> {
-    let from_asset = param(&args, 0, "from_asset")
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("Missing from_asset"))?
-        .to_string();
-    let to_asset = param(&args, 1, "to_asset")
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("Missing to_asset"))?
-        .to_string();
-    let rate_ppm = param(&args, 2, "rate_ppm")
-        .and_then(Value::as_u64)
-        .ok_or_else(|| anyhow!("Missing or invalid rate_ppm"))?;
-    let fee_base_msat = param(&args, 3, "fee_base_msat")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-
-    let pair = Pair {
-        from_asset,
-        to_asset: to_asset.clone(),
-        rate_ppm,
-        fee_base_msat,
-    };
-
-    let mut rpc = new_rpc(&p.state().lightning_dir, &p.state().rpc_file).await?;
-    let existing = rpc
-        .call_typed(&ListdatastoreRequest {
-            key: Some(price_key(&to_asset)),
-        })
+async fn fetch_ember_pairs(client: &reqwest::Client, url: &str) -> Result<Vec<Pair>, Error> {
+    let pairs = client
+        .get(format!("{}/v1/price-pairs", url.trim_end_matches('/')))
+        .send()
         .await?
-        .datastore
-        .into_iter()
-        .next();
-    let mode = if existing.is_some() { DatastoreMode::MUST_REPLACE } else { DatastoreMode::MUST_CREATE };
-    rpc.call_typed(&DatastoreRequest {
-        generation: existing.and_then(|d| d.generation),
-        hex: None,
-        mode: Some(mode),
-        string: Some(serde_json::to_string(&pair)?),
-        key: price_key(&to_asset),
-    })
-    .await?;
+        .error_for_status()?
+        .json::<Vec<Pair>>()
+        .await?;
+    Ok(pairs)
+}
 
-    upsert_pair(&mut *p.state().pairs.write().await, pair.clone());
-
-    Ok(json!({
-        "from_asset": pair.from_asset,
-        "to_asset": pair.to_asset,
-        "rate_ppm": pair.rate_ppm,
-        "fee_base_msat": pair.fee_base_msat,
-    }))
+/// Keeps `pairs` in sync with ember. A failed poll leaves the last good set
+/// in place rather than emptying it - a brief ember outage shouldn't stop
+/// in-flight swaps from being priced.
+async fn poll_ember(url: String, refresh: Duration, pairs: Arc<RwLock<Vec<Pair>>>) {
+    let client = match reqwest::Client::builder().timeout(Duration::from_secs(10)).build() {
+        Ok(c) => c,
+        Err(e) => {
+            log::warn!("pricetiers: can't build HTTP client: {e}");
+            return;
+        }
+    };
+    loop {
+        match fetch_ember_pairs(&client, &url).await {
+            Ok(fresh) => {
+                let mut current = pairs.write().await;
+                if *current != fresh {
+                    log::info!("pricetiers: {} price pair(s) from ember", fresh.len());
+                    *current = fresh;
+                }
+            }
+            Err(e) => log::warn!("pricetiers: polling {url}: {e}"),
+        }
+        tokio::time::sleep(refresh).await;
+    }
 }
 
 #[tokio::main]
@@ -206,19 +184,13 @@ async fn main() -> Result<(), Error> {
     let Some(plugin) = Builder::new(tokio::io::stdin(), tokio::io::stdout())
         .dynamic()
         .option(OPT_PAIR)
+        .option(OPT_EMBER_URL)
+        .option(OPT_EMBER_REFRESH)
         .rpcmethod(
             "pricetiers",
             "Quote low/medium/high price-ceiling tiers for to_asset/to_amount_msat, \
-             discovering from_asset from the matching configured pricetiers-pair",
+             discovering from_asset from the matching configured price pair",
             pricetiers,
-        )
-        .rpcmethod(
-            "setpricetier",
-            "Set (or create) the quotable pair for to_asset: from_asset, to_asset, \
-             rate_ppm, fee_base_msat (default 0). Takes effect immediately and \
-             persists across restarts, overriding any pricetiers-pair option for \
-             the same to_asset.",
-            setpricetier,
         )
         .configure()
         .await?
@@ -226,40 +198,30 @@ async fn main() -> Result<(), Error> {
         return Ok(());
     };
 
-    let mut pairs: Vec<Pair> = plugin
+    let static_pairs: Vec<Pair> = plugin
         .option_str("pricetiers-pair")?
         .and_then(|v| v.as_str_arr().cloned())
         .unwrap_or_default()
         .iter()
         .map(|s| parse_pair(s))
         .collect::<Result<_, _>>()?;
+    let ember_url = plugin.option(&OPT_EMBER_URL)?;
+    let refresh = Duration::from_secs(plugin.option(&OPT_EMBER_REFRESH)?.max(1) as u64);
 
-    // Persisted setpricetier overrides take precedence over whatever
-    // pricetiers-pair options were set at boot, for the same to_asset.
-    let configuration = plugin.configuration();
-    let lightning_dir = configuration.lightning_dir;
-    let rpc_file = configuration.rpc_file;
-    let mut rpc = new_rpc(&lightning_dir, &rpc_file).await?;
-    let overrides = rpc
-        .call_typed(&ListdatastoreRequest {
-            key: Some(price_prefix()),
-        })
-        .await?;
-    for d in overrides.datastore {
-        let Some(s) = d.string else { continue };
-        match serde_json::from_str::<Pair>(&s) {
-            Ok(pair) => upsert_pair(&mut pairs, pair),
-            Err(e) => log::warn!("pricetiers: ignoring unparseable stored pair at {:?}: {e}", d.key),
+    let pairs = Arc::new(RwLock::new(match &ember_url {
+        Some(_) => {
+            if !static_pairs.is_empty() {
+                log::warn!("pricetiers: pricetiers-ember-url is set, ignoring pricetiers-pair options");
+            }
+            Vec::new()
         }
-    }
+        None => static_pairs,
+    }));
 
-    let plugin = plugin
-        .start(State {
-            pairs: Arc::new(RwLock::new(pairs)),
-            lightning_dir,
-            rpc_file,
-        })
-        .await?;
+    let plugin = plugin.start(State { pairs: pairs.clone() }).await?;
+    if let Some(url) = ember_url {
+        tokio::spawn(poll_ember(url, refresh, pairs));
+    }
     plugin.join().await?;
     Ok(())
 }
