@@ -64,10 +64,12 @@ def make_cfg(tmp_path, url='http://127.0.0.1:1', contract='0x' + '11' * 20, key=
                      int(min_eth * 10**18), str(tmp_path), secrets=list(secrets) + [url, key.hex()])
 
 
-def offline_backend(tmp_path, ln=None, log=None, checked=True):
+def offline_backend(tmp_path, ln=None, log=None, checked=True, identity=False):
     """A Backend for the hook tests: no EVM node, options checked and fine,
-    a funded key."""
+    a funded key. identity: evm-require-peer-identity (off, so the other
+    hook tests need no identity messages; tests/test_identity.py has those)."""
     b = eb.Backend(make_cfg(tmp_path), log or Log(), lnrpc=(lambda: ln) if ln else None)
+    b.cfg.require_peer_identity = identity
     b.interval = INTERVAL
     b._chain_id = 31337
     if checked:
@@ -556,8 +558,11 @@ def test_deposit_withdraw_status(chain, backend):
     d = backend.deposit(50_000)
     assert d['status'] == 'mined' and d['amount_sat'] == 50_000 and d['address'].startswith('bcrt1p')
     assert backend.ix.utxo(d['txid'], 0) == {'amount': 50_000, 'script': A.p2tr, 'height': d['height']}
-    with pytest.raises(eb.UserError, match='BadDepositScript'):
+    with pytest.raises(eb.UserError, match='P2WPKH or P2TR'):
         backend.deposit(1000, backend.exitaddr(backend.address)['address'])
+    # Nor to a witness program the contract can't spend (v2): nothing is sent.
+    with pytest.raises(eb.UserError, match='P2WPKH or P2TR'):
+        backend.deposit(1000, btc.segwit_address('bcrt', 2, bytes(32)))
     with pytest.raises(eb.UserError, match='nothing to withdraw'):
         backend.withdraw()
     # Pay an exit to our own address, then withdraw it.

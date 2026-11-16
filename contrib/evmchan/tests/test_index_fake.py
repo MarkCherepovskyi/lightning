@@ -269,29 +269,40 @@ def test_split_through_the_index(tmp_path):
     check_chain(ix, node)
 
 
-def test_undecodable_events_are_counted_not_served(tmp_path):
-    """SPEC 5.2: an undecodable event counts in the log hash, is kept out of
-    served blocks and of the UTXO set, is logged at BROKEN level, and never
-    stops the index."""
+def test_undecodable_events_are_never_proven(tmp_path):
+    """SPEC 5.2: an undecodable event is logged at BROKEN level and left out
+    of served blocks, and the index never proves past it: the contract only
+    emits txs it parsed, so it is a bad reply that would otherwise hide a tx
+    (a revoked commitment, say) from CLN for good. The tip stays put until a
+    re-read decodes it."""
     node = FakeChain()
     logged = []
     ix = evmindex.Index(str(tmp_path / 'u.sqlite3'), node, CONTRACT, log=lambda lv, m: logged.append((lv, m)))
     good, other = node.deposit(), node.deposit()
     junk = b'\x02\x00\x00\x00junk'
-    node.add_block(node.T(1), [good, (other, btc.Tx.parse(good).txid()), (junk, bytes(range(32)))])
+    # The provider swaps `other`'s raw tx for junk; its txid (topic) and so
+    # txCount/logHash still match the contract.
+    blk = node.add_block(node.T(1), [good, (junk, btc.Tx.parse(other).txid())])
     node.add_block(node.T(2))
     node.add_block(node.T(2) + 1)
+    tip = ix.tip()
     r = ix.sync()
-    assert r['proven'] and ix.tip() == 1 and not ix.ibd
-    assert ix.undecodable == 2
-    assert [lv for lv, _ in logged].count('broken') == 2
+    assert not r['proven'] and ix.tip() == tip
+    assert ix.undecodable >= 1 and 'broken' in [lv for lv, _ in logged]
     assert all('junk' not in m for _, m in logged)
-    txs = btc.parse_block(ix.block(1)[1])[1]
-    assert [t.serialize() for t in txs[1:]] == [good]
-    assert ix.utxo(btc.Tx.parse(other).txid_hex(), 0) is None
-    assert ix.tx(btc.display(bytes(range(32)))) is None
-    assert ix.checkpoint()[2] == 3               # all three counted
+    for _ in range(3):
+        assert not ix.sync()['proven'] and ix.tip() == tip
 
+    # The provider answers honestly again: a re-read proves it, `other` is served.
+    blk['logs'][1]['data'] = '0x' + evm.abi_encode(['bytes'], [other]).hex()
+    for _ in range(10):
+        if ix.sync()['proven']:
+            break
+    assert ix.tip() >= 1
+    txs = btc.parse_block(ix.block(1)[1])[1]
+    assert [t.serialize() for t in txs[1:]] == [good, other]
+    assert ix.utxo(btc.Tx.parse(other).txid_hex(), 0) is not None
+    check_chain(ix, node)
 
 def test_header_cache_follows_changes(tmp_path):
     """A change at a height <= tip (here a log appended to an old block, as a

@@ -251,6 +251,16 @@ class EvmChain:
 
     # ---------------------------------------------------- the contract
 
+    def deploy_other(self, interval=INTERVAL):
+        """Another UtxoChain (ETH) on this anvil, for a node given
+        options={'evm-contract': address}: a different network on the same
+        EVM chain (SPEC 5.4 peer identity). The helpers here keep reading
+        self.contract. Returns its address."""
+        with self._send_lock:
+            rc = self.rpc.send(self.deployer, None, gas=8_000_000,
+                               data=_code(ARTIFACT) + evm.abi_encode(['uint256'], [interval]))
+        return evm.checksum_address(rc['contractAddress'])
+
     def const(self, name):
         return evm.abi_decode(['uint256'], self.rpc.eth_call(self.contract, evm.selector(name + '()')))[0]
 

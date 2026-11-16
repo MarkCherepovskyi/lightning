@@ -496,6 +496,11 @@ lightningd --network=regtest --disable-plugin=bcli \
   the lightning dir.
   - It is used only when the index is empty.
   - Otherwise it is ignored, with an INFO line.
+- **`evm-require-peer-identity`:** `true` (default) or `false`. Whether channel
+  opens need the peer's identity message to name this node's EVM chain,
+  contract and asset, and whether a peer naming another one is disconnected
+  (5.4 "Peer identity"). With `false` the plugin still sends its own message
+  and logs mismatches, but refuses and disconnects nothing for them.
 
 The plugin is `dynamic: false` and MUST NOT call lightningd during `init`.
 lightningd waits on the backend plugin at startup, as it does with bcli.
@@ -575,7 +580,11 @@ lightningd waits on the backend plugin at startup, as it does with bcli.
   - It still counts in the log hash.
   - It is left out of served blocks, so that no node serves CLN a block CLN
     can't parse.
-  - It never stops the index.
+  - It is never proven: the contract only emits txs it parsed and hashed
+    itself, so an undecodable event can only be a bad reply. Proving past it
+    would hide that tx (a revoked commitment, an HTLC claim) from CLN for
+    good. The index treats it as a log hash mismatch: it re-reads the range
+    (repair), and the tip stays where it is until a re-read decodes.
 - **Snapshots.** A fresh node can start from an index snapshot made by
   anyone (`evm-snapshot`, 5.5), and need not trust it. A snapshot is a
   gzip'd JSON-lines file, `evmindex.py` has the format:
@@ -807,6 +816,56 @@ treats that as fatal.
 - **Before the option check has run, or while the ETH balance is unknown,** every
   open is refused.
 - `openchannel` and `openchannel2` are registered with `before=['funder']`.
+- **Peer identity.** Every EVM node runs `--network=regtest` (5.6), so every
+  one has regtest's chain hash and the `bcrt` invoice prefix whatever its
+  chain, contract or asset: lightningd lets nodes on different contracts
+  connect, gossip and start opening channels. Until CLN has a network of its
+  own (9), the plugin tells peers apart itself. It is a stopgap.
+  - **Identity:** (EVM chain id, contract address, token address or none for
+    ETH, `UNITS_PER_SAT`), as read at startup (5.1, 4.6).
+  - **Message:** custom message type `0xFFE9` (65513; odd, so a peer without
+    this plugin ignores it), body big-endian: version `u8` = 1, chain id
+    `u64`, contract (20 bytes), token (20 bytes, all zero for ETH),
+    `UNITS_PER_SAT` (`u256`, 32 bytes): 83 bytes with the type. Bytes after
+    these fields are ignored, so version 1 can be extended; a change readers
+    must understand takes a new version. A message too short, or with a zero
+    chain id, contract or `UNITS_PER_SAT`, is malformed.
+  - **Sending:** the `peer_connected` hook (the one that checks anchors) sends
+    it with `sendcustommsg` from a thread, to every peer it lets in. lightningd
+    takes it while the peer is still connecting.
+  - **Receiving:** a `custommsg` hook (filtered to `0xFFE9`, always
+    `continue`) records per peer: matched, mismatched, or unreadable (malformed
+    or another version). A mismatch is logged (UNUSUAL) naming both
+    identities, and the peer is disconnected. An unreadable message refuses
+    opens but does not disconnect.
+  - **Per connection:** the `disconnect` notification marks the peer's record
+    stale; the peer must identify again on its next connection. A stale
+    mismatch is still remembered, for the early refusal below.
+  - **Inbound opens:** `openchannel` and `openchannel2` refuse a peer that is
+    mismatched or unreadable. If the peer has not identified itself on this
+    connection, they wait up to 5 s for its message, which may still be in
+    flight (the hooks are async, and the `custommsg` hook runs meanwhile).
+    Then they refuse: "peer has not identified its EVM chain/contract". A plain
+    `reject` is safe in `openchannel2`, because `dual_open_control.c` removes
+    its destructor on `dualopend` first. Only `openchannel2_changed`/`_sign`
+    need the abort above.
+  - **Outbound opens** (the `rpc_command` hook, now async):
+    `fundchannel_start` and `openchannel_init` run once the peer is connected,
+    and refuse as the inbound hooks do, waiting the same way. `fundchannel`
+    and `multifundchannel` may connect first, so they refuse only a known
+    mismatch (fresh or stale) or an unreadable message, failing early with
+    the identity error. The `fundchannel_start` or `openchannel_init` they
+    call then does the full check. A peer whose stale mismatch has since
+    been fixed needs a `connect` first.
+  - **Peers without this plugin** (older evmbackend) send nothing, so with the
+    option on no channel opens with them. `evm-require-peer-identity=false`
+    turns all of this off (5.1).
+  - **Gossip:** nothing changes. A channel announcement for an output on
+    another contract fails `getutxout` (5.3) and is dropped, as before.
+  - **Not covered:** invoices. A `bcrt` invoice from a node on another
+    contract still decodes. Paying it needs a route, which needs channels, and
+    channels across contracts are refused above. But nothing tells the user
+    the invoice is for another network.
 - **Tests only:** the flag `--evm-dev-no-outbound-filter` makes the
   `rpc_command` hook let this node's own opens through, so the integration
   tests can check that a peer's `openchannel*` hooks refuse them. The plugin
@@ -888,6 +947,9 @@ from a background thread.
   pyln-testing's options.
 - `--developer` is also what lets the tests-only `--evm-dev-no-outbound-filter`
   (5.4) be set; no network may run with that flag.
+- `--network=regtest` is shared by every EVM network. Keep
+  `evm-require-peer-identity` on (5.1, 5.4 "Peer identity") so nodes on
+  different contracts never open channels with each other.
 
 ## 6. Networks and deployment
 
@@ -985,7 +1047,9 @@ Each needs its tests green and your review before the next.
 
 - **ERC-20** is no longer later: it is token mode, section 4.6.
 - **A CLN network of its own:** chainparams from config, about 50 lines in CLN,
-  giving its own chain hash, address prefixes and limits.
+  giving its own chain hash, address prefixes and limits. This is the real fix
+  for network identity (open question 2). The plugin's identity handshake
+  (5.4) is a stopgap until then.
 - **An L1 force-inclusion fallback** for penalties and HTLC claims when the L2
   sequencer censors or stalls: an OptimismPortal deposit tx.
 - **Splicing**, with a check of the peer's splice inputs (open question 4).
@@ -1003,10 +1067,20 @@ Each needs its tests green and your review before the next.
      and a single 5,000,000,000 msat HTLC completes on a 20M-sat channel.
    - Without feature 19, `spendable_msat` is exactly 2^32−1 msat. A larger
      payment fails, as on Bitcoin.
-2. **Network identity.** Two contracts on the same chain look like one CLN
-   network: same chain hash, `bcrt` addresses. Gossip for channels on another
-   contract fails verification and is dropped, but nodes must be pointed at the
-   right contract.
+2. **Network identity: stopgap in place, real fix pending.** Every EVM node,
+   whatever its chain, contract or asset, runs `--network=regtest`, so they
+   look like one CLN network: the same chain hash and the same `bcrt` invoice
+   and address prefixes.
+   - Gossip for channels on another contract fails `getutxout` and is
+     dropped.
+   - Channel opens across contracts are refused by the plugin's identity
+     handshake (5.4 "Peer identity", `evm-require-peer-identity`), and such
+     peers are disconnected.
+   - Still shared: the chain hash in every message, and invoices. A node on
+     another contract can decode our invoices, and we can decode theirs.
+   - The fix is a custom-network option in core CLN (section 9) with its own
+     chain hash and HRP, so lightningd itself refuses foreign peers and
+     invoices.
 3. **Wall-clock heights.** An outage longer than the margins in 5.6 can still
    lose funds: if the EVM chain or a node's access to it is down for more than
    about a day on Base Sepolia, penalties and HTLC claims may be late. The

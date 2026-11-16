@@ -203,7 +203,8 @@ anchor channels, until about 100 blocks after a close. The node card says so too
   (`assetchan-invoice`/`-pay`), closes, on-chain sends from elementsd's wallet, and
   funding a node with L-BTC. On liquid-regtest it mines through elementsd
   (`--elements-rpc`, else the node's `assetchan-elements-rpc`). The Asset sweeps
-  table comes from `assetchan-sweeps`.
+  table is only filled by older plugins (`assetchan-sweeps`): core now funds and
+  broadcasts asset sweeps itself, from the node's own L-BTC wallet.
 - **EVM:** a status panel per node shows:
   - the contract, chain id, and ETH or the token (with `units_per_sat`);
   - the gas balance, with a warning below `evm-min-balance`;

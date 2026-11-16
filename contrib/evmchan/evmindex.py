@@ -601,14 +601,27 @@ class Index:
         self._set_meta('repair_failures', 0)
         self._db.execute('DELETE FROM staged')
 
+    def _undecodable(self, table, lo, hi):
+        """How many undecodable rows `table` holds in EVM blocks (lo, hi]; the
+        caller holds the lock."""
+        return self._db.execute('SELECT COUNT(*) FROM {} WHERE bad = 1 AND evm_block > ? AND evm_block <= ?'
+                                .format(table), (lo, hi)).fetchone()[0]
+
     def _prove(self, tagb, state):
         """True (checkpoint recorded) if the rows up to the tag block match the
         contract's state there, False on a mismatch, None if the index changed
-        while hashing (try again next poll)."""
+        while hashing (try again next poll).
+
+        An undecodable row is a mismatch even when the log hash agrees: the
+        contract only emits txs it parsed and hashed itself, so one can only
+        come from a bad reply, and counting it while serving nothing for it
+        would hide that tx (a revoked commitment, say) from CLN for good."""
         tag_n = _int(tagb['number'])
         with self._lock:
             number, count, loghash = self._base_checkpoint(tag_n)
             rev = self._rev
+            if self._undecodable('txs', number, tag_n):
+                return False
         got = self._hash_rows('txs', number, tag_n, count, loghash, rev)
         if got is None:
             return None
@@ -698,11 +711,12 @@ class Index:
             staged = {(r[0], r[2]): r for r in self._db.execute(
                 'SELECT evm_block, evm_hash, log_index, height, txid, raw, bad FROM staged '
                 'WHERE evm_block > ? AND evm_block <= ?', (base, tag_n))}
-            for row_id, blk, li, bhash, txid, height in self._db.execute(
-                    'SELECT id, evm_block, log_index, evm_hash, txid, height FROM txs '
+            for row_id, blk, li, bhash, txid, height, bad in self._db.execute(
+                    'SELECT id, evm_block, log_index, evm_hash, txid, height, bad FROM txs '
                     'WHERE evm_block > ? AND evm_block <= ?', (base, tag_n)).fetchall():
                 s = staged.get((blk, li))
-                if s is None or s[1] != bhash or s[4] != txid:
+                # (An undecodable row goes too: the staged one decodes.)
+                if s is None or s[1] != bhash or s[4] != txid or bad:
                     self._drop(row_id, blk, height)
                     dropped += 1
             for key in sorted(staged):
@@ -744,8 +758,12 @@ class Index:
         self._stage(tag_n)
         with self._lock:
             _, count, loghash = self._base_checkpoint(base)
+            undecodable = self._undecodable('staged', base, tag_n)
         got = self._hash_rows('staged', base, tag_n, count, loghash, None)
-        if got == tuple(state):
+        if undecodable:
+            self.log('broken', '{} undecodable events re-read up to EVM block {}: not proven'
+                     .format(undecodable, tag_n))
+        elif got == tuple(state):
             r = self._apply_staged(tagb, base, got)
             if r is not None:
                 self.log('unusual', 'repaired from EVM block {}: {} rows dropped, {} added'

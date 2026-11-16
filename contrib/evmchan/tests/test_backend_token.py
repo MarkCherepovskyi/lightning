@@ -164,8 +164,11 @@ def test_token_deposit_withdraw_status(tchain, tbackend):
     nonce0 = tchain.rpc.nonce(b.address)
     d2 = b.deposit(1, btc.segwit_address('bcrt', 0, A.h160))
     assert d2['status'] == 'mined' and tchain.rpc.nonce(b.address) == nonce0 + 2
-    with pytest.raises(eb.UserError, match='BadDepositScript'):
+    with pytest.raises(eb.UserError, match='P2WPKH or P2TR'):
         b.deposit(1000, b.exitaddr(b.address)['address'])
+    # Nor to a witness program the contract can't spend (v2): nothing is sent.
+    with pytest.raises(eb.UserError, match='P2WPKH or P2TR'):
+        b.deposit(1000, btc.segwit_address('bcrt', 2, bytes(32)))
     with pytest.raises(eb.UserError, match='nothing to withdraw'):
         b.withdraw()
 

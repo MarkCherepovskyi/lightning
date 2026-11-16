@@ -17,7 +17,9 @@ What it does (section numbers are SPEC's):
   within 2 x INTERVAL (a timer answers if the worker hasn't). A send that
   gets no receipt in time is tracked and, an INTERVAL later, replaced with
   the same nonce at 1.25x the fees.
-- 5.4 hooks that keep CLN on what the contract can spend.
+- 5.4 hooks that keep CLN on what the contract can spend, and the peer
+  identity handshake (a custom message naming the EVM chain, contract and
+  asset: every EVM node runs --network=regtest, so lightningd can't tell).
 - 5.5 evm-deposit, evm-exitaddr, evm-withdraw, evm-status, and alarms.
 - 4.6 token mode: on a UtxoChainToken (TOKEN() answers) amounts are token
   units (UNITS_PER_SAT per sat), evm-deposit approves the token first, and
@@ -48,6 +50,7 @@ import queue
 import random
 import re
 import stat
+import struct
 import sys
 import threading
 import time
@@ -165,6 +168,13 @@ OPEN_COMMANDS = ('fundchannel', 'fundchannel_start', 'multifundchannel', 'opench
 RPC_FILTER = OPEN_COMMANDS + ('openchannel_update', 'openchannel_signed', 'fundchannel_complete')
 ERR_REFUSED = -32602    # JSONRPC2_INVALID_PARAMS: what the rpc_command hook returns
 DEV_NO_OUTBOUND_FILTER = 'evm-dev-no-outbound-filter'   # tests only, with --developer (SPEC 5.4)
+
+# SPEC 5.4 peer identity: an odd custom message type (BOLT 1 "it's OK to be
+# odd": peers without evmbackend ignore it), unused elsewhere in this tree.
+IDENTITY_MSG_TYPE = 0xFFE9
+IDENTITY_V1 = '>HBQ20s20s32s'          # type, version, chain id, contract, token, UNITS_PER_SAT
+IDENTITY_WAIT = 5.0                    # seconds an open waits for the peer's identity message
+REQUIRE_PEER_IDENTITY = 'evm-require-peer-identity'
 
 
 class ConfigError(Exception):
@@ -396,11 +406,64 @@ def psbt_problem(b64):
     return None
 
 
+# ------------------------------------------------------------ peer identity (5.4)
+
+class Identity(collections.namedtuple('Identity', 'chain_id contract token units_per_sat')):
+    """What makes two EVM nodes one network: the EVM chain id, the contract,
+    its token (None: ETH) and UNITS_PER_SAT. Every node runs lightningd with
+    --network=regtest, so lightningd can't tell them apart (SPEC 5.4)."""
+
+    def key(self):
+        return (self.chain_id, self.contract.lower(), (self.token or '').lower(), self.units_per_sat)
+
+    def matches(self, other):
+        return isinstance(other, Identity) and self.key() == other.key()
+
+    def describe(self):
+        asset = 'ETH ({} wei per sat)'.format(self.units_per_sat) if self.token is None else \
+            'token {} ({} units per sat)'.format(self.token, self.units_per_sat)
+        return 'EVM chain {}, contract {}, {}'.format(self.chain_id, self.contract, asset)
+
+
+class UnknownIdentityVersion(ValueError):
+    pass
+
+
+def encode_identity(ident):
+    """The custom message (type, then body): version 1, chain id (u64),
+    contract (20 bytes), token (20 bytes, zero for ETH), UNITS_PER_SAT
+    (u256), all big-endian."""
+    token = evm.address_bytes(ident.token) if ident.token else bytes(20)
+    return struct.pack(IDENTITY_V1, IDENTITY_MSG_TYPE, 1, ident.chain_id, evm.address_bytes(ident.contract),
+                       token, ident.units_per_sat.to_bytes(32, 'big'))
+
+
+def decode_identity(raw):
+    """An Identity from a whole custom message (bytes). Bytes after the
+    version 1 fields are ignored (room to extend it); a version other than 1
+    raises UnknownIdentityVersion; anything malformed raises ValueError."""
+    if len(raw) < 3:
+        raise ValueError('too short')
+    mtype, version = struct.unpack_from('>HB', raw)
+    if mtype != IDENTITY_MSG_TYPE:
+        raise ValueError('message type {} is not {}'.format(mtype, IDENTITY_MSG_TYPE))
+    if version != 1:
+        raise UnknownIdentityVersion('version {}'.format(version))
+    if len(raw) < struct.calcsize(IDENTITY_V1):
+        raise ValueError('version 1 body too short ({} bytes)'.format(len(raw)))
+    _, _, chain_id, contract, token, units = struct.unpack_from(IDENTITY_V1, raw)
+    units = int.from_bytes(units, 'big')
+    if chain_id == 0 or units == 0 or contract == bytes(20):
+        raise ValueError('zero chain id, contract or units per sat')
+    return Identity(chain_id, evm.checksum_address(contract),
+                    None if token == bytes(20) else evm.checksum_address(token), units)
+
+
 # ------------------------------------------------------------ options (5.1) and the key file
 
 class Config:
     def __init__(self, rpc_url, contract, key, key_file, confirm, poll, min_balance_wei, lightning_dir,
-                 secrets=(), dev_no_outbound_filter=False, snapshot=None):
+                 secrets=(), dev_no_outbound_filter=False, snapshot=None, require_peer_identity=True):
         self.rpc_url, self.contract, self.key, self.key_file = rpc_url, contract, key, key_file
         self.confirm, self.poll, self.min_balance_wei = confirm, poll, min_balance_wei
         self.lightning_dir = lightning_dir
@@ -409,6 +472,9 @@ class Config:
         # Tests only (SPEC 5.4): the rpc_command hook lets our own opens
         # through, so a peer's hooks are what refuses them.
         self.dev_no_outbound_filter = dev_no_outbound_filter
+        # SPEC 5.4: opens only with peers that identified the same EVM chain,
+        # contract and asset.
+        self.require_peer_identity = require_peer_identity
 
     @classmethod
     def from_options(cls, get_option, lightning_dir, env, log=None, developer=False):
@@ -456,10 +522,17 @@ class Config:
             raise ConfigError('--{} is for tests: it needs lightningd --developer'.format(DEV_NO_OUTBOUND_FILTER))
         snapshot = get_option('evm-snapshot')
         snapshot = os.path.join(lightning_dir, snapshot) if snapshot else None   # relative to the lightning dir
+        require = get_option(REQUIRE_PEER_IDENTITY)
+        if require in (None, True, 'true'):
+            require = True
+        elif require in (False, 'false'):
+            require = False
+        else:
+            raise ConfigError('--{} must be true or false'.format(REQUIRE_PEER_IDENTITY))
         key = load_or_create_key(key_file, log)
         secrets.append(key.hex())
         return cls(url, contract, key, key_file, confirm, poll, min_balance_wei, lightning_dir, secrets,
-                   dev_no_outbound_filter=no_filter, snapshot=snapshot)
+                   dev_no_outbound_filter=no_filter, snapshot=snapshot, require_peer_identity=require)
 
 
 def load_or_create_key(path, log=None):
@@ -780,6 +853,12 @@ class Backend:
         self._chain_id = None    # for tests without an index
         self._hlock = threading.Lock()
         self._approved = {}      # outgoing channel -> [time.monotonic() of forwards let through]
+        # SPEC 5.4 peer identity: node id -> {'status': 'matched', 'mismatched'
+        # or 'unreadable', 'identity': Identity or None, 'why': str, 'fresh':
+        # False once the peer disconnected (a reconnect must identify again)}.
+        self.identity_wait = IDENTITY_WAIT
+        self._peer_ids = {}
+        self._pcond = threading.Condition()
         self.pending_file = os.path.join(cfg.lightning_dir, 'evm-pending.json')
 
     # -------------------------------------------------------- logging
@@ -1957,11 +2036,116 @@ class Backend:
         except (AttributeError, TypeError, ValueError):
             anchors = False
         if anchors:
+            node_id = peer.get('id')
+            if self.lnrpc is not None and isinstance(node_id, str):
+                # Off pyln's thread; lightningd takes it while the peer is
+                # still connecting (sendcustommsg allows PEER_CONNECTING).
+                threading.Thread(target=self.send_identity, args=(node_id,), name='send_identity',
+                                 daemon=True).start()
             return {'result': 'continue'}
         self.log('info', 'disconnecting peer {}: no anchors_zero_fee_htlc_tx (feature 22/23)'.format(
             peer.get('id') if isinstance(peer, dict) else '?'))
         return {'result': 'disconnect',
                 'error_message': 'this node only opens anchors_zero_fee_htlc_tx channels (feature 22/23)'}
+
+    # --- peer identity (5.4): EVM nodes all run --network=regtest
+
+    def identity(self):
+        return Identity(self.chain_id(), self.contract, self.token, self.units_per_sat)
+
+    def send_identity(self, node_id):
+        """Sends our identity message to a peer (calls lightningd)."""
+        try:
+            self.lnrpc().call('sendcustommsg', {'node_id': node_id, 'msg': encode_identity(self.identity()).hex()})
+        except Exception as e:               # noqa: B902 - the peer went away; its opens wait, then are refused
+            self.log('unusual', 'cannot send our EVM chain/contract identity to {} ({})'.format(
+                node_id, type(e).__name__))
+
+    def custommsg(self, peer_id, payload):
+        """The custommsg hook: records a peer's identity message. A peer on
+        another chain, contract or asset is disconnected (while
+        evm-require-peer-identity is on). Always 'continue'."""
+        try:
+            raw = bytes.fromhex(payload)
+        except (TypeError, ValueError):
+            return {'result': 'continue'}
+        if len(raw) < 2 or int.from_bytes(raw[:2], 'big') != IDENTITY_MSG_TYPE or not isinstance(peer_id, str):
+            return {'result': 'continue'}
+        ours = self.identity()
+        ident, why = None, None
+        try:
+            ident = decode_identity(raw)
+        except UnknownIdentityVersion as e:
+            why = 'identity message {} (this node reads version 1)'.format(e)
+        except ValueError as e:
+            why = 'malformed identity message ({})'.format(e)
+        if why:
+            status = 'unreadable'
+            self.log('unusual', 'peer {}: {}'.format(peer_id, why))
+        elif ident.matches(ours):
+            status = 'matched'
+            self.log('debug', 'peer {} is on this node\'s EVM chain/contract ({})'.format(peer_id, ident.describe()))
+        else:
+            status = 'mismatched'
+            why = 'peer {} is on a different EVM chain/contract: it is on {}; this node is on {}'.format(
+                peer_id, ident.describe(), ours.describe())
+        with self._pcond:
+            self._peer_ids[peer_id.lower()] = {'status': status, 'identity': ident, 'why': why, 'fresh': True}
+            self._pcond.notify_all()
+        if status == 'mismatched':
+            if self.cfg.require_peer_identity:
+                self.log('unusual', why + '; disconnecting')
+                threading.Thread(target=self._disconnect, args=(peer_id,), name='disconnect', daemon=True).start()
+            else:
+                self.log('unusual', why + ' (evm-require-peer-identity is off)')
+        return {'result': 'continue'}
+
+    def _disconnect(self, node_id):
+        if self.lnrpc is None:
+            return
+        try:
+            self.lnrpc().call('disconnect', {'id': node_id, 'force': True})
+        except Exception as e:               # noqa: B902 - it may be gone already
+            self.log('debug', 'disconnect {}: {}'.format(node_id, type(e).__name__))
+
+    def peer_disconnected(self, node_id):
+        """The disconnect notification: the peer must identify again on its
+        next connection (it may come back on another contract). A mismatch
+        is remembered, so our own opens to it fail early."""
+        if not isinstance(node_id, str):
+            return
+        with self._pcond:
+            rec = self._peer_ids.get(node_id.lower())
+            if rec is not None:
+                rec['fresh'] = False
+
+    def peer_identity_problem(self, node_id, wait=0.0, strict=True):
+        """Why a channel with node_id is refused for its identity, or None.
+        Waits up to `wait` seconds for its message from this connection.
+        strict=False (fundchannel and multifundchannel, which may connect
+        first): only a known mismatch or an unreadable message refuses."""
+        if not self.cfg.require_peer_identity:
+            return None
+        if not isinstance(node_id, str):
+            return 'cannot read the peer\'s node id'
+        node_id = node_id.split('@')[0].lower()
+        end = time.monotonic() + wait
+        with self._pcond:
+            while True:
+                rec = self._peer_ids.get(node_id)
+                left = end - time.monotonic()
+                if (rec is not None and rec['fresh']) or left <= 0:
+                    break
+                self._pcond.wait(left)
+            rec = dict(rec) if rec is not None else None
+        if rec is not None and rec['status'] == 'mismatched':
+            return rec['why']
+        if rec is not None and rec['fresh']:
+            return None if rec['status'] == 'matched' else 'peer {}: {}'.format(node_id, rec['why'])
+        if not strict:
+            return None
+        return 'peer {} has not identified its EVM chain/contract (no evmbackend identity message within {:g} s; ' \
+               'see evm-require-peer-identity)'.format(node_id, wait)
 
     def _reject_cmd(self, msg):
         return {'return': {'error': {'code': ERR_REFUSED, 'message': 'evmbackend: ' + msg}}}
@@ -2018,6 +2202,14 @@ class Backend:
             why = psbt_problem(p['initialpsbt'])
             if why:
                 return self._reject_cmd(why)
+        # Peer identity last (it may wait). fundchannel and multifundchannel
+        # may connect first: they refuse a known mismatch only, and the
+        # fundchannel_start or openchannel_init they then call checks fully.
+        strict = method in ('fundchannel_start', 'openchannel_init')
+        for d in dests:
+            why = self.peer_identity_problem(d.get('id'), wait=self.identity_wait if strict else 0, strict=strict)
+            if why:
+                return self._reject_cmd(why)
         return None
 
     def _open_hook_problem(self, payload, lease):
@@ -2047,14 +2239,20 @@ class Backend:
         return None
 
     def openchannel(self, oc):
-        why = self._open_hook_problem(oc, lease=False)
+        """May wait for the peer's identity: run it off pyln's thread."""
+        why = self._open_hook_problem(oc, lease=False) or \
+            self.peer_identity_problem(oc.get('id'), wait=self.identity_wait)
         if why:
             self.log('info', 'refused an open from {}: {}'.format(oc.get('id'), why))
             return {'result': 'reject', 'error_message': why}
         return {'result': 'continue'}
 
     def openchannel2(self, oc2):
-        why = self._open_hook_problem(oc2, lease=True)
+        """A plain 'reject' is safe here (dual_open_control.c drops its
+        destructor on dualopend before answering), unlike in
+        openchannel2_changed/_sign. May wait: run it off pyln's thread."""
+        why = self._open_hook_problem(oc2, lease=True) or \
+            self.peer_identity_problem(oc2.get('id'), wait=self.identity_wait)
         if why:
             self.log('info', 'refused a dual-funded open from {}: {}'.format(oc2.get('id'), why))
             return {'result': 'reject', 'error_message': why}
@@ -2219,6 +2417,11 @@ class Backend:
             spk = btc.address_script(address, 'bcrt')
         except ValueError:
             raise UserError('not a bcrt segwit address') from None
+        # The contract takes a deposit to any script but can only spend
+        # these: one to any other (another witness version, an odd program
+        # length, a P2WSH outside the channel templates) is locked for good.
+        if not is_segwit_wallet_script(spk):
+            raise UserError('deposits must go to a P2WPKH or P2TR address')
         if self.token is None:
             data = evm.calldata('deposit(bytes)', ['bytes'], [spk])
             p, receipt = self.contract_call('deposit', data, amount * SAT_WEI)
@@ -2359,6 +2562,8 @@ def main():
     plugin.add_option('evm-min-balance', '0.01', 'ETH below which new channels are refused')
     plugin.add_option('evm-snapshot', None, 'index snapshot (from evm-snapshot) to start an empty index from; '
                       'proven against the chain, else ignored')
+    plugin.add_option(REQUIRE_PEER_IDENTITY, True, 'refuse channels with peers that have not identified the same '
+                      'EVM chain, contract and asset (SPEC 5.4), and disconnect ones on another', opt_type='bool')
     plugin.add_flag_option(DEV_NO_OUTBOUND_FILTER, 'tests only, needs --developer: our own channel opens skip '
                            'the rpc_command checks, so the peer\'s hooks refuse them')
     developer = '--developer' in sys.argv[1:]      # lightningd passes it to plugins it runs with --developer
@@ -2476,22 +2681,32 @@ def main():
         return guard('peer_connected', lambda: backend().peer_connected(peer),
                      {'result': 'disconnect', 'error_message': 'internal error'})
 
-    def on_rpc_command(plugin, rpc_command, **kwargs):
+    # Async from here on: the open checks may wait for the peer's identity
+    # message (5.4), which the custommsg hook takes meanwhile.
+    def on_rpc_command(plugin, rpc_command, request, **kwargs):
         refuse = {'return': {'error': {'code': ERR_REFUSED, 'message': 'evmbackend: internal error'}}}
-        return guard('rpc_command', lambda: backend().rpc_command(rpc_command), refuse)
-    plugin.add_hook('rpc_command', on_rpc_command, filters=sorted(RPC_FILTER))
+        in_thread('rpc_command', lambda: backend().rpc_command(rpc_command), request, refuse)
+    plugin.add_hook('rpc_command', on_rpc_command, background=True, filters=sorted(RPC_FILTER))
+
+    @plugin.hook('custommsg', filters=[IDENTITY_MSG_TYPE])
+    def on_custommsg(peer_id, payload, plugin, **kwargs):
+        return guard('custommsg', lambda: backend().custommsg(peer_id, payload), {'result': 'continue'})
+
+    @plugin.subscribe('disconnect')
+    def on_disconnect(plugin, disconnect=None, **kwargs):
+        guard('disconnect', lambda: backend().peer_disconnected((disconnect or kwargs).get('id')), None)
 
     # Before funder: a bare 'continue' from a later plugin would wipe the
     # PSBT and amount funder contributed (dual_open_control.c).
-    @plugin.hook('openchannel', before=['funder'])
-    def on_openchannel(openchannel, plugin, **kwargs):
-        return guard('openchannel', lambda: backend().openchannel(openchannel),
-                     {'result': 'reject', 'error_message': 'internal error'})
+    def on_openchannel(openchannel, plugin, request, **kwargs):
+        in_thread('openchannel', lambda: backend().openchannel(openchannel), request,
+                  {'result': 'reject', 'error_message': 'internal error'})
+    plugin.add_hook('openchannel', on_openchannel, background=True, before=['funder'])
 
-    @plugin.hook('openchannel2', before=['funder'])
-    def on_openchannel2(openchannel2, plugin, **kwargs):
-        return guard('openchannel2', lambda: backend().openchannel2(openchannel2),
-                     {'result': 'reject', 'error_message': 'internal error'})
+    def on_openchannel2(openchannel2, plugin, request, **kwargs):
+        in_thread('openchannel2', lambda: backend().openchannel2(openchannel2), request,
+                  {'result': 'reject', 'error_message': 'internal error'})
+    plugin.add_hook('openchannel2', on_openchannel2, background=True, before=['funder'])
 
     # Async: a refusal calls lightningd (openchannel_abort) before answering.
     @plugin.async_hook('openchannel2_changed')

@@ -27,10 +27,6 @@ RESOLVED = re.compile(r'Resolved (\w+)/(\w+) by our proposal (\w+) \(([0-9a-f]{6
 FORGOTTEN = 'onchaind complete, forgetting peer'
 ANCHOR_SAT = 330
 HELD = ('SENT_ADD_ACK_REVOCATION', 'RCVD_ADD_ACK_REVOCATION')
-REPLAY_BUG = ("upstream lightningd/onchain_control.c: when a tx spends two outputs onchaind watches and "
-              "onchaind answers 'not interested' for one, the replay after a restart (replay_unwatch_txid) "
-              "drops the watch on that whole tx, so its own output's later spend is never seen and onchaind "
-              "never finishes; see test_restart_replay_two_spends")
 
 
 @pytest.fixture
@@ -190,43 +186,6 @@ def psbt_with_prevtx(spk, amount=1_000_000, redeem=None):
 def log_mark(node):
     node.daemon.logs_catchup()
     return len(node.daemon.logs)
-
-
-def spends_to_local_sweep(chain, commit, htlc_tx):
-    """REPLAY_BUG's trigger: the HTLC-timeout tx takes, as its fee input,
-    the output of a tx that spent only commitment outputs (the to_local
-    sweep), so it spends two outputs onchaind watches."""
-    for t, _ in htlc_tx.spends():
-        e = chain.event(t) if t != commit.txid else None
-        if e is not None and e.spends() and all(s[0] == commit.txid for s in e.spends()):
-            return True
-    return False
-
-
-def check_replay_bug(chain, node, htlc_tx, since):
-    """Returns only if onchaind stopped finishing as REPLAY_BUG says, and for
-    no reason of ours: since the restart (log position `since`) its replay
-    still waits for the sweep of the HTLC-timeout output, which the contract
-    applied, and keeps re-sending it; meanwhile lightningd runs, is at the
-    chain's tip, and is served at that sweep's height the block built here
-    from the contract's events. Otherwise pytest.fail."""
-    if not node.running():
-        pytest.fail('lightningd is not running')
-    try:
-        tip = chain.wait_synced([node])
-    except ValueError:
-        pytest.fail('lightningd is at height {}, behind the tip {}'.format(
-            node.rpc.getinfo()['blockheight'], chain.expected_tip()))
-    sweep = chain.spender(htlc_tx.txid, 0)
-    if sweep is None or sweep.height > tip:
-        pytest.fail('the HTLC-timeout output\'s sweep is not in the chain CLN has: {}'.format(sweep))
-    served = node.rpc.call('getrawblockbyheight', {'height': sweep.height})['blockhash']
-    if served != chain.reference_blocks(sweep.height)[sweep.height]:
-        pytest.fail('the block served at height {} is not the contract\'s'.format(sweep.height))
-    stuck = 'waiting confirmation that we spent DELAYED_OUTPUT_TO_US ({}'.format(htlc_tx.txid[:16])
-    if not (node.daemon.is_in_log(re.escape(stuck), start=since)
-            and node.daemon.is_in_log('Expected error broadcasting tx', start=since)):
-        pytest.fail('onchaind did not finish, but not as REPLAY_BUG says')
 
 
 # ------------------------------------------------------------ funding, paying, gossip
@@ -663,6 +622,46 @@ def test_regtest_defaults_refuse(node_factory, chain):
     assert [e.txid for e in chain.events() if not e.is_deposit] == []
 
 
+def test_peer_identity_mismatch(node_factory, chain):
+    """SPEC 5.4 peer identity: every EVM node runs --network=regtest, so two
+    nodes on different contracts (here on the same anvil) look like one
+    network to lightningd. Their evmbackends exchange identity messages on
+    connect, each logs the mismatch naming both and disconnects the other,
+    and an open between them fails with the identity error before anything
+    reaches the chain. Nodes on the same contract still open: every other
+    test here (test_open_pay_gossip, test_mutual_close, ...) does."""
+    other = chain.deploy_other()
+    l1 = node_factory.get_node()
+    l2 = node_factory.get_node(options={'evm-contract': other})
+    chain.nodes.remove(l2)      # chain.wait_synced compares with heights of chain.contract, not l2's
+    l1.deposit(500_000)
+    try:
+        connect(l1, l2)
+    except RpcError:
+        pass                    # sent away before connect returned
+    for a, b, theirs, ours in ((l1, l2, other, chain.contract), (l2, l1, chain.contract, other)):
+        line = a.daemon.wait_for_log(r'peer {} is on a different EVM chain/contract: it is on EVM chain {}, '
+                                     r'contract {}, ETH .*; this node is on EVM chain {}, contract {}, ETH .*; '
+                                     r'disconnecting'.format(b.info['id'], chain.chain_id, theirs,
+                                                             chain.chain_id, ours))
+        assert line
+    wait_for(lambda: not any(p['connected'] for p in l1.rpc.listpeers(l2.info['id'])['peers']))
+    # l1 remembers why: its own open fails early, naming the mismatch.
+    with pytest.raises(RpcError, match=r'evmbackend: peer {} is on a different EVM chain/contract'.format(
+            l2.info['id'])):
+        l1.rpc.fundchannel(l2.info['id'], 100_000)
+    assert l1.daemon.is_in_log(r'refused fundchannel: evmbackend: peer {} is on a different EVM '
+                               r'chain/contract'.format(l2.info['id']))
+    assert l1.rpc.listpeerchannels()['channels'] == [] and l2.rpc.listpeerchannels()['channels'] == []
+    assert [e.txid for e in chain.events() if not e.is_deposit] == []
+
+    # A node on l1's contract identifies as such, and opens as usual.
+    l3 = node_factory.get_node()
+    connect(l1, l3)
+    l1.daemon.wait_for_log(r"peer {} is on this node's EVM chain/contract".format(l3.info['id']))
+    open_channel(chain, l1, l3, 100_000)
+
+
 # ------------------------------------------------------------ exits (SPEC 4.4, 5.5)
 
 def test_exit_withdraw(node_factory, chain):
@@ -839,9 +838,8 @@ def test_max_payment(node_factory, chain):
 @pytest.mark.parametrize('htlc', [False, True])
 def test_restart_mid_close(node_factory, chain, htlc):
     """Both nodes restart while a force close is being resolved (with an
-    HTLC: after its HTLC-timeout tx, so onchaind replays HTLC spends). If
-    CLN happened to take the to_local sweep as that tx's fee input, it
-    may hit REPLAY_BUG: then (and only with its exact symptom) it xfails."""
+    HTLC: after its HTLC-timeout tx, so onchaind replays HTLC spends, also
+    when CLN took the to_local sweep as that tx's fee input)."""
     l1, l2 = node_factory.get_nodes(2, opts=[{'may_reconnect': True},
                                              {'may_reconnect': True, 'plugin': HOLD, 'hold-all': False}])
     l1.deposit(1_000_000)
@@ -860,29 +858,21 @@ def test_restart_mid_close(node_factory, chain, htlc):
     chain.mine(5)
     l1.restart()
     l2.restart()
-    tx, mark = None, None
-    try:
-        if htlc:
-            tx = wait_resolved(chain, l1, 'OUR_UNILATERAL', 'OUR_HTLC', 'OUR_HTLC_TIMEOUT_TX')
-            chain.mine(3)
-            l1.restart()         # onchaind replays the HTLC-timeout spend
-            mark = log_mark(l1)
-            second = wait_resolved(chain, l1, 'OUR_HTLC_TIMEOUT_TX', 'DELAYED_OUTPUT_TO_US',
-                                   'OUR_DELAYED_RETURN_TO_WALLET')
-            assert second.spends()[0][0] == tx.txid
-        sweep = wait_resolved(chain, l1, 'OUR_UNILATERAL', 'DELAYED_OUTPUT_TO_US', 'OUR_DELAYED_RETURN_TO_WALLET')
-        assert sweep.spends()[0][0] == commit.txid
+    if htlc:
+        tx = wait_resolved(chain, l1, 'OUR_UNILATERAL', 'OUR_HTLC', 'OUR_HTLC_TIMEOUT_TX')
         chain.mine(3)
-        l1.restart()             # and once more with the sweep on chain
-        wait_for(lambda: ends_in_wallet(chain, l1, sweep.txid))
-        if htlc:
-            wait_for(lambda: only_one(l1.rpc.listsendpays(payment_hash=phash)['payments'])['status'] == 'failed')
-        wait_forgotten(chain, l1, l2)
-    except (AssertionError, ValueError):
-        if tx is None or mark is None or not spends_to_local_sweep(chain, commit, tx):
-            raise
-        check_replay_bug(chain, l1, tx, mark)
-        pytest.xfail(REPLAY_BUG)
+        l1.restart()         # onchaind replays the HTLC-timeout spend
+        second = wait_resolved(chain, l1, 'OUR_HTLC_TIMEOUT_TX', 'DELAYED_OUTPUT_TO_US',
+                               'OUR_DELAYED_RETURN_TO_WALLET')
+        assert second.spends()[0][0] == tx.txid
+    sweep = wait_resolved(chain, l1, 'OUR_UNILATERAL', 'DELAYED_OUTPUT_TO_US', 'OUR_DELAYED_RETURN_TO_WALLET')
+    assert sweep.spends()[0][0] == commit.txid
+    chain.mine(3)
+    l1.restart()             # and once more with the sweep on chain
+    wait_for(lambda: ends_in_wallet(chain, l1, sweep.txid))
+    if htlc:
+        wait_for(lambda: only_one(l1.rpc.listsendpays(payment_hash=phash)['payments'])['status'] == 'failed')
+    wait_forgotten(chain, l1, l2)
     # The replays sent nothing that the contract refused on chain, and left
     # nothing behind.
     for n in (l1, l2):
@@ -926,15 +916,14 @@ def test_restart_rescan_htlc_success(node_factory, chain):
     wait_forgotten(chain, l1, l2)
 
 
-@pytest.mark.parametrize('restart', [False, pytest.param(True, marks=pytest.mark.xfail(
-    reason=REPLAY_BUG, strict=True, raises=AssertionError))])
+@pytest.mark.parametrize('restart', [False, True])
 def test_restart_replay_two_spends(node_factory, chain, restart):
-    """Minimal reproduction of REPLAY_BUG: l1's HTLC-timeout tx takes its
-    own to_local sweep output as fee input, so it spends two outputs
-    onchaind watches (onchaind cares about the HTLC one, not the sweep's).
-    Without a restart onchaind finishes; restarted after the HTLC-timeout
-    output's sweep, its replay never sees that sweep, it keeps re-sending it
-    ("Expected error broadcasting tx"), and never forgets the channel."""
+    """What used to be REPLAY_BUG (fixed in core; its Bitcoin twin is
+    test_closing.py::test_onchaind_replay_tx_spending_two_watched): l1's
+    HTLC-timeout tx takes its own to_local sweep output as fee input, so it
+    spends two outputs onchaind watches (onchaind cares about the HTLC one,
+    not the sweep's).  Restarted after the HTLC-timeout output's sweep, its
+    replay must still see that sweep and forget the channel."""
     l1, l2 = node_factory.get_nodes(2, opts=[{'may_reconnect': True},
                                              {'may_reconnect': True, 'plugin': HOLD, 'hold-all': False}])
     l1.deposit(700_000)
@@ -962,18 +951,9 @@ def test_restart_replay_two_spends(node_factory, chain, restart):
         pytest.fail('the HTLC-timeout tx does not spend the to_local sweep: {}'.format(tx.spends()))
     second = wait_resolved(chain, l1, 'OUR_HTLC_TIMEOUT_TX', 'DELAYED_OUTPUT_TO_US', 'OUR_DELAYED_RETURN_TO_WALLET')
     chain.mine(3)
-    mark = None
     if restart:
         l1.restart()
-        mark = log_mark(l1)
-    try:
-        wait_forgotten(chain, l1)
-    except (AssertionError, ValueError):
-        # The xfail stands only for this symptom (pytest.fail otherwise).
-        if mark is None:
-            pytest.fail('onchaind did not finish without a restart')
-        check_replay_bug(chain, l1, tx, mark)
-        raise AssertionError(REPLAY_BUG)
+    wait_forgotten(chain, l1)
     assert ends_in_wallet(chain, l1, second.txid)
 
 
