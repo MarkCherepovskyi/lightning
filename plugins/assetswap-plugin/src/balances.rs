@@ -5,7 +5,7 @@
 //! an ordinary L-BTC channel groups under `"lbtc"`, same default
 //! `rpc.rs::our_channel_assets` already uses.
 
-use crate::rpc::new_rpc;
+use crate::rpc::{new_rpc, require_client_mode};
 use anyhow::Error;
 use cln_plugin::Plugin;
 use serde_json::{json, Value};
@@ -13,6 +13,7 @@ use serde_json::{json, Value};
 use crate::State;
 
 pub(crate) async fn assetbalances(p: Plugin<State>, _args: Value) -> Result<Value, Error> {
+    require_client_mode(&p, "assetbalances")?;
     let mut rpc = new_rpc(&p).await?;
     let res: Value = rpc.call_raw("listpeerchannels", &json!({})).await?;
 

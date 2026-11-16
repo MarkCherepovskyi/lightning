@@ -6,6 +6,7 @@
 //! provider decides live, on arrival, whether this HTLC is profitable at
 //! its current price (see pay.rs's doc comment for why).
 
+use crate::config::Mode;
 use crate::protocol::{decode_swap_metadata, fetch_price_tiers, is_asset_id, quote_key, QuoteRecord};
 use crate::rpc::{asset_layers, channel_asset, leg2_rpc, new_rpc};
 use crate::State;
@@ -204,6 +205,13 @@ async fn resolve_from_leg2_status(rpc: &mut ClnRpc, rec: &QuoteRecord) -> Value 
 }
 
 pub(crate) async fn on_htlc_accepted(p: Plugin<State>, v: Value) -> Result<Value, Error> {
+    // A client node never settles anyone's leg 1 - that's the shared
+    // swap-provider's job (assetswap-mode=server). Pass every HTLC
+    // straight through, same as a non-final or non-swap one below.
+    if p.state().config.mode != Mode::Server {
+        return Ok(json!({"result": "continue"}));
+    }
+
     // Only a final hop (no onion.short_channel_id/next hop) can be a swap
     // settlement — never second-guess an HTLC we're meant to forward on.
     let is_final = v

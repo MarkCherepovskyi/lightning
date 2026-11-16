@@ -3,7 +3,7 @@
 //! requires, since that asset isn't part of the signed bolt11 bytes.
 
 use crate::protocol::is_asset_id;
-use crate::rpc::{new_rpc, param};
+use crate::rpc::{new_rpc, param, require_client_mode};
 use crate::State;
 use anyhow::{anyhow, Error};
 use base64::Engine as _;
@@ -35,6 +35,7 @@ pub(crate) fn decode_wrapper(s: &str) -> Result<AssetInvoiceWrapper, Error> {
 }
 
 pub(crate) async fn assetinvoice(p: Plugin<State>, args: Value) -> Result<Value, Error> {
+    require_client_mode(&p, "assetinvoice")?;
     let amount_msat = param(&args, 0, "amount_msat")
         .and_then(Value::as_u64)
         .ok_or_else(|| anyhow!("Missing or invalid amount_msat"))?;

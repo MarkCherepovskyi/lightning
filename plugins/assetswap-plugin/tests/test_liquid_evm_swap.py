@@ -119,6 +119,7 @@ def swap_nodes(node_factory, evm_factory, chain, bitcoind, pair_from='lbtc',
         'plugin': (provider_opts or {}).get('plugin', []) + [ASSETSWAP_PLUGIN, PRICETIERS_PLUGIN],
         'pricetiers-pair': pair,
         'assetswap-remote': 'eth:' + provider_e.rpc.socket_path,
+        'assetswap-mode': 'server',
     })
     payer = node_factory.get_node(options={
         **(payer_opts or {}),

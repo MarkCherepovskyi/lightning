@@ -7,10 +7,51 @@
 //! knobs around accepting it.
 
 use anyhow::{anyhow, Error};
-use cln_plugin::options::{DefaultIntegerConfigOption, StringArrayConfigOption};
+use cln_plugin::options::{DefaultIntegerConfigOption, DefaultStringConfigOption, StringArrayConfigOption};
 use cln_rpc::primitives::PublicKey;
 use std::collections::HashMap;
 use std::path::PathBuf;
+
+/// Which half of a cross-asset swap this node plays. Mutually exclusive:
+/// [`Mode::Server`] (the shared swap-provider node, e.g. `cln-swap`) can
+/// only settle leg-1 HTLCs via [`crate::htlc::on_htlc_accepted`] - its
+/// `assetinvoice`/`quoteassetinvoice`/`payassetinvoice`/`assetbalances` RPCs
+/// are disabled, since a provider never creates its own asset invoices or
+/// pays anyone else's. [`Mode::Client`] (every ordinary per-user node) is
+/// the reverse: those RPCs work, but `on_htlc_accepted` always passes a
+/// would-be leg-1 HTLC straight through with `"continue"` rather than
+/// attempting to settle it - an ordinary node never acts as someone else's
+/// swap provider.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Mode {
+    Client,
+    Server,
+}
+
+impl Mode {
+    fn parse(raw: &str) -> Result<Self, Error> {
+        match raw {
+            "client" => Ok(Self::Client),
+            "server" => Ok(Self::Server),
+            other => Err(anyhow!("assetswap-mode must be \"client\" or \"server\", got {other:?}")),
+        }
+    }
+}
+
+/// Defaults to "client": the vast majority of nodes are ordinary per-user
+/// ones, and an ordinary node left in server mode by mistake would be far
+/// more dangerous (silently trying to settle other people's leg-1 HTLCs)
+/// than the reverse (a provider left in client mode just can't create/pay
+/// its own asset invoices, which it has no reason to do anyway). The one
+/// node that needs `server` explicitly set is the shared swap-provider
+/// (e.g. `cln-swap` - see infra/images/cln/entrypoint.sh's `ASSETSWAP_MODE`).
+pub(crate) const OPT_MODE: DefaultStringConfigOption = DefaultStringConfigOption::new_str_with_default(
+    "assetswap-mode",
+    "client",
+    "\"client\" (default - create/pay asset invoices, read balances) or \"server\" \
+     (the shared swap-provider node - only settles leg-1 HTLCs via htlc_accepted, \
+     nothing else).",
+);
 
 pub(crate) const OPT_PROVIDER: StringArrayConfigOption = StringArrayConfigOption::new_str_arr_no_default(
     "assetswap-provider",
@@ -39,12 +80,17 @@ pub(crate) const OPT_MIN_HOP_BUDGET: DefaultIntegerConfigOption = DefaultInteger
 
 #[derive(Clone, Debug)]
 pub(crate) struct Config {
+    pub(crate) mode: Mode,
     pub(crate) providers: Vec<PublicKey>,
     pub(crate) safety_blocks: u32,
     pub(crate) min_hop_budget: u32,
     /// asset -> the RPC socket of the node that pays leg 2 in it, when that
     /// isn't this node (`assetswap-remote`).
     pub(crate) remotes: HashMap<String, PathBuf>,
+}
+
+pub(crate) fn parse_mode(raw: &str) -> Result<Mode, Error> {
+    Mode::parse(raw)
 }
 
 pub(crate) fn parse_remotes(specs: &[String]) -> Result<HashMap<String, PathBuf>, Error> {

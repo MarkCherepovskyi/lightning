@@ -37,7 +37,8 @@ def setup_receiver_with_two_asset_channels(node_factory, bitcoind):
 
     pair = f'{asset_a}:{asset_b}:{DEFAULT_RATE_PPM}:{DEFAULT_FEE_BASE_MSAT}'
     l2 = node_factory.get_node(options={'plugin': [ASSETSWAP_PLUGIN, PRICETIERS_PLUGIN],
-                                        'pricetiers-pair': pair})
+                                        'pricetiers-pair': pair,
+                                        'assetswap-mode': 'server'})
     l1, l3 = node_factory.get_nodes(2, opts=[
         {'plugin': [ASSETSWAP_PLUGIN, PRICETIERS_PLUGIN], 'pricetiers-pair': pair,
          'assetswap-provider': l2.info['id']},
