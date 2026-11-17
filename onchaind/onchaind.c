@@ -2857,20 +2857,22 @@ static void handle_their_cheat(const struct tx_parts *tx,
 				for (size_t csv = 2;
 				     csv <= LEASE_RATE_DURATION;
 				     csv++) {
-					script[LOCAL]
+					/* (Not into script[LOCAL]: a later
+					 * output may still be the csv-1 one.) */
+					const u8 *ground
 						= scriptpubkey_to_remote(tmpctx,
 								&keyset->other_payment_key,
 								csv);
 					if (!wally_tx_output_scripteq(
 						       tx->outputs[i],
-						       script[LOCAL]))
+						       ground))
 						continue;
 
 					their_unilateral_local(&outs, tx,
 							       &outpoint,
 							       tx_blockheight,
 							       amt,
-							       script[LOCAL],
+							       ground,
 							       THEIR_REVOKED_UNILATERAL,
 							       csv);
 					script[LOCAL] = NULL;
@@ -2883,16 +2885,15 @@ static void handle_their_cheat(const struct tx_parts *tx,
 				for (size_t csv = 2;
 				     csv <= LEASE_RATE_DURATION;
 				     csv++) {
-					remote_wscript
-						= to_self_wscript(tmpctx,
-								  to_self_delay[REMOTE],
-								  csv, keyset);
-					script[REMOTE]
+					/* (Not into script[REMOTE]: a later
+					 * output may still be the csv-1 one.) */
+					const u8 *ground
 						= scriptpubkey_p2wsh(tmpctx,
-								remote_wscript);
+							to_self_wscript(tmpctx,
+									to_self_delay[REMOTE],
+									csv, keyset));
 
-
-					if (!wally_tx_output_scripteq(tx->outputs[i], script[REMOTE]))
+					if (!wally_tx_output_scripteq(tx->outputs[i], ground))
 						continue;
 
 					out = new_tracked_output(&outs,
@@ -3186,20 +3187,22 @@ static void handle_their_unilateral(const struct tx_parts *tx,
 				for (size_t csv = 2;
 				     csv <= LEASE_RATE_DURATION;
 				     csv++) {
-					script[LOCAL]
+					/* (Not into script[LOCAL]: a later
+					 * output may still be the csv-1 one.) */
+					const u8 *ground
 						= scriptpubkey_to_remote(tmpctx,
 								&keyset->other_payment_key,
 								csv);
 					if (!wally_tx_output_scripteq(
 						       tx->outputs[i],
-						       script[LOCAL]))
+						       ground))
 						continue;
 
 					their_unilateral_local(&outs, tx,
 							       &outpoint,
 							       tx_blockheight,
 							       amt,
-							       script[LOCAL],
+							       ground,
 							       THEIR_UNILATERAL,
 							       csv);
 					script[LOCAL] = NULL;
@@ -3213,16 +3216,15 @@ static void handle_their_unilateral(const struct tx_parts *tx,
 				for (size_t csv = 2;
 				     csv <= LEASE_RATE_DURATION;
 				     csv++) {
-					remote_wscript
-						= to_self_wscript(tmpctx,
-								  to_self_delay[REMOTE],
-								  csv, keyset);
-					script[REMOTE]
+					/* (Not into script[REMOTE]: a later
+					 * output may still be the csv-1 one.) */
+					const u8 *ground
 						= scriptpubkey_p2wsh(tmpctx,
-								remote_wscript);
+							to_self_wscript(tmpctx,
+									to_self_delay[REMOTE],
+									csv, keyset));
 
-
-					if (!wally_tx_output_scripteq(tx->outputs[i], script[REMOTE]))
+					if (!wally_tx_output_scripteq(tx->outputs[i], ground))
 						continue;
 
 					out = new_tracked_output(&outs,
