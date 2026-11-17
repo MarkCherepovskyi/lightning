@@ -22,12 +22,18 @@
 #include <lightningd/subd.h>
 #include <onchaind/onchaind_wiregen.h>
 #include <wallet/txfilter.h>
+#include <wallet/wallet.h>
 
 /* If we're restarting, we keep a per-channel copy of watches, and replay */
 struct replay_tx {
 	u32 blockheight;
 	struct bitcoin_txid txid;
 	struct bitcoin_tx *tx;
+	/* onchaind_spent requests about this tx not answered yet: one per
+	 * input of it that spends a tx we watch. */
+	size_t pending_spends;
+	/* Did onchaind want any of them? */
+	bool interested;
 };
 
 static const struct bitcoin_txid *replay_tx_keyof(const struct replay_tx *rtx)
@@ -128,6 +134,8 @@ static bool tell_if_missing(const struct channel *channel,
 	return true;
 }
 
+static void onchaind_replay(struct channel *channel);
+
 static void handle_onchain_init_reply(struct channel *channel, const u8 *msg)
 {
 	struct htlc_stub *stubs;
@@ -163,6 +171,11 @@ static void handle_onchain_init_reply(struct channel *channel, const u8 *msg)
 
 	/* Tell it about any preimages we know. */
 	onchaind_tell_fulfill(channel);
+
+	/* Now it can hear about spends (see onchaind_funding_spent). */
+	if (channel->onchaind_replay_watches
+	    && channel->num_onchain_spent_calls == 0)
+		onchaind_replay(channel);
 }
 
 /**
@@ -229,7 +242,6 @@ static enum watch_result onchain_tx_watched(struct lightningd *ld,
 
 static void watch_tx_and_outputs(struct channel *channel,
 				 const struct bitcoin_tx *tx);
-static void onchaind_replay(struct channel *channel);
 
 static void replay_unwatch_txid(struct channel *channel,
 				const struct bitcoin_txid *txid)
@@ -251,15 +263,27 @@ static void onchaind_spent_reply(struct subd *onchaind, const u8 *msg,
 
 	channel->num_onchain_spent_calls--;
 
+	/* If we're doing replay: a tx can spend several outputs we watch,
+	 * and onchaind is asked about each of them.  Only drop it once
+	 * onchaind has answered for all of them, and wanted none.  (Live
+	 * watches get one txwatch per request, see watch_tx_and_outputs.) */
+	if (channel->onchaind_replay_watches) {
+		struct replay_tx *rtx
+			= replay_tx_hash_get(channel->onchaind_replay_watches,
+					     txid);
+		if (rtx && rtx->pending_spends) {
+			rtx->pending_spends--;
+			rtx->interested |= interested;
+			if (rtx->pending_spends == 0 && !rtx->interested)
+				replay_unwatch_txid(channel, txid);
+		} else if (!interested)
+			replay_unwatch_txid(channel, txid);
+		goto out;
+	}
+
 	/* Only delete watch if it says it doesn't care */
 	if (interested)
 		goto out;
-
-	/* If we're doing replay: */
-	if (channel->onchaind_replay_watches) {
-		replay_unwatch_txid(channel, txid);
-		goto out;
-	}
 
 	/* Frees the txo watches, too: see watch_tx_and_outputs() */
 	txw = find_txwatch(channel->peer->ld->topology, txid,
@@ -294,6 +318,16 @@ static void onchain_txo_spent(struct channel *channel, const struct bitcoin_tx *
 	/* Reply will need this if we want to unwatch */
 	txid = tal(NULL, struct bitcoin_txid);
 	bitcoin_txid(tx, txid);
+
+	/* Replaying: count the requests about this tx (see
+	 * onchaind_spent_reply). */
+	if (channel->onchaind_replay_watches) {
+		struct replay_tx *rtx
+			= replay_tx_hash_get(channel->onchaind_replay_watches,
+					     txid);
+		if (rtx)
+			rtx->pending_spends++;
+	}
 
 	msg = towire_onchaind_spent(channel, parts, input_num, blockheight);
 	subd_req(channel->owner, channel->owner, take(msg), -1, 0,
@@ -380,7 +414,17 @@ static void replay_watch_tx(struct channel *channel,
 	struct replay_tx *rtx = tal(channel->onchaind_replay_watches, struct replay_tx);
 	bitcoin_txid(tx, &rtx->txid);
 	rtx->blockheight = blockheight;
-	rtx->tx = clone_bitcoin_tx(rtx, tx);
+	rtx->pending_spends = 0;
+	rtx->interested = false;
+	if (tx->psbt)
+		rtx->tx = clone_bitcoin_tx(rtx, tx);
+	else {
+		/* A tx straight from a block has no PSBT (see replay_block) */
+		const u8 *p = linearize_tx(tmpctx, tx);
+		size_t len = tal_bytelen(p);
+		rtx->tx = pull_bitcoin_tx(rtx, &p, &len);
+		tal_free_if_taken(tx);
+	}
 
 	/* We might already be watching, in which case don't re-add! */
 	if (replay_tx_hash_get(channel->onchaind_replay_watches, &rtx->txid))
@@ -421,6 +465,12 @@ static void replay_block(struct bitcoind *bitcoind,
 	if (!channel->owner)
 		return;
 
+	/* A live spend's reply can ask for the block we already asked for:
+	 * only the first answer counts. */
+	if (!channel->onchaind_replay_watches
+	    || height != channel->onchaind_replay_height)
+		return;
+
 	/* There's no such block: the chain got shorter than the tip we were
 	 * replaying towards (a reorg while we replay).  We've seen everything
 	 * there is, so go live. */
@@ -452,9 +502,15 @@ static void replay_block(struct bitcoind *bitcoind,
 				 * PSBTs, so add one now */
 				if (!blk->tx[i]->psbt)
 					blk->tx[i]->psbt = new_psbt(blk->tx[i], blk->tx[i]->wtx);
-				onchain_txo_spent(channel, blk->tx[i], j, height);
-				/* Watch this and all the children too. */
+				/* Topology may have passed this block before
+				 * anyone watched the tx: record its height, as
+				 * filter_block_txs() does, or its depth stays 0 */
+				wallet_transaction_add(channel->peer->ld->wallet,
+						       blk->tx[i]->wtx, height, i);
+				/* Watch this and all the children too (first,
+				 * so onchain_txo_spent counts its request). */
 				replay_watch_tx(channel, height, blk->tx[i]);
+				onchain_txo_spent(channel, blk->tx[i], j, height);
 			}
 		}
 	}
@@ -479,7 +535,8 @@ static void onchaind_replay(struct channel *channel)
 	assert(channel->onchaind_replay_watches);
 	assert(channel->num_onchain_spent_calls == 0);
 
-	bitcoind_getrawblockbyheight(channel,
+	/* A new replay frees the table, which cancels this request. */
+	bitcoind_getrawblockbyheight(channel->onchaind_replay_watches,
 				     channel->peer->ld->topology->bitcoind,
 				     channel->onchaind_replay_height,
 				     replay_block, channel);
@@ -1922,12 +1979,18 @@ enum watch_result onchaind_funding_spent(struct channel *channel,
 				  feerate_min(ld, NULL));
 	subd_send_msg(channel->owner, take(msg));
 
-	/* If we're replaying, we just watch this */
-	if (channel->onchaind_replay_watches) {
-		replay_watch_tx(channel, blockheight, tx);
-	} else {
-		watch_tx_and_outputs(channel, tx);
-	}
+	/* onchaind gets the HTLCs and the preimages we know after it replies
+	 * to init.  A spend it hears of before that (eg. our own HTLC-success
+	 * tx, met again while rescanning blocks after a restart) looks like
+	 * the peer's, and the output it creates is never swept.  So always
+	 * replay from this block, starting once onchaind has all that.  This
+	 * onchaind needs all of it: drop any replay left by an earlier one,
+	 * and the replies it owed us died with it. */
+	tal_free(channel->onchaind_replay_watches);
+	channel->onchaind_replay_watches = new_htable(channel, replay_tx_hash);
+	channel->onchaind_replay_height = blockheight;
+	channel->num_onchain_spent_calls = 0;
+	replay_watch_tx(channel, blockheight, tx);
 
 	/* We keep watching until peer finally deleted, for reorgs. */
 	return KEEP_WATCHING;
@@ -1954,13 +2017,7 @@ static bool onchaind_restart(struct channel *channel)
 		 "Restarting onchaind (%s): closed in block %u",
 		 channel_state_name(channel), blockheight);
 
-	/* We're in replay mode (discard any left by an aborted one) */
-	tal_free(channel->onchaind_replay_watches);
-	channel->onchaind_replay_watches = new_htable(channel, replay_tx_hash);
-	channel->onchaind_replay_height = blockheight;
-	/* Any replies we were waiting for died with the previous onchaind. */
-	channel->num_onchain_spent_calls = 0;
-
+	/* This sets up the replay, too. */
 	onchaind_funding_spent(channel, tx, blockheight);
 
 	/* It logs the reason itself.  Don't leave the channel in replay mode,
@@ -1971,7 +2028,7 @@ static bool onchaind_restart(struct channel *channel)
 		return false;
 	}
 
-	onchaind_replay(channel);
+	/* The replay starts once onchaind replies to init. */
 	return true;
 }
 
