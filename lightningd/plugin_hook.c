@@ -224,9 +224,9 @@ static void hook_start(struct plugin_hook *hook)
 	hook->num_users++;
 }
 
-static void hook_done(struct lightningd *ld,
-		      struct plugin_hook *hook,
-		      void *cb_arg)
+/* A call of the hook is over: if it was the last one, apply any hooks
+ * (re)registered meanwhile. */
+static void hook_release(struct lightningd *ld, struct plugin_hook *hook)
 {
 	/* If we're the last one out, we can update hooks */
 	if (--hook->num_users == 0) {
@@ -239,7 +239,13 @@ static void hook_done(struct lightningd *ld,
 			hook->new_hooks = NULL;
 		}
 	}
+}
 
+static void hook_done(struct lightningd *ld,
+		      struct plugin_hook *hook,
+		      void *cb_arg)
+{
+	hook_release(ld, hook);
 	hook->final_cb(cb_arg);
 }
 
@@ -287,8 +293,15 @@ static void plugin_hook_callback(const char *buffer, const jsmntok_t *toks,
 				      buffer, toks);
 		if (!ph_req->hook->deserialize_cb(ph_req->cb_arg,
 						  buffer, resulttok)) {
+			/* The plugin's answer ended the chain (e.g.
+			 * htlc_accepted's "fail" or "resolve"): this call
+			 * is over too, or the hook stays "in use" and a
+			 * plugin (re)registered for it is never called. */
+			struct plugin_hook *hook = ph_req->hook;
+			struct lightningd *ld = ph_req->ld;
 			tal_free(ph_req->cb_arg);
 			tal_free(ph_req);
+			hook_release(ld, hook);
 			return;
 		}
 	} else {

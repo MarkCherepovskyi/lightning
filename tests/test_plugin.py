@@ -3151,6 +3151,52 @@ def test_htlc_accepted_hook_fwdto(node_factory):
     assert l2.rpc.listforwards()['forwards'][0]['out_channel'] == only_one(l1.rpc.listpeerchannels()['channels'])['short_channel_id']
 
 
+def test_htlc_accepted_hook_replaced_after_fail(node_factory):
+    """A plugin's htlc_accepted answer of "fail" (or "resolve") ends the hook
+    chain. That used to leave the hook counted as in use for good, so a
+    plugin (re)started for it afterwards was never called: "Deferring
+    registration of hook htlc_accepted until it's not in use." """
+    plugin = os.path.join(os.getcwd(), 'tests/plugins/fail_htlcs.py')
+    l1, l2 = node_factory.line_graph(2, opts=[{}, {'plugin': plugin}])
+
+    with pytest.raises(RpcError, match=r'temporary_node_failure'):
+        l1.rpc.pay(l2.rpc.invoice(1000, 'first', 'first')['bolt11'])
+    l2.daemon.wait_for_log('Failing htlc on purpose')
+
+    # Replace the plugin: the new instance must be called for the next HTLC.
+    l2.rpc.plugin_stop(plugin)
+    l2.rpc.plugin_start(plugin)
+    with pytest.raises(RpcError, match=r'temporary_node_failure'):
+        l1.rpc.pay(l2.rpc.invoice(1000, 'second', 'second')['bolt11'])
+    assert l2.rpc.listinvoices('second')['invoices'][0]['status'] == 'unpaid'
+    assert not l2.daemon.is_in_log('Deferring registration of hook htlc_accepted')
+
+
+def test_peer_connected_hook_replaced_after_disconnect(node_factory):
+    """As test_htlc_accepted_hook_replaced_after_fail, for another hook whose
+    answer ends the chain: peer_connected's "disconnect"."""
+    plugin = os.path.join(os.getcwd(), 'tests/plugins/reject.py')
+    l1, l2 = node_factory.get_nodes(2, opts=[{'plugin': plugin, 'allow_warning': True},
+                                             {'allow_warning': True}])
+
+    def rejected():
+        l1.rpc.reject(l2.info['id'])
+        try:
+            l2.connect(l1)
+        except RpcError as err:
+            assert "disconnected during connection" in err.error['message']
+        l1.daemon.wait_for_log(f"{l2.info['id']} is in reject list")
+        wait_for(lambda: not l1.rpc.listpeers(l2.info['id'])['peers']
+                 or not only_one(l1.rpc.listpeers(l2.info['id'])['peers'])['connected'])
+
+    rejected()
+    # Replace the plugin: the new instance must be called on the next connect.
+    l1.rpc.plugin_stop(plugin)
+    l1.rpc.plugin_start(plugin)
+    rejected()
+    assert not l1.daemon.is_in_log('Deferring registration of hook peer_connected')
+
+
 def test_dynamic_args(node_factory):
     plugin_path = os.path.join(os.getcwd(), 'contrib/plugins/helloworld.py')
 
