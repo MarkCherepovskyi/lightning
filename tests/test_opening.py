@@ -4226,3 +4226,39 @@ def test_duplicate_channel_id_in_db(node_factory, bitcoind):
     # And we can still start with both in the db.
     l2.restart()
     assert [c['channel_id'] for c in l2.rpc.listclosedchannels()['closedchannels']] == [cid, cid]
+
+
+@unittest.skipIf(TEST_NETWORK != 'regtest', 'dual-funding is only on bitcoin')
+@pytest.mark.parametrize('hook', ['openchannel2_changed'])
+def test_openchannel2_psbt_hook_reject(node_factory, bitcoind, hook):
+    """A plugin answering "reject" to openchannel2_changed fails the open,
+    and lightningd frees the hook's payload without leaving a destructor on
+    dualopend that writes to it when dualopend exits (a use-after-free that
+    valgrind/ASan catch).  (openchannel2_sign has the same fix, but a
+    "reject" there is broken in another way upstream: dualopend gets a
+    dualopend_fail it can't parse at that stage and dies, and the opener's
+    fundchannel hangs.)"""
+    plugin = os.path.join(os.getcwd(), 'tests/plugins/df_reject.py')
+    l1, l2 = node_factory.get_nodes(2, opts=[{'experimental-dual-fund': None,
+                                              'may_reconnect': True, 'allow_warning': True},
+                                             {'experimental-dual-fund': None,
+                                              'may_reconnect': True, 'allow_warning': True,
+                                              'plugin': plugin, 'df-reject-hook': hook,
+                                              'funder-policy': 'match',
+                                              'funder-policy-mod': 100}])
+    l1.fundwallet(2_000_000)
+    l2.fundwallet(2_000_000)
+    l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
+    with pytest.raises(RpcError):
+        l1.rpc.fundchannel(l2.info['id'], 500_000)
+    l2.daemon.wait_for_log('rejecting ' + hook)
+    # dualopend goes away now, and with it its destructors.
+    if l2.rpc.listpeers(l1.info['id'])['peers']:
+        l2.rpc.disconnect(l1.info['id'], force=True)
+    wait_for(lambda: not any(p['connected'] for p in l2.rpc.listpeers()['peers']))
+    # Still standing, and still opens channels.
+    l2.rpc.getinfo()
+    l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
+    l2.rpc.call('plugin', {'subcommand': 'stop', 'plugin': plugin})
+    l1.rpc.fundchannel(l2.info['id'], 500_000)
+    bitcoind.generate_block(1, wait_for_mempool=1)

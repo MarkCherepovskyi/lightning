@@ -670,6 +670,10 @@ openchannel2_hook_cb(struct openchannel2_payload *payload STEALS)
 
 	channel = dualopend->channel;
 
+	/* payload is freed with tmpctx, whatever happens next: dualopend's
+	 * destructor must not touch it afterwards. */
+	tal_del_destructor2(dualopend, openchannel2_remove_dualopend, payload);
+
 	/* Channel open is currently in progress elsewhere! */
 	if (channel->open_attempt) {
 		msg = towire_dualopend_fail(NULL, "Already initiated channel"
@@ -678,8 +682,6 @@ openchannel2_hook_cb(struct openchannel2_payload *payload STEALS)
 			  "Our open in progress, denying their offer");
 		return subd_send_msg(dualopend, take(msg));
 	}
-
-	tal_del_destructor2(dualopend, openchannel2_remove_dualopend, payload);
 
 	if (payload->err_msg) {
 		log_debug(dualopend->ld->log,
@@ -779,7 +781,10 @@ openchannel2_hook_deserialize(struct openchannel2_payload *payload,
 			   "openchannel2 hook close_to address was"
 			   " already set by other plugin. Ignoring!");
 	else
-		payload->our_shutdown_scriptpubkey = shutdown_script;
+		/* Parsed onto tmpctx, which is freed before the next
+		 * plugin in the chain answers: keep it with the payload. */
+		payload->our_shutdown_scriptpubkey
+			= tal_steal(payload, shutdown_script);
 
 
 	struct amount_msat fee_base, fee_max_base;
@@ -868,8 +873,15 @@ openchannel2_changed_deserialize(struct openchannel2_psbt_payload *payload,
 
 	if (!hook_extract_psbt(NULL, dualopend, buffer,
 			       toks, "openchannel2_changed",
-			       false, &psbt))
+			       false, &psbt)) {
+		/* The hook machinery frees the payload now: dualopend's
+		 * destructor must not touch it afterwards. */
+		if (dualopend)
+			tal_del_destructor2(dualopend,
+					    openchannel2_psbt_remove_dualopend,
+					    payload);
 		return false;
+	}
 
 	/* Add serials to PSBT, before checking for required fields */
 	psbt_add_serials(psbt, TX_ACCEPTER);
@@ -922,8 +934,15 @@ openchannel2_signed_deserialize(struct openchannel2_psbt_payload *payload,
 
 	if (!hook_extract_psbt(NULL, dualopend, buffer,
 			       toks, "openchannel2_sign",
-			       false, &psbt))
+			       false, &psbt)) {
+		/* The hook machinery frees the payload now: dualopend's
+		 * destructor must not touch it afterwards. */
+		if (dualopend)
+			tal_del_destructor2(dualopend,
+					    openchannel2_psbt_remove_dualopend,
+					    payload);
 		return false;
+	}
 
 	/* We require the PSBT to meet certain criteria such as
 	 * extra, proprietary fields (`serial_id`s) or

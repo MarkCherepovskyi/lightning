@@ -901,6 +901,28 @@ def test_openchannel_hook_chaining(node_factory, bitcoind):
 
 @pytest.mark.openchannel('v1')
 @pytest.mark.openchannel('v2')
+def test_openchannel_hook_close_to_then_another_plugin(node_factory, bitcoind):
+    """The first openchannel hook sets close_to, a second one answers later:
+    the close_to script must outlive that wait (it was parsed onto tmpctx,
+    freed before the hook chain ended, and lightningd crashed using it)."""
+    opts = [{}, {'plugin': [
+        os.path.join(os.getcwd(), 'tests/plugins/openchannel_hook_accepter.py'),
+        os.path.join(os.getcwd(), 'tests/plugins/openchannel_hook_accept.py'),
+    ]}]
+    l1, l2 = node_factory.line_graph(2, fundchannel=False, opts=opts)
+    l1.fundwallet(10**6)
+
+    # 100003sat: openchannel_hook_accepter.py answers with a close_to.
+    l1.rpc.fundchannel(l2.info['id'], 100003)
+    assert l2.daemon.is_in_log("accept on principle")
+    bitcoind.generate_block(6, wait_for_mempool=1)
+    wait_for(lambda: only_one(l2.rpc.listpeerchannels()['channels'])['state'] == 'CHANNELD_NORMAL')
+    assert (only_one(l2.rpc.listpeerchannels()['channels'])['close_to_addr']
+            == 'bcrt1q7gtnxmlaly9vklvmfj06amfdef3rtnrdazdsvw')
+
+
+@pytest.mark.openchannel('v1')
+@pytest.mark.openchannel('v2')
 def test_channel_state_changed_bilateral(node_factory, bitcoind):
     """ We open and close a channel and check notifications both sides.
 

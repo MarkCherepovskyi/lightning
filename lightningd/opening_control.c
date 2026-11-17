@@ -817,7 +817,10 @@ openchannel_hook_deserialize(struct openchannel_hook_payload *payload,
 				   " already set by other plugin. Ignoring!");
 			return true;
 		}
-		switch (json_to_address_scriptpubkey(tmpctx, chainparams,
+		/* On the payload, not tmpctx: with another plugin after
+		 * this one, the hook chain goes on (and tmpctx is freed)
+		 * before openchannel_hook_final uses it. */
+		switch (json_to_address_scriptpubkey(payload, chainparams,
 						     buffer, t_closeto,
 						     &payload->our_upfront_shutdown_script)) {
 			case ADDRESS_PARSE_UNRECOGNIZED:
