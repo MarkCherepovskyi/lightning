@@ -3551,10 +3551,9 @@ def test_onchaind_replay_tx_spending_two_watched(node_factory, bitcoind):
     sweep of the HTLC-timeout output, onchaind's replay must still see that
     sweep and finish: replay used to drop its watch on the whole HTLC-timeout
     tx as soon as onchaind said it didn't care about one of its inputs."""
-    hold = os.path.join(os.getcwd(), 'contrib/evmchan/hold.py')
-    l1, l2 = node_factory.get_nodes(2, opts=[{'may_reconnect': True},
-                                             {'may_reconnect': True, 'plugin': hold,
-                                              'hold-all': False}])
+    # l2 hangs up instead of failing an HTLC it doesn't know, which stays
+    # in flight.
+    l1, l2 = node_factory.get_nodes(2, opts=[{}, {'disconnect': ['-WIRE_UPDATE_FAIL_HTLC']}])
     l1.fundwallet(10**6)
     l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
     l1.rpc.fundchannel(l2.info['id'], 'all')
@@ -3570,16 +3569,14 @@ def test_onchaind_replay_tx_spending_two_watched(node_factory, bitcoind):
 
     l1.rpc.pay(l2.rpc.invoice(100_000_000, 'r', 'r')['bolt11'])
     payment_hash = '03' * 32
-    l2.rpc.call('hold-add', {'payment_hash': payment_hash})
     chan = only_one(l1.rpc.listpeerchannels()['channels'])
     # It expires well after l1's to_local delay.
     route = [{'id': l2.info['id'], 'channel': chan['short_channel_id'],
               'amount_msat': 40_000_000, 'delay': 30}]
     l1.rpc.sendpay(route, payment_hash, payment_secret='03' * 32, amount_msat=40_000_000)
-    # (Not just any HTLC: the payment above may still be settling.)
-    wait_for(lambda: l2.rpc.call('hold-list')['held'] == [payment_hash])
+    l2.daemon.wait_for_log('dev_disconnect: -WIRE_UPDATE_FAIL_HTLC')
+    wait_for(lambda: not only_one(l1.rpc.listpeerchannels()['channels'])['peer_connected'])
 
-    l1.rpc.disconnect(l2.info['id'], force=True)
     commit = only_one(l1.rpc.close(l2.info['id'], unilateraltimeout=1)['txids'])
     bitcoind.generate_block(1, wait_for_mempool=commit)
 
