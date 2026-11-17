@@ -228,15 +228,6 @@ static bool is_asset_output(const struct wally_tx_output *out)
 	return !amount_asset_is_main(&amt);
 }
 
-/* Elements outputs nobody spends: the explicit fee output (empty script),
- * and an asset channel commitment's burn of trimmed HTLCs (OP_RETURN,
- * common/channel_asset.h).  Tracked, and ignored. */
-static bool elements_unspendable(const struct wally_tx_output *out)
-{
-	return chainparams->is_elements
-		&& (out->script_len == 0 || channel_asset_is_burn(out));
-}
-
 static void note_lbtc_outputs(const struct tx_parts *tx)
 {
 	if (!chan_asset)
@@ -2354,7 +2345,8 @@ static void handle_our_unilateral(const struct tx_parts *tx,
 		outpoint.txid = tx->txid;
 		outpoint.n = i;
 
-		if (elements_unspendable(tx->outputs[i])) {
+		if (chainparams->is_elements
+		    && tx->outputs[i]->script_len == 0) {
 			status_debug("OUTPUT %zu is a fee output", i);
 			/* An empty script simply means that that this is a
 			 * fee output. */
@@ -2834,7 +2826,8 @@ static void handle_their_cheat(const struct tx_parts *tx,
 		outpoint.txid = tx->txid;
 		outpoint.n = i;
 
-		if (elements_unspendable(tx->outputs[i])) {
+		if (chainparams->is_elements
+		    && tx->outputs[i]->script_len == 0) {
 			/* An empty script simply means that that this is a
 			 * fee output. */
 			out = new_tracked_output(&outs, &outpoint,
@@ -3155,7 +3148,8 @@ static void handle_their_unilateral(const struct tx_parts *tx,
 		outpoint.txid = tx->txid;
 		outpoint.n = i;
 
-		if (elements_unspendable(tx->outputs[i])) {
+		if (chainparams->is_elements &&
+		    tx->outputs[i]->script_len == 0) {
 			/* An empty script simply means that that this is a
 			 * fee output. */
 			out = new_tracked_output(&outs, &outpoint,

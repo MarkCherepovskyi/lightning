@@ -1,5 +1,0 @@
-out/
-cache/
-# Regenerable test data (deterministic, ~35 MB): written by
-# contrib/evmchan/gen_vectors.py (see README.md)
-test/generated/

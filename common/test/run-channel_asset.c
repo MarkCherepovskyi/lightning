@@ -192,7 +192,7 @@ static void test_finish_tx(void)
 
 	/* A 100000-unit channel: 60000 to the opener (output 0), 39000 to
 	 * the other side (1), an anchor in the chain's coin (2), and 1000
-	 * units of trimmed HTLCs unpaid. */
+	 * units unpaid. */
 	tx = bitcoin_tx(tmpctx, chainparams, 2, 4, 0);
 	bitcoin_tx_add_asset_output(tx, script, NULL, AMOUNT_SAT(60000), tag);
 	bitcoin_tx_add_asset_output(tx, script, NULL, AMOUNT_SAT(39000), tag);
@@ -218,23 +218,6 @@ static void test_finish_tx(void)
 	assert(amt.value == 61000);
 	amt = bitcoin_tx_output_get_amount(tx, 1);
 	assert(amt.value == 39500);
-
-	/* Trimmed HTLCs are burned, not paid to anyone: 900 units of them to
-	 * an OP_RETURN, and only the 100 left (rounding) to the opener. */
-	tx = bitcoin_tx(tmpctx, chainparams, 2, 4, 0);
-	bitcoin_tx_add_asset_output(tx, script, NULL, AMOUNT_SAT(60000), tag);
-	bitcoin_tx_add_asset_output(tx, script, NULL, AMOUNT_SAT(39000), tag);
-	assert(channel_asset_add_burn(tx, asset, AMOUNT_SAT(0)) == -1);
-	assert(channel_asset_add_burn(tx, asset, AMOUNT_SAT(900)) == 2);
-	assert(channel_asset_is_burn(&tx->wtx->outputs[2]));
-	assert(!channel_asset_is_burn(&tx->wtx->outputs[0]));
-	amt = bitcoin_tx_output_get_amount(tx, 2);
-	assert(memeq(amt.asset, ELEMENTS_ASSET_LEN, tag, ELEMENTS_ASSET_LEN) && amt.value == 900);
-	channel_asset_finish_tx(tx, asset, AMOUNT_SAT(100000), 0, 1);
-	amt = bitcoin_tx_output_get_amount(tx, 0);
-	assert(amt.value == 60100);
-	amt = bitcoin_tx_output_get_amount(tx, 1);
-	assert(amt.value == 39000);
 
 	/* The fee reserve sits right after the funding output. */
 	{

@@ -49,10 +49,22 @@ bool check_config_bounds(const tal_t *ctx,
 	 * add must fit. */
 	if (asset) {
 		size_t max = asset_commit_max_htlcs(asset);
-		struct amount_sat dust
-			= amount_sat_greater(remoteconf->dust_limit,
-					     localconf->dust_limit)
-			? remoteconf->dust_limit : localconf->dust_limit;
+		struct amount_sat dust = ASSET_DUST_LIMIT;
+
+		/* No commitment trims an HTLC worth a unit: what a
+		 * commitment doesn't pay out goes to the opener
+		 * (channel_asset_finish_tx), who mustn't gain HTLCs. */
+		if (!amount_sat_eq(remoteconf->dust_limit, dust)
+		    || !amount_sat_eq(localconf->dust_limit, dust)) {
+			*err_reason = tal_fmt(ctx, "asset channel dust limits"
+					      " %s and %s must be %s",
+					      fmt_amount_sat(tmpctx,
+							     remoteconf->dust_limit),
+					      fmt_amount_sat(tmpctx,
+							     localconf->dust_limit),
+					      fmt_amount_sat(tmpctx, dust));
+			return false;
+		}
 
 		/* The asset can't pay fees, so every commitment pays out
 		 * all of it, and what isn't an output tops up a direct

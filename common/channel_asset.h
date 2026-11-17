@@ -98,27 +98,20 @@ bool check_fee_reserve_sig(struct bitcoin_tx *tx,
 			   const struct pubkey *their_funding_pubkey,
 			   const secp256k1_ecdsa_signature *sig);
 
-/* A commitment's trimmed HTLCs, @burned in the asset, go to an OP_RETURN
- * output (nobody gets them), as trimmed HTLCs go to the miners on Bitcoin:
- * so no side profits from making the other's HTLCs dust.  Only when some
- * HTLC is trimmed, so the output takes the place of at least one HTLC
- * output and never adds to a commitment's worst-case weight (the HTLC cap,
- * asset_commit_max_htlcs).  Returns its output number, or -1 for none. */
-int channel_asset_add_burn(struct bitcoin_tx *tx,
-			   const struct channel_asset *asset,
-			   struct amount_sat burned);
-
-/* Is this an asset channel's burn output (an OP_RETURN, which no one can
- * spend)? */
-bool channel_asset_is_burn(const struct wally_tx_output *out);
+/* Both sides' `dust_limit_satoshis` in an asset channel: one unit.  Elements
+ * has no dust rule for issued assets, and a trimmed HTLC can't go to the
+ * miners as on Bitcoin (the asset pays no fees), so no HTLC worth a unit is
+ * trimmed: it always gets its output, and no side can profit from making
+ * the other's HTLCs dust. */
+#define ASSET_DUST_LIMIT AMOUNT_SAT(1)
 
 /* Finish an asset channel transaction's outputs (before they get sorted):
  * the asset can't pay fees, so the asset outputs must add up to the asset
- * funding amount.  Whatever isn't paid out (msat rounding; trimmed HTLCs
- * are burned first, channel_asset_add_burn) tops up the opener's direct
- * output at @opener_outnum, or the other side's at @other_outnum if the
- * opener has none (-1).  The L-BTC that the outputs don't use (the reserve
- * minus the anchors) is the fee. */
+ * funding amount.  Whatever isn't paid out (less than a unit per balance
+ * and HTLC: msat rounding) tops up the opener's direct output at
+ * @opener_outnum, or the other side's at @other_outnum if the opener has
+ * none (-1).  The L-BTC that the outputs don't use (the reserve minus the
+ * anchors) is the fee. */
 void channel_asset_finish_tx(struct bitcoin_tx *tx,
 			     const struct channel_asset *asset,
 			     struct amount_sat funding_sats,

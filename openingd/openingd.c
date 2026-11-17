@@ -274,13 +274,15 @@ static void set_remote_upfront_shutdown(struct state *state,
 		peer_failed_err(state->pps, &state->channel_id, "%s", err);
 }
 
-/* Asset channels: accept only as many HTLCs as half of what the fee
- * reserve pays for (the peer does the same), so the commitment always pays
- * the relay floor (see check_config_bounds). */
-static void limit_asset_htlcs(struct state *state)
+/* Asset channels: trim no HTLC worth a unit (ASSET_DUST_LIMIT), and accept
+ * only as many HTLCs as half of what the fee reserve pays for (the peer
+ * does the same), so the commitment always pays the relay floor (see
+ * check_config_bounds). */
+static void asset_channel_config(struct state *state)
 {
 	size_t half = asset_commit_max_htlcs(state->asset) / 2;
 
+	state->localconf.dust_limit = ASSET_DUST_LIMIT;
 	if (state->localconf.max_accepted_htlcs > half) {
 		status_debug("Asset channel: fee reserve %s pays for %zu HTLCs:"
 			     " accepting %zu, not %u",
@@ -355,7 +357,7 @@ static u8 *funder_channel_start(struct state *state, u8 channel_flags,
 					   "Asset channels need option_anchors");
 			return NULL;
 		}
-		limit_asset_htlcs(state);
+		asset_channel_config(state);
 	}
 
 	/* If they use the same settings as us, would we fail?  If so, do that now. */
@@ -941,6 +943,7 @@ static u8 *funder_channel_complete(struct state *state)
 					   state->feerate_per_kw,
 					   state->localconf.channel_reserve,
 					   state->localconf.max_accepted_htlcs,
+					   state->localconf.dust_limit,
 					   state->upfront_shutdown_script[REMOTE],
 					   state->channel_type);
 }
@@ -1155,7 +1158,7 @@ static u8 *fundee_channel(struct state *state, const u8 *open_channel_msg)
 	}
 
 	if (state->asset)
-		limit_asset_htlcs(state);
+		asset_channel_config(state);
 
 	/* These checks are the same whether we're opener or accepter... */
 	if (!check_config_bounds(tmpctx, state->funding_sats,
@@ -1230,20 +1233,13 @@ static u8 *fundee_channel(struct state *state, const u8 *open_channel_msg)
 	if (reserve != NULL) {
 		set_reserve_absolute(state, state->remoteconf.dust_limit,
 				     *reserve);
-		/* An asset channel's reserves stay at least both dust
-		 * limits (check_config_bounds, above, and
-		 * channel_asset_finish_tx rely on it), whatever the
-		 * openchannel hook asked for. */
-		if (state->asset) {
-			struct amount_sat dust
-				= state->remoteconf.dust_limit;
-
-			if (amount_sat_greater(state->localconf.dust_limit, dust))
-				dust = state->localconf.dust_limit;
-			if (amount_sat_greater(dust,
-					       state->localconf.channel_reserve))
-				state->localconf.channel_reserve = dust;
-		}
+		/* An asset channel's reserves stay at least the dust limit
+		 * (check_config_bounds, above, and channel_asset_finish_tx
+		 * rely on it), whatever the openchannel hook asked for. */
+		if (state->asset
+		    && amount_sat_less(state->localconf.channel_reserve,
+				       ASSET_DUST_LIMIT))
+			state->localconf.channel_reserve = ASSET_DUST_LIMIT;
 	}
 
 	/* OK, we accept! */
@@ -1479,6 +1475,7 @@ static u8 *fundee_channel(struct state *state, const u8 *open_channel_msg)
 				     msg,
 				     state->localconf.channel_reserve,
 				     state->localconf.max_accepted_htlcs,
+				     state->localconf.dust_limit,
 				     state->upfront_shutdown_script[LOCAL],
 				     state->upfront_shutdown_script[REMOTE],
 				     state->channel_type);
