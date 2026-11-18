@@ -2201,6 +2201,32 @@ def test_withdraw_close_output_signed(node_factory, bitcoind):
     assert decoded['txid'] == out['txid']
 
 
+def test_withdraw_anchored_to_remote_feerate(node_factory, bitcoind):
+    """The to_remote output of a peer's unilateral close of an anchor channel
+    is P2WSH: its witness is the signature and the 37-byte script, and the fee
+    must pay for both.  At the 253perkw floor, a fee for the signature alone
+    is under bitcoind's min relay fee."""
+    l1, l2 = node_factory.line_graph(2)
+    l1.pay(l2, 200_000_000)
+
+    # l1 drops to chain: l2's balance is the to_remote output (CSV 1).
+    l1.rpc.dev_fail(l2.info['id'])
+    l1.wait_for_channel_onchain(l2.info['id'])
+    bitcoind.generate_block(2)
+    sync_blockheight(bitcoind, [l2])
+    wait_for(lambda: [o['status'] for o in l2.rpc.listfunds()['outputs']] == ['confirmed'])
+    utxo = only_one(l2.rpc.listfunds()['outputs'])
+    assert utxo['scriptpubkey'].startswith('0020')
+
+    out = l2.rpc.withdraw(bitcoind.rpc.getnewaddress(), 'all', '253perkw',
+                          utxos=['{}:{}'.format(utxo['txid'], utxo['output'])])
+    decoded = bitcoind.rpc.decoderawtransaction(out['tx'])
+    assert len(only_one(decoded['vin'])['txinwitness']) == 2
+    fee = utxo['amount_msat'] // 1000 - sum(round(v['value'] * 10**8) for v in decoded['vout'])
+    assert fee >= 253 * decoded['weight'] // 1000
+    assert out['txid'] in bitcoind.rpc.getrawmempool()
+
+
 def test_withdraw_nlocktime(node_factory):
     """
     Test that we don't set the nLockTime to 0 for withdrawal and
