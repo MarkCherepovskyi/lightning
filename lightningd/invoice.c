@@ -1202,15 +1202,21 @@ static struct command_result *json_invoice(struct command *cmd,
 		}
 	} else if (cmd->ld->unified_invoices) {
 		struct pubkey pubkey;
-		const u8 *p2tr;
 
 		fallback_scripts = tal_arr(cmd, const u8 *, 1);
 
-		if (!newaddr_inner(cmd, &pubkey, ADDR_P2TR))
+		/* We cannot spend taproot on Elements. */
+		if (!newaddr_inner(cmd, &pubkey,
+				   chainparams->is_elements
+				   ? ADDR_BECH32 : ADDR_P2TR))
 			return command_fail(cmd, LIGHTNINGD, "Keys exhausted ");
 
-		p2tr = scriptpubkey_p2tr(fallback_scripts, &pubkey);
-		fallback_scripts[0] = p2tr;
+		if (chainparams->is_elements)
+			fallback_scripts[0]
+				= scriptpubkey_p2wpkh(fallback_scripts, &pubkey);
+		else
+			fallback_scripts[0]
+				= scriptpubkey_p2tr(fallback_scripts, &pubkey);
 	}
 
 	if (preimage)

@@ -150,6 +150,11 @@ static struct command_result *json_newaddr(struct command *cmd,
 			*addrtype = ADDR_P2TR;
 	}
 
+	/* We cannot spend taproot on Elements, so never hand out such an
+	 * address there (param_newaddr refuses an explicit "p2tr"). */
+	if (chainparams->is_elements)
+		*addrtype = ADDR_BECH32;
+
 	if (!newaddr_inner(cmd, &pubkey, *addrtype)) {
 		return command_fail(cmd, LIGHTNINGD, "Keys exhausted ");
 	};

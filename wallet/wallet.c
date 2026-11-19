@@ -630,6 +630,10 @@ struct utxo **wallet_utxo_boost(const tal_t *ctx,
 		if (utxo_is_immature(utxo, blockheight))
 			continue;
 
+		/* Don't add ones we cannot sign for */
+		if (utxo_is_unsignable(utxo))
+			continue;
+
 		/* UTXOs must be sane amounts */
 		if (!amount_sat_add(&new_excess_sats,
 				    excess_sats, utxo->amount))
@@ -836,6 +840,7 @@ struct utxo *wallet_find_utxo(const tal_t *ctx, struct wallet *w,
 
 		if (excluded(excludes, u)
 		    || (nonwrapped && u->utxotype == UTXO_P2SH_P2WPKH)
+		    || utxo_is_unsignable(u)
 		    || !deep_enough(maxheight, u, current_blockheight))
 			continue;
 		return tal_steal(ctx, u);
@@ -856,6 +861,7 @@ bool wallet_has_funds(struct wallet *w,
 		const struct utxo *utxo = utxos[i];
 
 		if (excluded(excludes, utxo)
+		    || utxo_is_unsignable(utxo)
 		    || !deep_enough(-1U, utxo, current_blockheight))
 			continue;
 

@@ -2228,6 +2228,34 @@ def test_withdraw_anchored_to_remote_feerate(node_factory, bitcoind):
     assert out['txid'] in bitcoind.rpc.getrawmempool()
 
 
+@unittest.skipIf(TEST_NETWORK != 'liquid-regtest', "taproot is only unusable on Elements")
+def test_elements_no_taproot(node_factory, bitcoind):
+    """hsmd cannot sign a taproot input on Elements (it dies trying, and takes
+    lightningd with it), so we must neither hand out taproot addresses there
+    nor put a taproot coin we already hold into a transaction."""
+    l1 = node_factory.get_node()
+    assert list(l1.rpc.newaddr().keys()) == ['bech32']
+    assert list(l1.rpc.newaddr('all').keys()) == ['bech32']
+    with pytest.raises(RpcError, match="should be 'p2tr', 'bech32', or 'all'"):
+        l1.rpc.newaddr('p2tr')
+
+    # A coin from before that was the rule: make our only one taproot.
+    l1.fundwallet(10**6)
+    utxo = only_one(l1.rpc.listfunds()['outputs'])
+    l1.stop()
+    l1.db_manip("UPDATE our_outputs SET scriptpubkey=x'5120{}';".format('aa' * 32))
+    l1.start()
+
+    with pytest.raises(RpcError, match='Could not afford'):
+        l1.rpc.fundpsbt(1000, '253perkw', 0)
+    with pytest.raises(RpcError, match='Could not afford'):
+        l1.rpc.withdraw(l1.rpc.newaddr()['bech32'], 1000)
+    with pytest.raises(RpcError, match='is taproot, which we cannot spend'):
+        l1.rpc.utxopsbt(1000, '253perkw', 0, ['{}:{}'.format(utxo['txid'], utxo['output'])])
+    # It is still running.
+    assert l1.rpc.getinfo()['id'] == l1.info['id']
+
+
 def test_withdraw_nlocktime(node_factory):
     """
     Test that we don't set the nLockTime to 0 for withdrawal and

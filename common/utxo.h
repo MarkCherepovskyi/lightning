@@ -82,6 +82,11 @@ static inline bool utxo_is_csv_locked(const struct utxo *utxo, u32 current_heigh
 	return *utxo->blockheight + utxo->close_info->csv > current_height;
 }
 
+/* On Elements we cannot sign a taproot input (hsmd's PSBT signing fails on
+ * it), so such a coin must never go into a transaction: asking hsmd to sign
+ * it takes the node down. */
+bool utxo_is_unsignable(const struct utxo *utxo);
+
 /* Estimate of (signed) UTXO weight in transaction */
 size_t utxo_spend_weight(const struct utxo *utxo, size_t min_witness_weight);
 
