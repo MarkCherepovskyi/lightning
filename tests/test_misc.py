@@ -349,6 +349,48 @@ def test_lightningd_still_loading(node_factory, bitcoind, executor):
     l1.pay(l2, 1000)
 
 
+def test_fundchannel_start_peer_gone_while_syncing(node_factory, bitcoind, executor):
+    """fundchannel_start waits until we have synced.  If the peer is no longer
+    connected by then, the command must fail, not go on with a freed command."""
+    mock_release = Event()
+
+    def mock_getblock(r):
+        brpc = RawProxy(btc_conf_file=bitcoind.conf_file)
+        if r['params'][0] == slow_blockid:
+            mock_release.wait(TIMEOUT)
+        return {
+            "result": brpc._call(r['method'], *r['params']),
+            "error": None,
+            "id": r['id']
+        }
+
+    # A channel between them, so l1 keeps the peer when it disconnects.
+    l1, l2 = node_factory.line_graph(2, opts=[{'may_reconnect': True,
+                                               'wait_for_bitcoind_sync': False},
+                                              {'may_reconnect': True}])
+    l1.stop()
+    bitcoind.generate_block(2)
+    sync_blockheight(bitcoind, [l2])
+
+    # Make it slow grabbing the final block.
+    slow_blockid = bitcoind.rpc.getblockhash(bitcoind.rpc.getblockcount())
+    l1.daemon.rpcproxy.mock_rpc('getblock', mock_getblock)
+    l1.start(wait_for_bitcoind_sync=False)
+    wait_for(lambda: only_one(l1.rpc.listpeers(l2.info['id'])['peers'])['connected'])
+
+    fut = executor.submit(l1.rpc.fundchannel_start, l2.info['id'], '30000sat')
+    l1.daemon.wait_for_log("NOTIFY .* unusual Waiting to sync with bitcoind network")
+
+    # The peer goes away while we wait.
+    l2.stop()
+    wait_for(lambda: not only_one(l1.rpc.listpeers(l2.info['id'])['peers'])['connected'])
+
+    mock_release.set()
+    with pytest.raises(RpcError, match=r'Peer not connected'):
+        fut.result(TIMEOUT)
+    assert l1.rpc.getinfo()['id'] == l1.info['id']
+
+
 def test_ping(node_factory):
     l1, l2 = node_factory.line_graph(2)
 

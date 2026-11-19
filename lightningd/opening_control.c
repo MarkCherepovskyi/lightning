@@ -1374,11 +1374,13 @@ static void fundchannel_start_after_sync(struct chain_topology *topo,
 		return;
 	}
 
-	if (peer->connected != PEER_CONNECTED)
+	if (peer->connected != PEER_CONNECTED) {
 		was_pending(command_fail(info->cmd, FUNDING_PEER_NOT_CONNECTED,
 					 "Peer %s",
 					 peer->connected == PEER_DISCONNECTED
 					 ? "not connected" : "still connecting"));
+		return;
+	}
 	fundchannel_start(info->cmd, peer, info->fc,
 			  &info->tmp_channel_id, info->mindepth, info->reserve);
 }

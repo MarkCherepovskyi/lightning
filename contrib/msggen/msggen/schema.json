@@ -31137,9 +31137,10 @@
           "addresstype": {
             "type": "string",
             "description": [
-              "It specifies the type of address wanted; currently *bech32* (e.g. `tb1qu9j4lg5f9rgjyfhvfd905vw46eg39czmktxqgg` on bitcoin testnet or `bc1qwqdg6squsna38e46795at95yu9atm8azzmyvckulcc7kytlcckxswvvzej` on bitcoin mainnet), or *p2tr* taproot addresses. The special value *all* generates all known address types for the same underlying key."
+              "It specifies the type of address wanted; currently *bech32* (e.g. `tb1qu9j4lg5f9rgjyfhvfd905vw46eg39czmktxqgg` on bitcoin testnet or `bc1qwqdg6squsna38e46795at95yu9atm8azzmyvckulcc7kytlcckxswvvzej` on bitcoin mainnet), or *p2tr* taproot addresses. The special value *all* generates all known address types for the same underlying key.",
+              "On Elements networks (e.g. Liquid) taproot outputs cannot be spent, so *p2tr* is refused and a *bech32* address is always returned."
             ],
-            "default": "*p2tr* address",
+            "default": "*p2tr* address (*bech32* on Elements)",
             "enum": [
               "bech32",
               "p2tr",
