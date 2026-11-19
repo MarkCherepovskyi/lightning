@@ -19,6 +19,13 @@ pub(crate) async fn assetbalances(p: Plugin<State>, _args: Value) -> Result<Valu
 
     let mut by_asset: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
     for c in res["channels"].as_array().into_iter().flatten() {
+        // Only live channels: a closed one stays in listpeerchannels (state
+        // ONCHAIN) for 100 blocks with its final to_us_msat, while that
+        // same money is already back on-chain - counting it would show it
+        // twice.
+        if c["state"].as_str() != Some("CHANNELD_NORMAL") {
+            continue;
+        }
         let asset = c["asset"].as_str().unwrap_or("lbtc").to_string();
         let to_us_msat = c["to_us_msat"].as_u64().unwrap_or(0);
         *by_asset.entry(asset).or_insert(0) += to_us_msat;

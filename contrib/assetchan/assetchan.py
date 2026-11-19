@@ -363,6 +363,44 @@ def assetchan_funds(plugin, channels=True):
     return res
 
 
+@plugin.method('assetchan-listtransactions')
+def assetchan_listtransactions(plugin, count=500):
+    """elementsd wallet's last {count} transactions: per tx, its net change
+    per asset ('lbtc' for L-BTC, the fee included there) in signed base
+    units, blockheight (0 = unconfirmed) and time."""
+    txs = {}
+    for e in elements(plugin).call('listtransactions', '*', int(count), 0, False):
+        if e.get('confirmations', 0) < 0:   # conflicted or abandoned
+            continue
+        t = txs.setdefault(e['txid'], {'blockheight': e.get('blockheight', 0) if e.get('confirmations', 0) > 0 else 0,
+                                       'time': e.get('time', 0), 'amounts': {}, 'fee': 0})
+        asset = 'lbtc' if e.get('assetlabel') == 'bitcoin' else e.get('asset', '')
+        t['amounts'][asset] = t['amounts'].get(asset, 0) + base_units(e['amount'])
+        if 'fee' in e:   # repeated on every send entry of the tx: count once
+            t['fee'] = max(t['fee'], abs(base_units(e['fee'])))
+    out = []
+    for txid, t in txs.items():
+        if t['fee']:
+            t['amounts']['lbtc'] = t['amounts'].get('lbtc', 0) - t['fee']
+        out.append({'txid': txid, 'blockheight': t['blockheight'], 'time': t['time'],
+                    'amounts': [{'asset': a, 'amount': v} for a, v in t['amounts'].items() if v]})
+    return {'transactions': out}
+
+
+@plugin.method('assetchan-listunspent')
+def assetchan_listunspent(plugin):
+    """elementsd wallet's unspent outputs, unconfirmed ones included: each
+    with its asset ('lbtc' for L-BTC, else the asset id), amount in base
+    units and confirmations (0 = still in the mempool)."""
+    return {'utxos': [{'txid': u['txid'],
+                       'vout': u['vout'],
+                       'asset': 'lbtc' if u.get('assetlabel') == 'bitcoin' else u['asset'],
+                       'amount': base_units(u['amount']),
+                       'address': u.get('address', ''),
+                       'confirmations': u.get('confirmations', 0)}
+                      for u in elements(plugin).call('listunspent', 0)]}
+
+
 @plugin.method('assetchan-send')
 def assetchan_send(plugin, addr, asset, amount):
     """Send {amount} units of {asset} (an asset id, or an elementsd label
