@@ -2201,6 +2201,7 @@ def test_withdraw_close_output_signed(node_factory, bitcoind):
     assert decoded['txid'] == out['txid']
 
 
+@unittest.skipIf(TEST_NETWORK == 'liquid-regtest', "No anchor channels on Elements")
 def test_withdraw_anchored_to_remote_feerate(node_factory, bitcoind):
     """The to_remote output of a peer's unilateral close of an anchor channel
     is P2WSH: its witness is the signature and the 37-byte script, and the fee
