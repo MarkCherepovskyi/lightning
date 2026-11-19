@@ -365,26 +365,29 @@ def assetchan_funds(plugin, channels=True):
 
 @plugin.method('assetchan-listtransactions')
 def assetchan_listtransactions(plugin, count=500):
-    """elementsd wallet's last {count} transactions: per tx, its net change
-    per asset ('lbtc' for L-BTC, the fee included there) in signed base
-    units, blockheight (0 = unconfirmed) and time."""
+    """elementsd wallet's last {count} transactions. Per tx: its net change
+    per asset ('lbtc' for L-BTC) in signed base units, the fee NOT
+    included; the L-BTC fee this wallet paid (0 when it didn't fund the
+    tx); each wallet entry (asset, signed amount, address - ours for a
+    receive, the destination for a send); blockheight (0 = unconfirmed)
+    and time."""
+    lbtc = lbtc_asset(plugin)
     txs = {}
     for e in elements(plugin).call('listtransactions', '*', int(count), 0, False):
         if e.get('confirmations', 0) < 0:   # conflicted or abandoned
             continue
         t = txs.setdefault(e['txid'], {'blockheight': e.get('blockheight', 0) if e.get('confirmations', 0) > 0 else 0,
-                                       'time': e.get('time', 0), 'amounts': {}, 'fee': 0})
-        asset = 'lbtc' if e.get('assetlabel') == 'bitcoin' else e.get('asset', '')
-        t['amounts'][asset] = t['amounts'].get(asset, 0) + base_units(e['amount'])
+                                       'time': e.get('time', 0), 'amounts': {}, 'outputs': [], 'fee': 0})
+        asset = 'lbtc' if e.get('asset') == lbtc or e.get('assetlabel') == 'bitcoin' else e.get('asset', '')
+        amount = base_units(e['amount'])
+        t['amounts'][asset] = t['amounts'].get(asset, 0) + amount
+        t['outputs'].append({'asset': asset, 'amount': amount, 'address': e.get('address', '')})
         if 'fee' in e:   # repeated on every send entry of the tx: count once
             t['fee'] = max(t['fee'], abs(base_units(e['fee'])))
-    out = []
-    for txid, t in txs.items():
-        if t['fee']:
-            t['amounts']['lbtc'] = t['amounts'].get('lbtc', 0) - t['fee']
-        out.append({'txid': txid, 'blockheight': t['blockheight'], 'time': t['time'],
-                    'amounts': [{'asset': a, 'amount': v} for a, v in t['amounts'].items() if v]})
-    return {'transactions': out}
+    return {'transactions': [{'txid': txid, 'blockheight': t['blockheight'], 'time': t['time'], 'fee': t['fee'],
+                              'amounts': [{'asset': a, 'amount': v} for a, v in t['amounts'].items() if v],
+                              'outputs': t['outputs']}
+                             for txid, t in txs.items()]}
 
 
 @plugin.method('assetchan-listunspent')
@@ -392,9 +395,10 @@ def assetchan_listunspent(plugin):
     """elementsd wallet's unspent outputs, unconfirmed ones included: each
     with its asset ('lbtc' for L-BTC, else the asset id), amount in base
     units and confirmations (0 = still in the mempool)."""
+    lbtc = lbtc_asset(plugin)
     return {'utxos': [{'txid': u['txid'],
                        'vout': u['vout'],
-                       'asset': 'lbtc' if u.get('assetlabel') == 'bitcoin' else u['asset'],
+                       'asset': 'lbtc' if u['asset'] == lbtc or u.get('assetlabel') == 'bitcoin' else u['asset'],
                        'amount': base_units(u['amount']),
                        'address': u.get('address', ''),
                        'confirmations': u.get('confirmations', 0)}
@@ -764,14 +768,11 @@ def assetchan_sweeps(plugin):
 # ------------------------------------------------------------ notifications
 @plugin.subscribe('invoice_payment')
 def on_invoice_payment(plugin, invoice_payment, **kwargs):
-    """A paid invoice no longer needs its asset noted."""
+    """A paid invoice no longer needs policing by htlc_accepted. Its
+    datastore note stays: wallets read it (listdatastore assetchan/invoice)
+    to tell which asset a paid invoice was in."""
     payment_hash = hashlib.sha256(bytes.fromhex(invoice_payment['preimage'])).hexdigest()
-    if plugin.invoice_assets.pop(payment_hash, None) is None:
-        return  # an ordinary invoice
-    try:
-        plugin.rpc.deldatastore(key=INVOICE_KEY + [payment_hash])
-    except RpcError as e:
-        plugin.log('deldatastore: {}'.format(e), level='warn')
+    plugin.invoice_assets.pop(payment_hash, None)
 
 
 @plugin.init()
