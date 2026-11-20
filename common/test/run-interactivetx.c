@@ -36,7 +36,7 @@ u8 *fromwire_tal_arrn(const tal_t *ctx UNNEEDED,
 bool fromwire_tx_add_input(const tal_t *ctx UNNEEDED, const void *p UNNEEDED, struct channel_id *channel_id UNNEEDED, u64 *serial_id UNNEEDED, u8 **prevtx UNNEEDED, u32 *prevtx_vout UNNEEDED, u32 *sequence UNNEEDED, struct tlv_tx_add_input_tlvs **tlvs UNNEEDED)
 { fprintf(stderr, "fromwire_tx_add_input called!\n"); abort(); }
 /* Generated stub for fromwire_tx_add_output */
-bool fromwire_tx_add_output(const tal_t *ctx UNNEEDED, const void *p UNNEEDED, struct channel_id *channel_id UNNEEDED, u64 *serial_id UNNEEDED, u64 *sats UNNEEDED, u8 **script UNNEEDED)
+bool fromwire_tx_add_output(const tal_t *ctx UNNEEDED, const void *p UNNEEDED, struct channel_id *channel_id UNNEEDED, u64 *serial_id UNNEEDED, u64 *sats UNNEEDED, u8 **script UNNEEDED, struct tlv_tx_add_output_tlvs **tlvs UNNEEDED)
 { fprintf(stderr, "fromwire_tx_add_output called!\n"); abort(); }
 /* Generated stub for fromwire_tx_complete */
 bool fromwire_tx_complete(const void *p UNNEEDED, struct channel_id *channel_id UNNEEDED)
@@ -131,7 +131,7 @@ void towire_sha256(u8 **pptr UNNEEDED, const struct sha256 *sha256 UNNEEDED)
 u8 *towire_tx_add_input(const tal_t *ctx UNNEEDED, const struct channel_id *channel_id UNNEEDED, u64 serial_id UNNEEDED, const u8 *prevtx UNNEEDED, u32 prevtx_vout UNNEEDED, u32 sequence UNNEEDED, const struct tlv_tx_add_input_tlvs *tlvs UNNEEDED)
 { fprintf(stderr, "towire_tx_add_input called!\n"); abort(); }
 /* Generated stub for towire_tx_add_output */
-u8 *towire_tx_add_output(const tal_t *ctx UNNEEDED, const struct channel_id *channel_id UNNEEDED, u64 serial_id UNNEEDED, u64 sats UNNEEDED, const u8 *script UNNEEDED)
+u8 *towire_tx_add_output(const tal_t *ctx UNNEEDED, const struct channel_id *channel_id UNNEEDED, u64 serial_id UNNEEDED, u64 sats UNNEEDED, const u8 *script UNNEEDED, const struct tlv_tx_add_output_tlvs *tlvs UNNEEDED)
 { fprintf(stderr, "towire_tx_add_output called!\n"); abort(); }
 /* Generated stub for towire_tx_complete */
 u8 *towire_tx_complete(const tal_t *ctx UNNEEDED, const struct channel_id *channel_id UNNEEDED)

@@ -312,20 +312,14 @@ struct wally_psbt *psbt_using_utxos(const tal_t *ctx,
 			/* FIXME: persist nonces */
 		}
 
-		/* FIXME: as of 17 sept 2020, elementsd is *at most* at par
-		 * with v0.18.0 of bitcoind, which doesn't support setting
-		 * non-witness and witness utxo data for an input; remove this
-		 * check once elementsd can be updated */
-		if (!is_elements(chainparams)) {
-			/* If we have the transaction for this utxo,
-			 * add it to the PSBT as the non-witness-utxo field.
-			 * Dual-funded channels and some hardware wallets
-			 * require this */
-			tx = wallet_transaction_get(ctx, wallet,
-						    &utxos[i]->outpoint.txid);
-			if (tx)
-				psbt_input_set_utxo(psbt, psbt->num_inputs-1, tx->wtx);
-		}
+		/* If we have the transaction for this utxo, add it to the
+		 * PSBT as the non-witness-utxo field.  Dual-funded channels
+		 * and some hardware wallets require this.  (Elements too: a
+		 * PSET carries both, and dual funding sends the whole tx.) */
+		tx = wallet_transaction_get(ctx, wallet,
+					    &utxos[i]->outpoint.txid);
+		if (tx)
+			psbt_input_set_utxo(psbt, psbt->num_inputs-1, tx->wtx);
 	}
 
 	return psbt;

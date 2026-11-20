@@ -10,12 +10,13 @@ struct tx_add_output {
 	u64 serial_id;
 	u64 sats;
 	u8 *script;
+	struct tlv_tx_add_output_tlvs *tlvs;
 };
 
 static void *encode(const tal_t *ctx, const struct tx_add_output *s)
 {
 	return towire_tx_add_output(ctx, &s->channel_id, s->serial_id, s->sats,
-				    s->script);
+				    s->script, s->tlvs);
 }
 
 static struct tx_add_output *decode(const tal_t *ctx, const void *p)
@@ -23,7 +24,7 @@ static struct tx_add_output *decode(const tal_t *ctx, const void *p)
 	struct tx_add_output *s = tal(ctx, struct tx_add_output);
 
 	if (fromwire_tx_add_output(s, p, &s->channel_id, &s->serial_id,
-				   &s->sats, &s->script))
+				   &s->sats, &s->script, &s->tlvs))
 		return s;
 	return tal_free(s);
 }

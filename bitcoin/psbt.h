@@ -176,6 +176,13 @@ struct wally_psbt_output *psbt_add_output(struct wally_psbt *psbt,
  * @script - scriptPubKey of the output
  * @amount - value of the output
  */
+/* Elements: append an output in @asset (33-byte explicit tag; NULL means the
+ * fee asset). */
+struct wally_psbt_output *psbt_append_asset_output(struct wally_psbt *psbt,
+						   const u8 *script,
+						   struct amount_sat amount,
+						   const u8 *asset);
+
 struct wally_psbt_output *psbt_append_output(struct wally_psbt *psbt,
 					     const u8 *script,
 					     struct amount_sat amount);

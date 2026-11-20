@@ -831,6 +831,16 @@ json_openchannel2_call(struct command *cmd,
 			   err, json_tok_full_len(params),
 			   json_tok_full(buf, params));
 
+	/* Asset channels (contrib/assetchan) are in an asset our wallet
+	 * doesn't hold: whatever goes into them is the asset plugin's
+	 * business.  (Their amounts aren't sats either.) */
+	if (json_get_member(buf, json_get_member(buf, params, "openchannel2"),
+			    "asset")) {
+		plugin_log(cmd->plugin, LOG_DBG,
+			   "asset channel: not ours to fund");
+		return command_hook_success(cmd);
+	}
+
 	/* Channel lease info isn't necessarily included, ignore any err */
 	json_scan(tmpctx, buf, params,
 		  "{openchannel2:{"

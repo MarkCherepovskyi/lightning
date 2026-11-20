@@ -1,4 +1,5 @@
 #include "config.h"
+#include <bitcoin/chainparams.h>
 #include <bitcoin/psbt.h>
 #include <bitcoin/script.h>
 #include <ccan/asort/asort.h>
@@ -573,4 +574,43 @@ bool psbt_contribs_changed(struct wally_psbt *orig,
 	    tal_count(cs->rm_outs) > 0;
 	tal_free(cs);
 	return ok;
+}
+
+bool psbt_output_is_elements_fee(const struct wally_psbt_output *out)
+{
+	return is_elements(chainparams) && out->script_len == 0;
+}
+
+void psbt_set_elements_fee_output(struct wally_psbt *psbt)
+{
+	struct amount_sat fee = AMOUNT_SAT(0);
+	struct wally_psbt_output *out;
+
+	if (!is_elements(chainparams))
+		return;
+
+	for (size_t i = 0; i < psbt->num_outputs; i++) {
+		if (psbt_output_is_elements_fee(&psbt->outputs[i]))
+			psbt_rm_output(psbt, i--);
+	}
+
+	for (size_t i = 0; i < psbt->num_inputs; i++) {
+		if (!psbt_input_in_fee_asset(psbt, i))
+			continue;
+		if (!amount_sat_add(&fee, fee, psbt_input_get_value(psbt, i)))
+			return;
+	}
+	for (size_t i = 0; i < psbt->num_outputs; i++) {
+		struct amount_asset amt
+			= wally_psbt_output_get_amount(&psbt->outputs[i]);
+		if (!amount_asset_is_main(&amt))
+			continue;
+		if (!amount_sat_sub(&fee, fee, amount_asset_to_sat(&amt)))
+			return;
+	}
+	if (amount_sat_is_zero(fee))
+		return;
+
+	out = psbt_append_output(psbt, NULL, fee);
+	psbt_output_set_serial_id(psbt, out, PSBT_ELEMENTS_FEE_SERIAL);
 }

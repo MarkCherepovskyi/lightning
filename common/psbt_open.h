@@ -165,6 +165,20 @@ u64 psbt_new_output_serial(struct wally_psbt *psbt, enum tx_role role);
  */
 bool psbt_has_required_fields(struct wally_psbt *psbt);
 
+/* Elements: every transaction pays its fee in an explicit output with an
+ * empty script.  In an interactive construction neither side sends it (an
+ * empty script isn't a standard one): once the transaction is complete, both
+ * (re)compute it the same way, as whatever the fee asset's inputs leave over
+ * its outputs, and put it last under PSBT_ELEMENTS_FEE_SERIAL, which no peer
+ * may use.  That way both arrive at the same txid.  If the fee asset's
+ * inputs don't cover its outputs there's no fee output (balance checks will
+ * fail the transaction).  A no-op off Elements. */
+#define PSBT_ELEMENTS_FEE_SERIAL UINT64_MAX
+void psbt_set_elements_fee_output(struct wally_psbt *psbt);
+
+/* Elements: is this the fee output? */
+bool psbt_output_is_elements_fee(const struct wally_psbt_output *out);
+
 /* psbt_side_finalized - True if designated role has all signature data */
 bool psbt_side_finalized(const struct wally_psbt *psbt,
 			 enum tx_role role);

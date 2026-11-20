@@ -20,6 +20,7 @@
 #include <ccan/tal/str/str.h>
 #include <common/billboard.h>
 #include <common/blockheight_states.h>
+#include <common/channel_asset.h>
 #include <common/initial_channel.h>
 #include <common/interactivetx.h>
 #include <common/lease_rates.h>
@@ -64,6 +65,14 @@
  */
 #define MAX_FUNDING_INPUTS 252
 #define MAX_FUNDING_OUTPUTS 252
+
+/* Elements: see psbt_set_elements_fee_output() */
+#define ELEMENTS_FEE_SERIAL PSBT_ELEMENTS_FEE_SERIAL
+
+static bool is_elements_fee_output(const struct wally_psbt_output *out)
+{
+	return psbt_output_is_elements_fee(out);
+}
 
 /* State for a 'new' funding transaction. There should be one
  * for every new funding transaction attempt */
@@ -202,6 +211,11 @@ struct state {
 	/* Channel type we agreed on (even before channel populated) */
 	struct channel_type *channel_type;
 
+	/* Asset channel (common/channel_asset.h)?  NULL for an ordinary one.
+	 * Then the funding amounts are units of the asset, and the opener
+	 * puts a fee reserve of L-BTC right after the funding output. */
+	struct channel_asset *asset;
+
 	struct feature_set *our_features;
 
 	/* Tally of which sides are locked, or not */
@@ -277,6 +291,14 @@ static u8 *psbt_changeset_get_next(const tal_t *ctx,
 		tal_arr_remove(&set->rm_ins, 0);
 		return msg;
 	}
+	/* Elements: our fee output stays ours (see ELEMENTS_FEE_SERIAL). */
+	while (tal_count(set->added_outs) != 0
+	       && is_elements_fee_output(&set->added_outs[0].output))
+		tal_arr_remove(&set->added_outs, 0);
+	while (tal_count(set->rm_outs) != 0
+	       && is_elements_fee_output(&set->rm_outs[0].output))
+		tal_arr_remove(&set->rm_outs, 0);
+
 	if (tal_count(set->added_outs) != 0) {
 		struct amount_sat sats;
 		struct amount_asset asset_amt;
@@ -286,14 +308,22 @@ static u8 *psbt_changeset_get_next(const tal_t *ctx,
 			abort();
 
 		asset_amt = wally_psbt_output_get_amount(&out->output);
-		sats = amount_asset_to_sat(&asset_amt);
+		sats = amount_sat(asset_amt.value);
 		const u8 *script = wally_psbt_output_get_script(ctx,
 								&out->output);
+		struct tlv_tx_add_output_tlvs *tlvs
+			= tlv_tx_add_output_tlvs_new(tmpctx);
 
+		/* Elements: outputs in another asset than the fee asset say
+		 * which (dual-funded asset channels, their change). */
+		if (is_elements(chainparams)
+		    && !amount_asset_is_main(&asset_amt))
+			tlvs->output_asset
+				= channel_asset_tag_dup(tlvs, asset_amt.asset);
 
 		msg = towire_tx_add_output(ctx, cid, serial_id,
 					   sats.satoshis, /* Raw: wire interface */
-					   script);
+					   script, tlvs);
 
 		tal_arr_remove(&set->added_outs, 0);
 		return msg;
@@ -717,16 +747,61 @@ static bool is_openers(const struct wally_map *unknowns)
 	return serial_id % 2 == TX_INITIATOR;
 }
 
-static bool find_txout(struct wally_psbt *psbt, const u8 *wscript, u32 *funding_txout)
+/* The funding output pays the 2-of-2 in the channel's asset (the fee asset
+ * for an ordinary channel).  An asset channel's fee reserve, in the fee
+ * asset to the same 2-of-2, must directly follow it (common/channel_asset.h):
+ * that's where every commitment and closing transaction looks for it.
+ * Returns an error message, or NULL with *funding_txout set. */
+static char *find_funding_txout(const tal_t *ctx,
+				const struct state *state,
+				const struct wally_psbt *psbt,
+				u32 *funding_txout)
 {
+	const u8 *wscript = bitcoin_redeem_2of2(tmpctx,
+						&state->our_funding_pubkey,
+						&state->their_funding_pubkey);
+	const u8 *script = scriptpubkey_p2wsh(tmpctx, wscript);
+	bool found = false;
+	struct amount_asset amt;
+	size_t reserve;
+
 	for (size_t i = 0; i < psbt->num_outputs; i++) {
-		if (memeq(wscript, tal_bytelen(wscript), psbt->outputs[i].script,
-			  psbt->outputs[i].script_len)) {
-			*funding_txout = i;
-			return true;
-		}
+		if (!memeq(script, tal_bytelen(script),
+			   psbt->outputs[i].script,
+			   psbt->outputs[i].script_len))
+			continue;
+		amt = wally_psbt_output_get_amount(&psbt->outputs[i]);
+		if (state->asset
+		    ? !channel_asset_tag_eq(amt.asset, state->asset->tag)
+		    : !amount_asset_is_main(&amt))
+			continue;
+		if (found)
+			return tal_fmt(ctx, "Two funding outputs");
+		*funding_txout = i;
+		found = true;
 	}
-	return false;
+	if (!found)
+		return tal_fmt(ctx, "funding output not present");
+
+	if (!state->asset)
+		return NULL;
+
+	reserve = *funding_txout + 1;
+	if (reserve >= psbt->num_outputs
+	    || !memeq(script, tal_bytelen(script),
+		      psbt->outputs[reserve].script,
+		      psbt->outputs[reserve].script_len))
+		return tal_fmt(ctx, "asset channel: the fee reserve must"
+			       " directly follow the funding output");
+	amt = wally_psbt_output_get_amount(&psbt->outputs[reserve]);
+	if (!amount_asset_is_main(&amt)
+	    || !amount_sat_eq(amount_sat(amt.value),
+			      state->asset->fee_reserve))
+		return tal_fmt(ctx, "asset channel: output %zu must pay"
+			       " exactly the %s fee reserve", reserve,
+			       fmt_amount_sat(tmpctx,
+					      state->asset->fee_reserve));
+	return NULL;
 }
 
 static char *insufficient_err_msg(const tal_t *ctx,
@@ -735,6 +810,30 @@ static char *insufficient_err_msg(const tal_t *ctx,
 {
 	return tal_fmt(tmpctx, "Insufficiently funded funding tx, %s. %s",
 		       error, fmt_wally_psbt(tmpctx, psbt));
+}
+
+/* Elements: inputs and outputs in other assets than the fee asset don't pay
+ * fees, so what each side puts in of an asset it must take out again (or put
+ * into the channel, for an asset channel's asset). */
+struct asset_tally {
+	u8 tag[ELEMENTS_ASSET_LEN];
+	struct amount_sat in[NUM_TX_ROLES], out[NUM_TX_ROLES];
+};
+
+static struct asset_tally *asset_tally(struct asset_tally **tallies,
+				       const u8 *tag)
+{
+	struct asset_tally t;
+
+	for (size_t i = 0; i < tal_count(*tallies); i++) {
+		if (channel_asset_tag_eq((*tallies)[i].tag, tag))
+			return &(*tallies)[i];
+	}
+	memcpy(t.tag, tag, sizeof(t.tag));
+	for (size_t r = 0; r < NUM_TX_ROLES; r++)
+		t.in[r] = t.out[r] = AMOUNT_SAT(0);
+	tal_arr_expand(tallies, t);
+	return &(*tallies)[tal_count(*tallies) - 1];
 }
 
 static char *check_balances(const tal_t *ctx,
@@ -752,6 +851,8 @@ static char *check_balances(const tal_t *ctx,
 	bool ok;
 	u32 funding_outnum = psbt->num_outputs;
 	size_t accepter_weight = 0;
+	struct asset_tally *tallies = tal_arr(tmpctx, struct asset_tally, 0);
+	char *err;
 
 
 	/* BOLT #2:
@@ -767,11 +868,6 @@ static char *check_balances(const tal_t *ctx,
 	size_t initiator_weight =
 		bitcoin_tx_core_weight(psbt->num_inputs,
 				       psbt->num_outputs);
-
-	u8 *funding_wscript =
-		bitcoin_redeem_2of2(tmpctx,
-				    &state->our_funding_pubkey,
-				    &state->their_funding_pubkey);
 
 	/*
 	 * BOLT #2:
@@ -797,14 +893,23 @@ static char *check_balances(const tal_t *ctx,
 			       tx_state->psbt->num_outputs,
 			       MAX_FUNDING_OUTPUTS);
 
-	/* Find funding output, check balance */
-	if (find_txout(psbt,
-		       scriptpubkey_p2wsh(tmpctx, funding_wscript),
-		       &funding_outnum)) {
+	/* Find funding output (and an asset channel's fee reserve) */
+	err = find_funding_txout(tmpctx, state, psbt, &funding_outnum);
+	if (err) {
+		/* BOLT #2:
+		 *
+		 * Upon receipt of consecutive `tx_complete`s, the receiving
+		 * node:
+		 *   - if is the *accepter*:
+		 *     - MUST fail the negotiation if:
+		 *     - no funding output was received
+		 */
+		return insufficient_err_msg(ctx, err, tx_state->psbt);
+	} else {
 		struct amount_sat output_val, total_funding;
 
-		output_val = psbt_output_get_amount(psbt,
-						    funding_outnum);
+		output_val = amount_sat(wally_psbt_output_get_amount(
+				&psbt->outputs[funding_outnum]).value);
 		if (!amount_sat_add(&total_funding,
 				    tx_state->accepter_funding,
 				    tx_state->opener_funding)) {
@@ -845,17 +950,6 @@ static char *check_balances(const tal_t *ctx,
 		if (is_dust(tx_state, output_val))
 			return insufficient_err_msg(ctx, "funding output is dust",
 						    tx_state->psbt);
-	} else {
-		/* BOLT #2:
-		 *
-		 * Upon receipt of consecutive `tx_complete`s, the receiving
-		 * node:
-		 *   - if is the *accepter*:
-		 *     - MUST fail the negotiation if:
-		 *     - no funding output was received
-		 */
-		return insufficient_err_msg(ctx, "funding output not present",
-					    tx_state->psbt);
 	}
 
 	/* Find the total input and output sums */
@@ -863,8 +957,28 @@ static char *check_balances(const tal_t *ctx,
 	initiator_inputs = AMOUNT_SAT(0);
 	accepter_inputs = AMOUNT_SAT(0);
 	for (size_t i = 0; i < psbt->num_inputs; i++) {
-		struct amount_sat amt =
-			psbt_input_get_amount(psbt, i);
+		struct amount_sat amt = psbt_input_get_value(psbt, i);
+		enum tx_role role = is_openers(&psbt->inputs[i].unknowns)
+			? TX_INITIATOR : TX_ACCEPTER;
+
+		if (role == TX_INITIATOR)
+			initiator_weight +=
+				psbt_input_get_weight(psbt, i, PSBT_GUESS_ZERO);
+		else
+			accepter_weight +=
+				psbt_input_get_weight(psbt, i, PSBT_GUESS_ZERO);
+
+		/* Elements: an input in another asset is tallied apart */
+		if (!psbt_input_in_fee_asset(psbt, i)) {
+			struct amount_asset a = wally_tx_output_get_amount(
+					psbt->inputs[i].witness_utxo);
+			struct asset_tally *t = asset_tally(&tallies, a.asset);
+			if (!amount_sat_add(&t->in[role], t->in[role], amt))
+				return insufficient_err_msg(ctx,
+							    "overflow adding asset input",
+							    tx_state->psbt);
+			continue;
+		}
 
 		/* Add to total balance check */
 		if (!amount_sat_add(&tot_input_amt,
@@ -874,28 +988,32 @@ static char *check_balances(const tal_t *ctx,
 						    tx_state->psbt);
 		}
 
-		if (is_openers(&psbt->inputs[i].unknowns)) {
+		if (role == TX_INITIATOR) {
 			/* If the above additon passed,
 			 * this should also */
 			ok = amount_sat_add(&initiator_inputs,
 					    initiator_inputs, amt);
 			assert(ok);
-
-			initiator_weight +=
-				psbt_input_get_weight(psbt, i, PSBT_GUESS_ZERO);
 		} else {
 			ok = amount_sat_add(&accepter_inputs,
 					    accepter_inputs, amt);
 			assert(ok);
-
-			accepter_weight +=
-				psbt_input_get_weight(psbt, i, PSBT_GUESS_ZERO);
 		}
 	}
 	tot_output_amt = AMOUNT_SAT(0);
 
-	initiator_outs = tx_state->opener_funding;
-	accepter_outs = tx_state->accepter_funding;
+	/* What each side puts into the channel: of the fee asset for an
+	 * ordinary channel, of the channel's asset for an asset channel. */
+	if (state->asset) {
+		struct asset_tally *t = asset_tally(&tallies,
+						    state->asset->tag);
+		t->out[TX_INITIATOR] = tx_state->opener_funding;
+		t->out[TX_ACCEPTER] = tx_state->accepter_funding;
+		initiator_outs = accepter_outs = AMOUNT_SAT(0);
+	} else {
+		initiator_outs = tx_state->opener_funding;
+		accepter_outs = tx_state->accepter_funding;
+	}
 
 	/* The lease_fee has been added to the accepter_funding,
 	 * but the opener_funding is responsible for covering it,
@@ -912,8 +1030,37 @@ static char *check_balances(const tal_t *ctx,
 					    tx_state->psbt);
 
 	for (size_t i = 0; i < psbt->num_outputs; i++) {
-		struct amount_sat amt =
-			psbt_output_get_amount(psbt, i);
+		struct amount_sat amt;
+		struct amount_asset a;
+		enum tx_role role;
+
+		/* Elements: the fee output is what's left over */
+		if (is_elements_fee_output(&psbt->outputs[i]))
+			continue;
+		a = wally_psbt_output_get_amount(&psbt->outputs[i]);
+		amt = amount_sat(a.value);
+		role = is_openers(&psbt->outputs[i].unknowns)
+			? TX_INITIATOR : TX_ACCEPTER;
+
+		if (role == TX_INITIATOR)
+			initiator_weight += psbt_output_get_weight(psbt, i);
+		else
+			accepter_weight += psbt_output_get_weight(psbt, i);
+
+		/* Elements: an output in another asset is tallied apart
+		 * (an asset channel's funding output is the sides'
+		 * funding, already in the tally). */
+		if (is_elements(chainparams) && !amount_asset_is_main(&a)) {
+			struct asset_tally *t;
+			if (i == funding_outnum)
+				continue;
+			t = asset_tally(&tallies, a.asset);
+			if (!amount_sat_add(&t->out[role], t->out[role], amt))
+				return insufficient_err_msg(ctx,
+							    "overflow adding asset output",
+							    tx_state->psbt);
+			continue;
+		}
 
 		/* Add to total balance check */
 		if (!amount_sat_add(&tot_output_amt,
@@ -934,7 +1081,7 @@ static char *check_balances(const tal_t *ctx,
 			return insufficient_err_msg(ctx, "output is dust",
 						    tx_state->psbt);
 
-		if (is_openers(&psbt->outputs[i].unknowns)) {
+		if (role == TX_INITIATOR) {
 			/* Don't add the funding output to
 			 * the amount */
 			if (i != funding_outnum) {
@@ -945,15 +1092,33 @@ static char *check_balances(const tal_t *ctx,
 						    amt);
 				assert(ok);
 			}
-
-			initiator_weight +=
-				psbt_output_get_weight(psbt, i);
 		} else {
 			ok = amount_sat_add(&accepter_outs,
 					    accepter_outs, amt);
 			assert(ok);
-			accepter_weight +=
-				psbt_output_get_weight(psbt, i);
+		}
+	}
+
+	/* Elements: each side's assets (other than the fee asset) must come
+	 * out as they went in: they can't pay fees. */
+	for (size_t i = 0; i < tal_count(tallies); i++) {
+		for (size_t r = 0; r < NUM_TX_ROLES; r++) {
+			if (amount_sat_eq(tallies[i].in[r], tallies[i].out[r]))
+				continue;
+			return insufficient_err_msg(ctx,
+						    tal_fmt(tmpctx, "%s's inputs"
+							    " in asset %s (%s)"
+							    " != outputs (%s)",
+							    r == TX_INITIATOR
+							    ? "initiator"
+							    : "accepter",
+							    fmt_channel_asset(tmpctx,
+									      tallies[i].tag),
+							    fmt_amount_sat(tmpctx,
+									   tallies[i].in[r]),
+							    fmt_amount_sat(tmpctx,
+									   tallies[i].out[r])),
+						    tx_state->psbt);
 		}
 	}
 
@@ -982,7 +1147,8 @@ static char *check_balances(const tal_t *ctx,
 	}
 
 	/* BOLT #2:
-	 * The receiving node: ...
+	 * The receiving node:
+	 * ...
 	 * - MUST fail the negotiation if:
 	 *   ...
 	 *   - the peer's paid feerate does not meet or exceed the
@@ -1013,7 +1179,8 @@ static char *check_balances(const tal_t *ctx,
 	}
 
 	/* BOLT #2:
-	 * The receiving node:  ...
+	 * The receiving node:
+	 * ...
 	 * - MUST fail the negotiation if:
 	 *   ...
 	 *   - the peer's paid feerate does not meet or exceed the
@@ -1169,10 +1336,12 @@ static u8 *msg_for_remote_commit(const tal_t *ctx,
 {
 	struct wally_tx_output *direct_outputs[NUM_SIDES];
 	struct bitcoin_tx *remote_commit;
-	struct bitcoin_signature local_sig;
+	struct bitcoin_signature local_sig, reserve_sig;
 	u32 feerate = 0; // unused since there are no htlcs
 	u64 commit_num = 0;
-        u8 *msg;
+	u8 *msg;
+	struct tlv_commitment_signed_tlvs *cs_tlv;
+	bool ok;
 
 	/* Create commitment tx signatures for remote */
 	remote_commit = initial_channel_tx(NULL, NULL, state->channel,
@@ -1188,7 +1357,20 @@ static u8 *msg_for_remote_commit(const tal_t *ctx,
 	 * witness script.  It also needs the amount of the funding output,
 	 * as segwit signatures commit to that as well, even though it doesn't
 	 * explicitly appear in the transaction itself. */
-	msg = towire_hsmd_sign_remote_commitment_tx(NULL,
+	/* For an asset channel hsmd also signs the fee reserve input; that
+	 * signature goes to the peer in a TLV (common/channel_asset.h). */
+	if (state->asset)
+		msg = towire_hsmd_sign_asset_remote_commitment_tx(NULL,
+						    remote_commit,
+						    &state->channel->funding_pubkey[REMOTE],
+						    &state->first_per_commitment_point[REMOTE],
+						    true,
+						    commit_num,
+						    NULL, /* no HTLCS */
+						    feerate,
+						    state->asset);
+	else
+		msg = towire_hsmd_sign_remote_commitment_tx(NULL,
 						    remote_commit,
 						    &state->channel->funding_pubkey[REMOTE],
 						    &state->first_per_commitment_point[REMOTE],
@@ -1198,7 +1380,12 @@ static u8 *msg_for_remote_commit(const tal_t *ctx,
 						    feerate);
 	wire_sync_write(HSM_FD, take(msg));
 	msg = wire_sync_read(tmpctx, HSM_FD);
-	if (!fromwire_hsmd_sign_tx_reply(msg, &local_sig))
+	if (state->asset)
+		ok = fromwire_hsmd_sign_asset_tx_reply(msg, &local_sig,
+						       &reserve_sig);
+	else
+		ok = fromwire_hsmd_sign_tx_reply(msg, &local_sig);
+	if (!ok)
 		status_failed(STATUS_FAIL_HSM_IO,
 			      "Bad sign_tx_reply %s", tal_hex(tmpctx, msg));
 
@@ -1220,9 +1407,14 @@ static u8 *msg_for_remote_commit(const tal_t *ctx,
 		*pbase = NULL;
 
 	tal_free(remote_commit);
+	cs_tlv = tlv_commitment_signed_tlvs_new(tmpctx);
+	if (state->asset)
+		cs_tlv->fee_reserve_sig = tal_dup(cs_tlv,
+						  secp256k1_ecdsa_signature,
+						  &reserve_sig.s);
 	return towire_commitment_signed(ctx, &state->channel_id,
 					&local_sig.s,
-					NULL, NULL);
+					NULL, cs_tlv);
 }
 
 static enum tx_role their_role(const struct state *state)
@@ -1326,6 +1518,15 @@ static char *do_commit_signed_received(const tal_t *ctx,
 			       fmt_wally_psbt(tmpctx,
 					      tx_state->psbt));
 	}
+
+	/* Asset channel: check their sig for the fee reserve too, and keep
+	 * it with our first commitment tx (common/channel_asset.h). */
+	if (state->asset
+	    && !check_fee_reserve_sig(*local_commit, wscript,
+				      &state->their_funding_pubkey,
+				      cs_tlv->fee_reserve_sig))
+		return tal_fmt(ctx, "Bad or missing fee_reserve_sig on tx %s",
+			       fmt_bitcoin_tx(tmpctx, *local_commit));
 
 	tx_state->has_commitments = true;
 	return NULL;
@@ -1826,7 +2027,6 @@ static bool run_tx_interactive(struct state *state,
 			size_t len;
 			struct bitcoin_tx *tx;
 			struct bitcoin_outpoint outpoint;
-			struct amount_sat amt;
 			struct tlv_tx_add_input_tlvs *tlvs;
 
 			if (!fromwire_tx_add_input(tmpctx, msg, &cid,
@@ -1950,18 +2150,28 @@ static bool run_tx_interactive(struct state *state,
 			wally_psbt_input_set_utxo(in, tx->wtx);
 			tal_wally_end(psbt);
 
+			/* Elements: we need the input's asset and value to
+			 * account for it and to sign (they're in the sighash),
+			 * so only explicit ones will do.  Keep them as the
+			 * witness utxo, where the rest of the code looks. */
 			if (is_elements(chainparams)) {
-				struct amount_asset asset;
+				const struct wally_tx_output *prevout
+					= &tx->wtx->outputs[outpoint.n];
 
-				amt = bitcoin_tx_output_get_amount_sat(tx, outpoint.n);
-
-				/* FIXME: persist asset tags */
-				asset = amount_sat_to_asset(&amt,
-							    chainparams->fee_asset_tag);
-				/* FIXME: persist nonces */
-				psbt_elements_input_set_asset(psbt,
-							      outpoint.n,
-							      &asset);
+				if (!elements_output_is_explicit(prevout)) {
+					open_abort(state,
+						   "Input %s is blinded: only"
+						   " explicit inputs can fund"
+						   " a channel",
+						   fmt_bitcoin_outpoint(tmpctx,
+									&outpoint));
+					return false;
+				}
+				tal_wally_start();
+				if (wally_psbt_input_set_witness_utxo(in, prevout)
+				    != WALLY_OK)
+					abort();
+				tal_wally_end(psbt);
 			}
 			psbt_input_set_serial_id(psbt, in, serial_id);
 
@@ -2015,9 +2225,10 @@ static bool run_tx_interactive(struct state *state,
 			struct wally_psbt_output *out;
 			struct amount_sat amt;
 			const char *error;
+			struct tlv_tx_add_output_tlvs *tlvs;
 			if (!fromwire_tx_add_output(tmpctx, msg, &cid,
 						    &serial_id, &value,
-						    &scriptpubkey))
+						    &scriptpubkey, &tlvs))
 				open_err_fatal(state,
 					       "Parsing tx_add_output %s",
 					       tal_hex(tmpctx, msg));
@@ -2061,6 +2272,14 @@ static bool run_tx_interactive(struct state *state,
 					   " %"PRIu64, serial_id);
 				return false;
 			}
+			/* Elements: that one's for the fee output */
+			if (is_elements(chainparams)
+			    && serial_id == ELEMENTS_FEE_SERIAL) {
+				open_abort(state,
+					   "Reserved serial_id rcvd."
+					   " %"PRIu64, serial_id);
+				return false;
+			}
 			amt = amount_sat(value);
 
 			/* BOLT #2:
@@ -2084,7 +2303,19 @@ static bool run_tx_interactive(struct state *state,
 				return false;
 			}
 
-			out = psbt_append_output(psbt, scriptpubkey, amt);
+			/* Elements: an output in another asset than the fee
+			 * asset says which. */
+			if (tlvs->output_asset
+			    && (!is_elements(chainparams)
+				|| tal_bytelen(tlvs->output_asset)
+				   != ELEMENTS_ASSET_LEN
+				|| tlvs->output_asset[0] != 0x01)) {
+				open_abort(state, "Invalid output_asset %s",
+					   tal_hex(tmpctx, tlvs->output_asset));
+				return false;
+			}
+			out = psbt_append_asset_output(psbt, scriptpubkey, amt,
+						       tlvs->output_asset);
 			psbt_output_set_serial_id(psbt, out, serial_id);
 			break;
 		}
@@ -2194,6 +2425,9 @@ static bool run_tx_interactive(struct state *state,
 		}
 	}
 
+	/* Elements: both sides add the fee output (ELEMENTS_FEE_SERIAL) */
+	psbt_set_elements_fee_output(psbt);
+
 	/* Sort psbt! */
 	psbt_sort_by_serial_id(psbt);
 
@@ -2246,6 +2480,7 @@ static void revert_channel_state(struct state *state)
 					     feature_offered(state->their_features,
 							     OPT_LARGE_CHANNELS),
 					     opener);
+	state->channel->asset = state->asset;
 }
 
 /* Returns NULL on negotation failure; reason given as *err_reason
@@ -2259,25 +2494,17 @@ static u8 *accepter_commits(struct state *state,
 	struct bitcoin_signature remote_sig;
 	struct penalty_base *pbase;
 	struct amount_msat our_msats;
-	const u8 *wscript;
 	u8 *msg, *commit_msg;
 	char *error;
 
 	/* Find the funding transaction txid */
 	psbt_txid(NULL, tx_state->psbt, &tx_state->funding.txid, NULL);
 
-	wscript = bitcoin_redeem_2of2(tmpctx,
-				      &state->our_funding_pubkey,
-				      &state->their_funding_pubkey);
-
 	/* Figure out the txout */
-	if (!find_txout(tx_state->psbt,
-			scriptpubkey_p2wsh(tmpctx, wscript),
-			&tx_state->funding.n)) {
-		*err_reason = tal_fmt(tmpctx, "Expected output %s not"
-				      " found on funding tx %s",
-				      tal_hex(tmpctx,
-					      scriptpubkey_p2wsh(tmpctx, wscript)),
+	error = find_funding_txout(tmpctx, state, tx_state->psbt,
+				   &tx_state->funding.n);
+	if (error) {
+		*err_reason = tal_fmt(tmpctx, "%s on funding tx %s", error,
 				      fmt_wally_psbt(tmpctx,
 						     tx_state->psbt));
 		return NULL;
@@ -2321,6 +2548,7 @@ static u8 *accepter_commits(struct state *state,
 					     feature_offered(state->their_features,
 							     OPT_LARGE_CHANNELS),
 					     REMOTE);
+	state->channel->asset = state->asset;
 
 	/* Let lightningd know we're about to send our commitment sigs */
 	peer_billboard(false, "channel open: commitment ready to send, "
@@ -2569,6 +2797,42 @@ static void accepter_start(struct state *state, const u8 *oc2_msg)
 		}
 	}
 
+	/* Asset channel?  Its balance is in the asset, and the opener puts up
+	 * a fee reserve next to the funding output (common/channel_asset.h).
+	 * As for open_channel (openingd), only if a plugin offers them. */
+	if (open_tlv->channel_asset) {
+		if (!feature_offered(state->our_features->bits[INIT_FEATURE],
+				     OPT_CHANNEL_ASSET)) {
+			negotiation_failed(state,
+					   "Asset channels not enabled"
+					   " (no plugin offers them)");
+			return;
+		}
+		if (!chainparams->is_elements
+		    || tal_bytelen(open_tlv->channel_asset) != ELEMENTS_ASSET_LEN
+		    || open_tlv->channel_asset[0] != 0x01
+		    || !open_tlv->fee_reserve) {
+			negotiation_failed(state, "Bad asset channel request");
+			return;
+		}
+		if (!channel_type_has(state->channel_type,
+				      OPT_ANCHORS_ZERO_FEE_HTLC_TX)) {
+			negotiation_failed(state,
+					   "Asset channels need option_anchors");
+			return;
+		}
+		/* A lease is paid for in the channel: in the asset? No. */
+		if (open_tlv->request_funds) {
+			negotiation_failed(state,
+					   "Asset channels can't be leased");
+			return;
+		}
+		state->asset = channel_asset_new(state,
+						 open_tlv->channel_asset,
+						 *open_tlv->fee_reserve);
+	} else
+		state->asset = NULL;
+
 	/* The commitment feerate is a different matter: too low and the
 	 * commitment we are signing cannot be relayed when we need it.  This
 	 * has to wait for channel_type above, since what counts as too low
@@ -2642,7 +2906,8 @@ static void accepter_start(struct state *state, const u8 *oc2_msg)
 					 state->requested_lease,
 					 tx_state->blockheight,
 					 state->require_confirmed_inputs[REMOTE],
-					 state->channel_type);
+					 state->channel_type,
+					 state->asset);
 
 	wire_sync_write(REQ_FD, take(msg));
 	msg = wire_sync_read(tmpctx, REQ_FD);
@@ -2766,7 +3031,7 @@ static void accepter_start(struct state *state, const u8 *oc2_msg)
 				 &tx_state->remoteconf,
 				 &tx_state->localconf,
 				 channel_type_has(state->channel_type, OPT_ANCHORS_ZERO_FEE_HTLC_TX),
-				 NULL,
+				 state->asset,
 				 &err_reason)) {
 		negotiation_failed(state, "%s", err_reason);
 		return;
@@ -2792,6 +3057,12 @@ static void accepter_start(struct state *state, const u8 *oc2_msg)
 	 *  - MUST set `channel_type` to the `channel_type` from `open_channel`
 	 */
 	a_tlv->channel_type = state->channel_type->features;
+
+	/* An asset channel only works if we build the same transactions,
+	 * so we echo the asset back. */
+	if (state->asset)
+		a_tlv->channel_asset = channel_asset_tag_dup(a_tlv,
+							     state->asset->tag);
 
 	/* BOLT- #2:
 	 * The accepting node:
@@ -2878,16 +3149,38 @@ static void add_funding_output(struct tx_state *tx_state,
 
 	wscript = bitcoin_redeem_2of2(tmpctx, &state->our_funding_pubkey,
 				      &state->their_funding_pubkey);
-	funding_out = psbt_append_output(tx_state->psbt,
-					 scriptpubkey_p2wsh(tmpctx, wscript),
-					 total);
+	/* An asset channel's funding is in its asset. */
+	funding_out = psbt_append_asset_output(tx_state->psbt,
+					       scriptpubkey_p2wsh(tmpctx, wscript),
+					       total,
+					       channel_asset_tag(state->asset));
 
-	/* Add a serial_id for this output */
-	tx_state->funding_serial = psbt_new_input_serial(tx_state->psbt,
-							 TX_INITIATOR);
+	/* Add a serial_id for this output (an asset channel's fee reserve
+	 * gets the next one of ours: see below). */
+	do {
+		tx_state->funding_serial
+			= psbt_new_input_serial(tx_state->psbt, TX_INITIATOR);
+	} while (tx_state->funding_serial > UINT64_MAX - 4
+		 || psbt_find_serial_output(tx_state->psbt,
+					    tx_state->funding_serial + 2) != -1);
 	psbt_output_set_serial_id(tx_state->psbt,
 				  funding_out,
 				  tx_state->funding_serial);
+
+	/* Asset channel: the fee reserve, in the fee asset, to the same
+	 * 2-of-2, must directly follow the funding output
+	 * (common/channel_asset.h).  Outputs end up sorted by serial_id, so
+	 * we give it the next even one: only a peer's output with the odd
+	 * one between could land there, and find_funding_txout() fails the
+	 * transaction if one does. */
+	if (state->asset) {
+		struct wally_psbt_output *reserve_out
+			= psbt_append_output(tx_state->psbt,
+					     scriptpubkey_p2wsh(tmpctx, wscript),
+					     state->asset->fee_reserve);
+		psbt_output_set_serial_id(tx_state->psbt, reserve_out,
+					  tx_state->funding_serial + 2);
+	}
 }
 
 /* Returns NULL on negotation failure; reason given as *err_reason.
@@ -2901,23 +3194,17 @@ static u8 *opener_commits(struct state *state,
 	struct penalty_base *pbase;
 	struct bitcoin_tx *local_commit;
 	struct bitcoin_signature remote_sig;
-	const u8 *wscript;
 	u8 *msg, *commit_msg;
 	char *error;
 	struct amount_msat their_msats;
 
-	wscript = bitcoin_redeem_2of2(tmpctx, &state->our_funding_pubkey,
-				      &state->their_funding_pubkey);
 	psbt_txid(NULL, tx_state->psbt, &tx_state->funding.txid, NULL);
 
 	/* Figure out the txout */
-	if (!find_txout(tx_state->psbt, scriptpubkey_p2wsh(tmpctx, wscript),
-			&tx_state->funding.n)) {
-		*err_reason = tal_fmt(tmpctx, "Expected output %s not"
-				      " found on funding tx %s",
-				      tal_hex(tmpctx,
-					      scriptpubkey_p2wsh(tmpctx,
-								 wscript)),
+	error = find_funding_txout(tmpctx, state, tx_state->psbt,
+				   &tx_state->funding.n);
+	if (error) {
+		*err_reason = tal_fmt(tmpctx, "%s on funding tx %s", error,
 				      fmt_wally_psbt(tmpctx,
 						     tx_state->psbt));
 		return NULL;
@@ -2976,6 +3263,7 @@ static u8 *opener_commits(struct state *state,
 							     OPT_LARGE_CHANNELS),
 					     /* Opener is local */
 					     LOCAL);
+	state->channel->asset = state->asset;
 
 	commit_msg = msg_for_remote_commit(state, state, &pbase, &error);
 	if (!commit_msg) {
@@ -3081,6 +3369,7 @@ static void opener_start(struct state *state, u8 *msg)
 					    &tx_state->blockheight,
 					    &dry_run,
 					    &state->channel_type,
+					    &state->asset,
 					    &expected_rates))
 		master_badmsg(WIRE_DUALOPEND_OPENER_INIT, msg);
 
@@ -3098,6 +3387,16 @@ static void opener_start(struct state *state, u8 *msg)
 
 	if (requested_lease)
 		state->requested_lease = tal_steal(state, requested_lease);
+
+	/* Asset channel (common/channel_asset.h)?  lightningd checked the
+	 * peer can do them; we tell them which asset, and the reserve. */
+	if (state->asset) {
+		open_tlv->channel_asset
+			= channel_asset_tag_dup(open_tlv, state->asset->tag);
+		open_tlv->fee_reserve
+			= tal_dup(open_tlv, struct amount_sat,
+				  &state->asset->fee_reserve);
+	}
 
 	/* BOLT #2:
 	 * When sending `open_channel2`, the peer's revocation basepoint is unknown.
@@ -3266,6 +3565,23 @@ static void opener_start(struct state *state, u8 *msg)
 		return;
 	}
 
+	/* An asset channel only works if they build the same transactions,
+	 * so they must echo the asset back. */
+	if ((state->asset == NULL) != (a_tlv->channel_asset == NULL)
+	    || (state->asset
+		&& (tal_bytelen(a_tlv->channel_asset) != ELEMENTS_ASSET_LEN
+		    || !channel_asset_tag_eq(state->asset->tag,
+					     a_tlv->channel_asset)))) {
+		negotiation_failed(state,
+				   "Peer did not accept asset channel"
+				   " (asset %s)",
+				   state->asset
+				   ? fmt_channel_asset(tmpctx,
+						      state->asset->tag)
+				   : "none");
+		return;
+	}
+
 	/* If we've requested funds and they've failed to provide
 	 * to lease us (or give them to us for free?!) then we fail.
 	 * This isn't spec'd but it makes the UX predictable */
@@ -3421,7 +3737,7 @@ static void opener_start(struct state *state, u8 *msg)
 				 &tx_state->remoteconf,
 				 &tx_state->localconf,
 				 channel_type_has(state->channel_type, OPT_ANCHORS_ZERO_FEE_HTLC_TX),
-				 NULL,
+				 state->asset,
 				 &err_reason)) {
 		negotiation_failed(state, "%s", err_reason);
 		return;
@@ -3609,6 +3925,13 @@ static void rbf_local_start(struct state *state, u8 *msg)
 
 	peer_billboard(false, "channel rbf: init received from master");
 
+	/* An asset channel's funding can't be replaced (yet): lightningd
+	 * refuses openchannel_bump for one, this is in case. */
+	if (state->asset) {
+		open_abort(state, "Asset channels can't be RBF'd");
+		return;
+	}
+
 	if (!check_funding_feerate(tx_state->feerate_per_kw_funding,
 				   state->tx_state->feerate_per_kw_funding)) {
 		open_abort(state, "Proposed funding feerate (%u) invalid",
@@ -3790,6 +4113,12 @@ static void rbf_remote_start(struct state *state, const u8 *rbf_msg)
 		open_abort(state, "%s",
 			   "Only the channel initiator is allowed"
 			   " to initiate RBF");
+		goto free_rbf_ctx;
+	}
+
+	/* An asset channel's funding can't be replaced (yet). */
+	if (state->asset) {
+		open_abort(state, "%s", "Asset channels can't be RBF'd");
 		goto free_rbf_ctx;
 	}
 
@@ -4461,6 +4790,8 @@ int main(int argc, char *argv[])
 	/* Init state to not aborted, and not reconnected until we know better */
 	state->aborted_err = NULL;
 	state->reconnected = false;
+	/* An ordinary channel until open_channel2 or lightningd say not */
+	state->asset = NULL;
 
 	/*~ The very first thing we read from lightningd is our init msg */
 	msg = wire_sync_read(tmpctx, REQ_FD);
@@ -4548,7 +4879,8 @@ int main(int argc, char *argv[])
 					     &state->require_confirmed_inputs[LOCAL],
 					     &state->require_confirmed_inputs[REMOTE],
 					     &state->local_alias,
-					     &state->tx_state->local_funding_sigs_sent)) {
+					     &state->tx_state->local_funding_sigs_sent,
+					     &state->asset)) {
 
 		bool ok;
 
@@ -4579,6 +4911,7 @@ int main(int argc, char *argv[])
 						     feature_offered(state->their_features,
 								     OPT_LARGE_CHANNELS),
 						     opener);
+		state->channel->asset = state->asset;
 
 		if (opener == LOCAL) {
 			state->our_role = TX_INITIATOR;

@@ -278,6 +278,20 @@ struct wally_psbt_output *psbt_append_output(struct wally_psbt *psbt,
 	return psbt_insert_output(psbt, script, amount, psbt->num_outputs);
 }
 
+struct wally_psbt_output *psbt_append_asset_output(struct wally_psbt *psbt,
+						   const u8 *script,
+						   struct amount_sat amount,
+						   const u8 *asset)
+{
+	struct wally_psbt_output *out;
+	struct wally_tx_output *tx_out = wally_tx_output_asset(NULL, script,
+							       amount, asset);
+
+	out = psbt_add_output(psbt, tx_out, psbt->num_outputs);
+	wally_tx_output_free(tx_out);
+	return out;
+}
+
 struct wally_psbt_output *psbt_insert_output(struct wally_psbt *psbt,
 					     const u8 *script,
 					     struct amount_sat amount,

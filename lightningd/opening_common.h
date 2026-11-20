@@ -3,6 +3,7 @@
 #include "config.h"
 #include <common/channel_config.h>
 #include <common/channel_id.h>
+#include <common/json_parse_simple.h>
 #include <common/derive_basepoints.h>
 #include <common/status_levels.h>
 
@@ -139,5 +140,13 @@ void channel_config(struct lightningd *ld,
 		    struct channel_config *ours,
 		    u32 *max_to_self_delay,
 		    struct amount_msat *min_effective_htlc_capacity);
+
+/* JSON param: an asset id as printed by elements-cli, as the 33-byte
+ * explicit asset tag of an asset channel (common/channel_asset.h). */
+struct command_result *param_channel_asset(struct command *cmd,
+					   const char *name,
+					   const char *buffer,
+					   const jsmntok_t *tok,
+					   u8 **asset);
 
 #endif /* LIGHTNING_LIGHTNINGD_OPENING_COMMON_H */

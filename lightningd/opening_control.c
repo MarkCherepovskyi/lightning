@@ -1352,21 +1352,6 @@ static void fundchannel_start_after_sync(struct chain_topology *topo,
 /**
  * json_fundchannel_start - Entrypoint for funding a channel
  */
-/* An asset id as printed by elements-cli */
-static struct command_result *param_asset(struct command *cmd,
-					  const char *name,
-					  const char *buffer,
-					  const jsmntok_t *tok,
-					  u8 **asset)
-{
-	*asset = channel_asset_from_hex(cmd, buffer + tok->start,
-					tok->end - tok->start);
-	if (*asset)
-		return NULL;
-	return command_fail_badparam(cmd, name, buffer, tok,
-				     "should be a 32-byte asset id");
-}
-
 static struct command_result *json_fundchannel_start(struct command *cmd,
 						     const char *buffer,
 						     const jsmntok_t *obj UNNEEDED,
@@ -1401,7 +1386,7 @@ static struct command_result *json_fundchannel_start(struct command *cmd,
 			 p_opt("mindepth", param_u32, &mindepth),
 			 p_opt("reserve", param_sat, &reserve),
 			 p_opt("channel_type", param_channel_type, &ctype),
-			 p_opt("asset", param_asset, &asset),
+			 p_opt("asset", param_channel_asset, &asset),
 			 p_opt("fee_reserve", param_sat, &fee_reserve),
 			 NULL))
 		return command_param_failed();

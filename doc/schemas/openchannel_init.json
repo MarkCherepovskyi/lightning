@@ -80,6 +80,20 @@
             "Bit number."
           ]
         }
+      },
+      "asset": {
+        "type": "hex",
+        "added": "v26.09",
+        "description": [
+          "Liquid only: open an asset channel whose balance is in this issued asset (the asset id as printed by elements-cli), which a plugin must offer asset channels in (contrib/assetchan). `amount` is then in the asset's units, which *initialpsbt*'s inputs must hold (fees, in L-BTC, come from other inputs); we add the funding output in the asset and `fee_reserve` of L-BTC to the channel right after it. The peer may add to the funding in the same asset. Asset channels use anchors, and can't be leased or bumped."
+        ]
+      },
+      "fee_reserve": {
+        "type": "sat",
+        "added": "v26.09",
+        "description": [
+          "Liquid only, required with `asset`: L-BTC we put next to the funding output. It pays the anchors and the fee of every on-chain transaction of the channel (the whole reserve, minus anchors, is the fee), so it only has to cover the minimum relay fee."
+        ]
       }
     }
   },

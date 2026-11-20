@@ -294,6 +294,10 @@ static bool update_node_psbt(const tal_t *ctx,
 		 * output, skip it */
 		if (serial_id % 2 == TX_INITIATOR)
 			continue;
+		/* Elements: the fee output is nobody's, and has the same
+		 * serial_id everywhere */
+		if (serial_id == PSBT_ELEMENTS_FEE_SERIAL)
+			continue;
 
 		/* Down one, as that's where it'll be on the parent */
 		output_index = psbt_find_serial_output(clone,
@@ -493,7 +497,16 @@ collect_sigs(struct multifundchannel_command *mfc)
 		assert(dest->state == MULTIFUNDCHANNEL_SIGNED);
 		psbt_txid(NULL, dest->psbt, &dest_txid, NULL);
 
-		assert(bitcoin_txid_eq(mfc->txid, &dest_txid));
+		if (!bitcoin_txid_eq(mfc->txid, &dest_txid))
+			plugin_err(mfc->cmd->plugin,
+				   "mfc %"PRIu64": funding txid %s but"
+				   " dest %u has %s. Roll-up %s, dest %s",
+				   mfc->id,
+				   fmt_bitcoin_txid(tmpctx, mfc->txid),
+				   dest->index,
+				   fmt_bitcoin_txid(tmpctx, &dest_txid),
+				   fmt_wally_psbt(tmpctx, mfc->psbt),
+				   fmt_wally_psbt(tmpctx, dest->psbt));
 	}
 
 	return perform_signpsbt(mfc);
@@ -531,6 +544,7 @@ static struct command_result *json_peer_sigs(struct command *cmd,
 	const struct wally_psbt *psbt;
 	struct multifundchannel_destination *dest;
 	const char *err;
+	bool ok;
 
 	err = json_scan(tmpctx, buf, params,
 			"{openchannel_peer_sigs:"
@@ -563,15 +577,17 @@ static struct command_result *json_peer_sigs(struct command *cmd,
 	/* Combine with the parent. Unknown map dupes are ignored,
 	 * so the updated serial_id should persist on the parent */
 	tal_wally_start();
-	if (wally_psbt_combine(dest->mfc->psbt, psbt) != WALLY_OK)
+	ok = wally_psbt_combine(dest->mfc->psbt, psbt) == WALLY_OK;
+	tal_wally_end(dest->mfc->psbt);
+
+	/* (Formatting PSBTs uses wally too: not inside the above.) */
+	if (!ok)
 		plugin_err(cmd->plugin,
 			   "mfc %"PRIu64": Unable to combine signed "
 			   "PSBT with roll-up. "
 			   "Signed %s, prev %s", dest->mfc->id,
 			   fmt_wally_psbt(tmpctx, psbt),
 			   fmt_wally_psbt(tmpctx, dest->mfc->psbt));
-
-	tal_wally_end(dest->mfc->psbt);
 
 	/* Bit of a race is possible here. If we're still waiting for
 	 * their commitment sigs to come back, we'll be in
@@ -601,9 +617,14 @@ static struct command_result *json_peer_sigs(struct command *cmd,
 static struct command_result *
 funding_transaction_established(struct multifundchannel_command *mfc)
 {
-	/* Elements requires a fee output.  */
-	/* FIXME: v2 on liquid */
-	psbt_elements_normalize_fees(mfc->psbt);
+	/* Elements requires a fee output: the one dualopend (and the peer)
+	 * put last, or our txid won't be theirs.  The roll-up still has the
+	 * one our wallet's PSBT came with. */
+	psbt_set_elements_fee_output(mfc->psbt);
+	for (size_t i = 0; i < tal_count(mfc->destinations); i++) {
+		if (is_v2(&mfc->destinations[i]))
+			psbt_set_elements_fee_output(mfc->destinations[i].psbt);
+	}
 
 	/* Generate the TXID.  */
 	mfc->txid = tal(mfc, struct bitcoin_txid);

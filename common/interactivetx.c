@@ -303,7 +303,7 @@ static char *send_next(const tal_t *ctx,
 					   cid,
 					   serial_id,
 					   sats.satoshis, /* Raw: wire interface */
-					   script);
+					   script, NULL);
 
 		tal_arr_remove(&set->added_outs, 0);
 	}
@@ -400,7 +400,13 @@ char *interactive_tx_add_output_check_max_money(const tal_t *ctx,
 	struct amount_sat output_amt;
 	struct amount_sat out_total = AMOUNT_SAT(0), new_total;
 	for (size_t i = 0; i < psbt->num_outputs; i++) {
-		output_amt = psbt_output_get_amount(psbt, i);
+		struct amount_asset a
+			= wally_psbt_output_get_amount(&psbt->outputs[i]);
+		/* Elements: MAX_MONEY is the fee asset's; other assets
+		 * (dual-funded asset channels) have supplies of their own. */
+		if (!amount_asset_is_main(&a))
+			continue;
+		output_amt = amount_sat(a.value);
 		if (!amount_sat_add(&out_total, out_total, output_amt))
 			return tal_fmt(ctx,
 				       "Output amount total overflow "
@@ -712,12 +718,20 @@ char *process_interactivetx_updates(const tal_t *ctx,
 			u8 *scriptpubkey;
 			struct wally_psbt_output *out;
 			struct amount_sat amt;
+			struct tlv_tx_add_output_tlvs *tlvs;
 			if (!fromwire_tx_add_output(ctx, msg, &cid,
 						    &serial_id, &value,
-						    &scriptpubkey))
+						    &scriptpubkey, &tlvs))
 				return tal_fmt(ctx,
 					       "Parsing tx_add_output %s",
 					       tal_hex(ctx, msg));
+
+			/* Outputs in other assets than the fee asset are
+			 * for dual-funded asset channels (dualopend). */
+			if (tlvs->output_asset)
+				return tal_fmt(ctx,
+					       "tx_add_output in an asset is"
+					       " not supported here");
 
 			/*
 			 * BOLT #2:

@@ -8,6 +8,9 @@ plugin does the rest, with an elementsd wallet holding the assets:
   their feature bit, and the plugin decides which assets (`assetchan-asset`);
 - `assetchan-open` funds an asset channel from that wallet: the asset to the
   channel's 2-of-2 at output n, an L-BTC fee reserve to it at output n+1;
+  with `dual_fund`, through open_channel2, where the peer may put in some of
+  the asset too: its plugin does that (`openchannel2` hook) from its
+  elementsd wallet, by policy (`assetchan-dual-fund-match`);
 - the `openchannel` hook polices incoming offers (allowed assets, fee reserve)
   and, like `assetchan-open` and `assetchan-close`, makes our side of a
   channel close to an address of that wallet, so swept assets are spendable;
@@ -25,6 +28,7 @@ plugin does the rest, with an elementsd wallet holding the assets:
 Amounts are in the asset's base units; on the wire a unit is 1000 msat.
 """
 from elements import ElementsError, ElementsRpc, Tx, TxIn, TxOut, base_units, coins, config_value, rpc_url
+from pset import PsetError, add_prev_txs, copy_finals
 from pyln.client import Plugin, RpcError, RpcException
 
 import hashlib
@@ -46,6 +50,7 @@ plugin.invoice_assets = {}   # payment_hash -> asset of that invoice of ours
 plugin.gossip_assets = {}    # gossiped scid -> asset of its funding output (None: can't tell)
 plugin.layers = {}           # askrene layer we created -> scids disabled in it
 plugin.sweeps = {}           # 'txid:vout' an asset sweep spends -> its state
+plugin.v2_inputs = {}        # channel_id -> elementsd inputs we put into its dual-funded open
 
 LBTC = 'lbtc'                           # the "asset" of an ordinary channel
 INVOICE_KEY = ['assetchan', 'invoice']  # datastore: + [payment_hash] -> asset
@@ -273,12 +278,111 @@ def cancel_funding(plugin, peer_id, inputs):
             plugin.log(str(e), level='warn')
 
 
+# ------------------------------------------------- dual-funded (open_channel2)
+def v2_fee(feerate_perkw, n_inputs, n_outputs, common):
+    """Our share of a dual-funded funding transaction's fee (sat): our
+    inputs' and outputs' weight (and, for the opener, the common fields and
+    the channel's two outputs) at the funding feerate, doubled: core checks
+    each side pays at least that, and Elements outputs weigh more than the
+    estimate.  What's over goes to the fee output core adds."""
+    weight = n_inputs * (4 * 41 + 110) + n_outputs * 4 * 80
+    if common:
+        weight += 4 * 12 + 2 * 4 * 80
+    return max(500, -(-2 * weight * feerate_perkw // 1000))
+
+
+def unlock(plugin, inputs):
+    if inputs:
+        try:
+            elements(plugin).call('lockunspent', True, inputs)
+        except ElementsError as e:
+            plugin.log(str(e), level='warn')
+
+
+def v2_contribution(plugin, asset, units, lbtc_units):
+    """Our inputs (and change) for a dual-funded funding transaction, from
+    elementsd's wallet, explicit: `units` of `asset` (none if 0) and
+    `lbtc_units` of L-BTC (our fee share, and an opener's fee reserve).  No
+    fee output: core puts one (the same on both sides).  Returns the PSET
+    and the inputs, locked in elementsd."""
+    ed = elements(plugin)
+    lbtc = lbtc_asset(plugin)
+    outputs, inputs = [], []
+    try:
+        if units:
+            x_in = explicit_utxo(plugin, asset, units)
+            inputs.append({'txid': x_in['txid'], 'vout': x_in['vout']})
+            ed.call('lockunspent', False, inputs[-1:])
+            if x_in['units'] > units:
+                outputs.append({new_address(plugin): coins(x_in['units'] - units),
+                                'asset': asset})
+        l_in = explicit_utxo(plugin, lbtc, lbtc_units)
+        inputs.append({'txid': l_in['txid'], 'vout': l_in['vout']})
+        ed.call('lockunspent', False, inputs[-1:])
+        # Change below 1000 sat isn't worth an output: it goes to the fee.
+        if l_in['units'] - lbtc_units >= 1000:
+            outputs.append({new_address(plugin): coins(l_in['units'] - lbtc_units)})
+        psbt = ed.call('createpsbt', inputs, outputs)
+        psbt = ed.call('walletprocesspsbt', psbt, False)['psbt']
+        psbt = add_prev_txs(psbt, lambda txid: ed.call('gettransaction', txid)['hex'])
+    except Exception:
+        unlock(plugin, inputs)
+        raise
+    return psbt, inputs
+
+
+def sign_v2(plugin, psbt, inputs):
+    """core's funding PSET with our (elementsd's) inputs signed."""
+    ed = elements(plugin)
+    signed = ed.call('walletprocesspsbt', psbt, True)['psbt']
+    return copy_finals(psbt, signed, {(i['txid'], i['vout']) for i in inputs})
+
+
+def open_v2(plugin, id, amount, asset, fee_reserve, announce, close_to):
+    """assetchan-open with dual_fund: open_channel2, the peer may add to it."""
+    feerate = plugin.rpc.feerates('perkw')['perkw']['opening']
+    psbt, inputs = v2_contribution(plugin, asset, amount,
+                                   fee_reserve + v2_fee(feerate, 2, 2, True))
+    cid = None
+    try:
+        params = {'id': id, 'amount': amount, 'initialpsbt': psbt,
+                  'announce': bool(announce), 'funding_feerate': '{}perkw'.format(feerate),
+                  'asset': asset, 'fee_reserve': fee_reserve}
+        if close_to:
+            params['close_to'] = close_to
+        res = plugin.rpc.call('openchannel_init', params)
+        cid = res['channel_id']
+        while not res['commitments_secured']:
+            res = plugin.rpc.call('openchannel_update', {'channel_id': cid, 'psbt': res['psbt']})
+        outnum = res['funding_outnum']
+        signed = sign_v2(plugin, res['psbt'], inputs)
+    except Exception:
+        if cid:
+            try:
+                plugin.rpc.call('openchannel_abort', {'channel_id': cid})
+            except RpcError as e:
+                plugin.log('openchannel_abort: {}'.format(e), level='warn')
+        unlock(plugin, inputs)
+        raise
+    # Once we hand over our signatures, the open is out of our hands: if
+    # this fails (say the peer disconnects), dualopend still completes it on
+    # reconnecting, so no abort (and our inputs stay locked until spent).
+    done = plugin.rpc.call('openchannel_signed', {'channel_id': cid, 'signed_psbt': signed})
+    plugin.log('opened dual-funded channel {} to {}: {} units of {} + {} sat fee reserve,'
+               ' funding {}:{}'.format(cid, id, amount, asset, fee_reserve, done['txid'], outnum))
+    return {'txid': done['txid'], 'channel_id': cid, 'outnum': outnum,
+            'asset': asset, 'fee_reserve': fee_reserve}
+
+
 @plugin.method('assetchan-open')
-def assetchan_open(plugin, id, amount, asset, fee_reserve=None, announce=False, close_to=None):
+def assetchan_open(plugin, id, amount, asset, fee_reserve=None, announce=False, close_to=None,
+                   dual_fund=False):
     """Open a channel to (connected) peer {id} holding {amount} units of
     {asset}, funded by elementsd's wallet, with {fee_reserve} sat of L-BTC
     next to it for on-chain fees (default assetchan-default-fee-reserve).
-    Our side closes to {close_to} (default: a fresh address of that wallet)."""
+    Our side closes to {close_to} (default: a fresh address of that wallet).
+    With {dual_fund}, open it with open_channel2 (both nodes need
+    experimental-dual-fund), where the peer may add some of the asset."""
     check_asset(asset)
     amount = int(amount)
     if fee_reserve is None:
@@ -286,6 +390,8 @@ def assetchan_open(plugin, id, amount, asset, fee_reserve=None, announce=False, 
     fee_reserve = int(fee_reserve)
     if close_to is None and plugin.get_option('assetchan-close-to') == 'elements':
         close_to = new_address(plugin)
+    if dual_fund:
+        return open_v2(plugin, id, amount, asset, fee_reserve, announce, close_to)
     ed = elements(plugin)
     lbtc = lbtc_asset(plugin)
 
@@ -524,28 +630,93 @@ def assetchan_pay(plugin, bolt11, asset, maxfee=None):
 
 
 # -------------------------------------------------------------------- hooks
-@plugin.hook('openchannel')
-def on_openchannel(plugin, openchannel, **kwargs):
-    """Take asset-channel offers in an allowed asset with a sane fee reserve,
-    closing to elementsd's wallet; leave ordinary offers alone."""
-    asset = openchannel.get('asset')
-    if asset is None:
-        return {'result': 'continue'}
+def offer_error(plugin, offer):
+    """Why we refuse this asset-channel offer (an openchannel or openchannel2
+    hook payload), or None."""
+    asset = offer['asset']
     if asset not in allowed_assets(plugin):
-        return {'result': 'reject',
-                'error_message': 'asset {} is not one we take channels in'.format(asset)}
-    reserve = int(openchannel.get('fee_reserve_msat', 0)) // 1000
+        return 'asset {} is not one we take channels in'.format(asset)
+    reserve = int(offer.get('fee_reserve_msat', 0)) // 1000
     lo = plugin.get_option('assetchan-min-fee-reserve')
     hi = plugin.get_option('assetchan-max-fee-reserve')
     if not lo <= reserve <= hi:
-        return {'result': 'reject',
-                'error_message': 'fee reserve {} sat not in {}..{}'.format(reserve, lo, hi)}
+        return 'fee reserve {} sat not in {}..{}'.format(reserve, lo, hi)
+    return None
+
+
+def accept_offer(plugin, offer):
+    """The hook result taking an asset-channel offer: closing to elementsd."""
     res = {'result': 'continue'}
     if plugin.get_option('assetchan-close-to') == 'elements':
         res['close_to'] = new_address(plugin)
     plugin.log('accepting a channel from {} in asset {} ({} sat fee reserve)'
-               .format(openchannel['id'], asset, reserve))
+               .format(offer['id'], offer['asset'], int(offer['fee_reserve_msat']) // 1000))
     return res
+
+
+@plugin.hook('openchannel')
+def on_openchannel(plugin, openchannel, **kwargs):
+    """Take asset-channel offers in an allowed asset with a sane fee reserve,
+    closing to elementsd's wallet; leave ordinary offers alone."""
+    if openchannel.get('asset') is None:
+        return {'result': 'continue'}
+    err = offer_error(plugin, openchannel)
+    if err:
+        return {'result': 'reject', 'error_message': err}
+    return accept_offer(plugin, openchannel)
+
+
+def dual_fund_units(plugin, their_units):
+    """How much of the asset we put into a channel they open with their_units:
+    assetchan-dual-fund-match percent of it, at most assetchan-dual-fund-max."""
+    units = their_units * plugin.get_option('assetchan-dual-fund-match') // 100
+    cap = plugin.get_option('assetchan-dual-fund-max')
+    return min(units, cap) if cap else units
+
+
+@plugin.hook('openchannel2')
+def on_openchannel2(plugin, openchannel2, **kwargs):
+    """As openchannel, for open_channel2; and put some of the asset in from
+    elementsd's wallet too, by policy (assetchan-dual-fund-match).  Ordinary
+    offers are funder's business."""
+    if openchannel2.get('asset') is None:
+        return {'result': 'continue'}
+    err = offer_error(plugin, openchannel2)
+    if err:
+        return {'result': 'reject', 'error_message': err}
+    res = accept_offer(plugin, openchannel2)
+    asset = openchannel2['asset']
+    units = dual_fund_units(plugin, int(openchannel2['their_funding_msat']) // 1000)
+    if not units:
+        return res
+    fee = v2_fee(int(openchannel2['funding_feerate_per_kw']), 2, 2, False)
+    try:
+        psbt, inputs = v2_contribution(plugin, asset, units, fee)
+    except (ElementsError, RpcException, PsetError) as e:
+        plugin.log("can't put {} of {} into {}'s channel: {}"
+                   .format(units, asset, openchannel2['id'], e), level='warn')
+        return res
+    plugin.v2_inputs[openchannel2['channel_id']] = inputs
+    plugin.log('putting {} units of {} into the channel from {}'
+               .format(units, asset, openchannel2['id']))
+    res.update({'psbt': psbt, 'our_funding_msat': units * 1000})
+    return res
+
+
+@plugin.hook('openchannel2_sign')
+def on_openchannel2_sign(plugin, openchannel2_sign, **kwargs):
+    """Sign the inputs we put into a dual-funded asset channel."""
+    psbt = openchannel2_sign['psbt']
+    inputs = plugin.v2_inputs.pop(openchannel2_sign['channel_id'], None)
+    if not inputs:
+        return {'result': 'continue', 'psbt': psbt}
+    return {'result': 'continue', 'psbt': sign_v2(plugin, psbt, inputs)}
+
+
+@plugin.subscribe('channel_open_failed')
+def on_channel_open_failed(plugin, channel_open_failed, **kwargs):
+    """A dual-funded open we put inputs into failed: give them back."""
+    unlock(plugin, plugin.v2_inputs.pop(channel_open_failed.get('channel_id'), None))
 
 
 def forward_channel(channels, cid, asset, amount_msat):
@@ -812,6 +983,12 @@ plugin.add_option('assetchan-max-sweep-fee', 20000,
 plugin.add_option('assetchan-close-to', 'elements',
                   "Where our asset goes when a channel closes: a fresh address of"
                   " elementsd's wallet (elements), or whatever core picks (none)")
+plugin.add_option('assetchan-dual-fund-match', 0,
+                  'Percent of what the opener puts into a dual-funded asset channel that we'
+                  ' put in too, from elementsd (0: nothing)', opt_type='int')
+plugin.add_option('assetchan-dual-fund-max', 0,
+                  'Most units we put into one dual-funded asset channel (0: no limit)',
+                  opt_type='int')
 plugin.add_option('assetchan-elements-rpc', None,
                   "elementsd's JSON-RPC as http://user:password@host:port"
                   ' (default: the bitcoin-rpcuser/-rpcpassword/-rpcconnect/-rpcport settings)')

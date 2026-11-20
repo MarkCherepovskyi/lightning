@@ -1,5 +1,6 @@
 #include "config.h"
 #include <ccan/ccan/tal/str/str.h>
+#include <common/channel_asset.h>
 #include <common/json_command.h>
 #include <hsmd/hsmd_wiregen.h>
 #include <lightningd/channel.h>
@@ -169,4 +170,18 @@ void channel_config(struct lightningd *ld,
 
 	 /* This is filled in by lightning_openingd, for consistency. */
 	 ours->channel_reserve = AMOUNT_SAT(UINT64_MAX);
+}
+
+struct command_result *param_channel_asset(struct command *cmd,
+					   const char *name,
+					   const char *buffer,
+					   const jsmntok_t *tok,
+					   u8 **asset)
+{
+	*asset = channel_asset_from_hex(cmd, buffer + tok->start,
+					tok->end - tok->start);
+	if (*asset)
+		return NULL;
+	return command_fail_badparam(cmd, name, buffer, tok,
+				     "should be a 32-byte asset id");
 }

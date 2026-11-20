@@ -9,6 +9,7 @@
 #include <ccan/mem/mem.h>
 #include <ccan/tal/str/str.h>
 #include <common/blockheight_states.h>
+#include <common/channel_asset.h>
 #include <common/clock_time.h>
 #include <common/json_channel_type.h>
 #include <common/json_command.h>
@@ -324,6 +325,15 @@ static void openchannel2_hook_serialize(struct openchannel2_payload *payload,
 	json_add_bool(stream, "require_confirmed_inputs",
 		      payload->req_confirmed_ins_remote);
 	json_add_channel_type(stream, "channel_type", payload->channel_type);
+	/* Asset channel (common/channel_asset.h): amounts are its units
+	 * (a unit is 1000msat), and the opener puts up the fee reserve. */
+	if (payload->channel->asset) {
+		json_add_string(stream, "asset",
+				fmt_channel_asset(tmpctx,
+						  payload->channel->asset->tag));
+		json_add_amount_sat_msat(stream, "fee_reserve_msat",
+					 payload->channel->asset->fee_reserve);
+	}
 	json_object_end(stream);
 }
 
@@ -768,9 +778,25 @@ openchannel2_hook_deserialize(struct openchannel2_payload *payload,
 		      json_tok_full_len(toks),
 		      json_tok_full(buffer, toks));
 
-	if (!hook_extract_psbt(payload, dualopend, buffer, toks,
-			       "openchannel2", true, &payload->psbt))
-		return false;
+	{
+		struct wally_psbt *psbt;
+		if (!hook_extract_psbt(payload, dualopend, buffer, toks,
+				       "openchannel2", true, &psbt))
+			return false;
+		/* Hooks chain: a plugin that doesn't put anything in
+		 * (no psbt) doesn't take out what an earlier one put in. */
+		if (!psbt && payload->psbt) {
+			shutdown_script = hook_extract_shutdown_script(dualopend,
+								       buffer,
+								       toks);
+			if (shutdown_script && !payload->our_shutdown_scriptpubkey)
+				payload->our_shutdown_scriptpubkey
+					= shutdown_script;
+			return true;
+		}
+		tal_free(payload->psbt);
+		payload->psbt = psbt;
+	}
 
 	shutdown_script =
 		hook_extract_shutdown_script(dualopend, buffer, toks);
@@ -1120,7 +1146,8 @@ void watch_opening_inflight(struct lightningd *ld,
 	watch_scriptpubkey(inflight, ld->topology,
 			   take(scriptpubkey_p2wsh(NULL, funding_wscript)),
 			   &inflight->funding->outpoint,
-			   inflight->funding->total_funds, NULL,
+			   inflight->funding->total_funds,
+			   inflight->channel->asset,
 			   dual_funding_found,
 			   inflight);
 }
@@ -1546,7 +1573,12 @@ wallet_commit_channel(struct lightningd *ld,
 	 * P2TR, but we'll use BECH32 for older peers (but always P2TR
 	 * for our own onchian spends, if any).  */
 
-	channel->final_key_idx = wallet_get_newindex(ld, anysegwit ? ADDR_P2TR : (ADDR_BECH32|ADDR_P2TR));
+	/* FIXME: P2TR for elements! (as wallet_commit_channel for v1) */
+	channel->final_key_idx = wallet_get_newindex(ld,
+						     chainparams->is_elements
+						     ? ADDR_BECH32
+						     : anysegwit ? ADDR_P2TR
+						     : (ADDR_BECH32|ADDR_P2TR));
 	if (channel->final_key_idx == -1) {
 		log_broken(channel->log, "Can't get final key index");
 		return NULL;
@@ -1606,6 +1638,11 @@ wallet_commit_channel(struct lightningd *ld,
 	if (our_upfront_shutdown_script)
 		channel->shutdown_scriptpubkey[LOCAL]
 			= tal_steal(channel, our_upfront_shutdown_script);
+	else if (chainparams->is_elements)
+		/* FIXME: P2TR for elements! */
+		channel->shutdown_scriptpubkey[LOCAL]
+			= p2wpkh_for_keyidx(channel, channel->peer->ld,
+					    channel->final_key_idx);
 	else
 		channel->shutdown_scriptpubkey[LOCAL]
 			= p2tr_for_keyidx(channel, channel->peer->ld,
@@ -2281,11 +2318,14 @@ static void accepter_got_offer(struct subd *dualopend,
 					  &payload->requested_lease_amt,
 					  &payload->lease_blockheight_start,
 					  &payload->req_confirmed_ins_remote,
-					  &payload->channel_type)) {
+					  &payload->channel_type,
+					  &channel->asset)) {
 		channel_internal_error(channel, "Bad DUALOPEND_GOT_OFFER: %s",
 				       tal_hex(tmpctx, msg));
 		return;
 	}
+	/* The channel keeps its asset (common/channel_asset.h) */
+	tal_steal(channel, channel->asset);
 
 	/* Don't allow opening if we don't know any fees; even if
 	 * ignore-feerates is set. */
@@ -2730,6 +2770,30 @@ static struct command_result *openchannel_bump(struct openchannel_bump_info *inf
 	return command_still_pending(cmd);
 }
 
+/* What a PSBT's inputs hold of @asset (33-byte explicit tag; NULL means the
+ * fee asset).  On Elements, inputs say their asset in their witness utxo. */
+static bool psbt_inputs_value(const struct wally_psbt *psbt, const u8 *asset,
+			      struct amount_sat *total)
+{
+	*total = AMOUNT_SAT(0);
+	for (size_t i = 0; i < psbt->num_inputs; i++) {
+		bool in_fee_asset = psbt_input_in_fee_asset(psbt, i);
+
+		if (asset) {
+			struct amount_asset a;
+			if (in_fee_asset)
+				continue;
+			a = wally_tx_output_get_amount(psbt->inputs[i].witness_utxo);
+			if (!channel_asset_tag_eq(a.asset, asset))
+				continue;
+		} else if (!in_fee_asset)
+			continue;
+		if (!amount_sat_add(total, *total, psbt_input_get_value(psbt, i)))
+			return false;
+	}
+	return true;
+}
+
 /* sync_waiter must return void, so we use a simple wrapper */
 static void openchannel_bump_after_sync(struct chain_topology *topo,
 					struct openchannel_bump_info *info)
@@ -2759,15 +2823,11 @@ json_openchannel_bump(struct command *cmd,
 			 NULL))
 		return command_param_failed();
 
-	psbt_val = AMOUNT_SAT(0);
-	for (size_t i = 0; i < info->psbt->num_inputs; i++) {
-		struct amount_sat in_amt = psbt_input_get_amount(info->psbt, i);
-		if (!amount_sat_add(&psbt_val, psbt_val, in_amt))
-			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-					    "Overflow in adding PSBT input"
-					    " values. %s",
-					    fmt_wally_psbt(tmpctx, info->psbt));
-	}
+	if (!psbt_inputs_value(info->psbt, NULL, &psbt_val))
+		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+				    "Overflow in adding PSBT input"
+				    " values. %s",
+				    fmt_wally_psbt(tmpctx, info->psbt));
 
 	/* If they don't pass in at least enough in the PSBT to cover
 	 * their amount, nope */
@@ -2784,6 +2844,11 @@ json_openchannel_bump(struct command *cmd,
 		return command_fail(cmd, FUNDING_UNKNOWN_CHANNEL,
 				    "Unknown channel %s",
 				    fmt_channel_id(tmpctx, info->cid));
+
+	/* An asset channel's funding can't be replaced (yet) */
+	if (channel->asset)
+		return command_fail(cmd, FUNDING_STATE_INVALID,
+				    "Asset channels can't be RBF'd");
 
 	/* BOLT #2:
 	 * The sender:
@@ -3288,7 +3353,8 @@ static struct command_result *openchannel_init(struct command *cmd,
 					       const u8 *our_upfront_shutdown_script,
 					       bool announce_channel,
 					       const struct lease_rates *rates,
-					       const struct channel_type *ctype)
+					       const struct channel_type *ctype,
+					       const struct channel_asset *asset)
 {
 	u32 *our_upfront_shutdown_script_wallet_index;
 	u32 found_wallet_index;
@@ -3310,6 +3376,10 @@ static struct command_result *openchannel_init(struct command *cmd,
 	/* We derive initial channel_id *now*, so we can tell it to connectd. */
 	derive_tmp_channel_id(&channel->cid,
 			      &channel->local_basepoints.revocation);
+
+	/* Asset channel (common/channel_asset.h)? */
+	channel->asset = asset ? tal_dup(channel, struct channel_asset, asset)
+		: NULL;
 
 	/* Get a new open_attempt going */
 	channel->opener = LOCAL;
@@ -3360,6 +3430,7 @@ static struct command_result *openchannel_init(struct command *cmd,
 					   get_block_height(cmd->ld->topology),
 					   false,
 					   ctype,
+					   channel->asset,
 					   rates);
 
 	/* Start dualopend! */
@@ -3387,6 +3458,7 @@ struct openchannel_init_info {
 	bool *announce_channel;
 	struct lease_rates *rates;
 	struct channel_type *ctype;
+	struct channel_asset *asset;
 };
 
 static void openchannel_init_after_sync(struct chain_topology *topo,
@@ -3417,7 +3489,7 @@ static void openchannel_init_after_sync(struct chain_topology *topo,
 			 *info->feerate_per_kw_funding, *info->feerate_per_kw,
 			 info->our_upfront_shutdown_script,
 			 *info->announce_channel,
-			 info->rates, info->ctype);
+			 info->rates, info->ctype, info->asset);
 }
 
 static struct command_result *json_openchannel_init(struct command *cmd,
@@ -3429,6 +3501,8 @@ static struct command_result *json_openchannel_init(struct command *cmd,
 	struct peer *peer;
 	struct amount_sat psbt_val;
 	struct command_result *res;
+	u8 *asset_tag;
+	struct amount_sat *fee_reserve;
 
 	info->cmd = cmd;
 	if (!param_check(cmd, buffer, params,
@@ -3442,8 +3516,30 @@ static struct command_result *json_openchannel_init(struct command *cmd,
 			 p_opt_def("request_amt", param_sat, &info->request_amt, AMOUNT_SAT(0)),
 			 p_opt("compact_lease", param_lease_hex, &info->rates),
 			 p_opt("channel_type", param_channel_type, &info->ctype),
+			 p_opt("asset", param_channel_asset, &asset_tag),
+			 p_opt("fee_reserve", param_sat, &fee_reserve),
 			 NULL))
 		return command_param_failed();
+
+	/* Asset channel: the balance is in @asset, and we put a fee reserve
+	 * right after the funding output (common/channel_asset.h).  As for
+	 * fundchannel_start (v1). */
+	if (asset_tag) {
+		if (!chainparams->is_elements)
+			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+					    "asset channels only exist on Liquid");
+		if (!fee_reserve)
+			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+					    "fee_reserve is required with asset");
+		if (!amount_sat_is_zero(*info->request_amt))
+			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+					    "asset channels can't be leased");
+		info->asset = channel_asset_new(info, asset_tag, *fee_reserve);
+	} else if (fee_reserve)
+		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+				    "fee_reserve only applies with asset");
+	else
+		info->asset = NULL;
 
 	/* We only deal in v2 */
 	if (!psbt_set_version(info->psbt, 2)) {
@@ -3455,19 +3551,20 @@ static struct command_result *json_openchannel_init(struct command *cmd,
 		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
 				    "Must pass in 'compact_lease' if requesting"
 				    " funds from peer");
-	psbt_val = AMOUNT_SAT(0);
-	for (size_t i = 0; i < info->psbt->num_inputs; i++) {
-		struct amount_sat in_amt = psbt_input_get_amount(info->psbt, i);
-		if (!amount_sat_add(&psbt_val, psbt_val, in_amt))
-			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-					    "Overflow in adding PSBT input"
-					    " values. %s",
-					    fmt_wally_psbt(tmpctx, info->psbt));
-	}
+	/* For an asset channel, the amount is in the asset (and fees, in the
+	 * fee asset, come from other inputs). */
+	if (!psbt_inputs_value(info->psbt, channel_asset_tag(info->asset),
+			       &psbt_val))
+		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+				    "Overflow in adding PSBT input"
+				    " values. %s",
+				    fmt_wally_psbt(tmpctx, info->psbt));
 
 	/* If they don't pass in at least enough in the PSBT to cover
 	 * their amount, nope */
-	if (!amount_sat_greater(psbt_val, *info->amount))
+	if (info->asset
+	    ? amount_sat_less(psbt_val, *info->amount)
+	    : !amount_sat_greater(psbt_val, *info->amount))
 		return command_fail(cmd, FUND_CANNOT_AFFORD,
 				    "Provided PSBT cannot afford funding of "
 				    "amount %s. %s",
@@ -3494,6 +3591,22 @@ static struct command_result *json_openchannel_init(struct command *cmd,
 	if (!info->ctype)
 		info->ctype = desired_channel_type(info, cmd->ld->our_features,
 						   peer->their_features);
+
+	/* Asset channels are built on anchors (common/channel_asset.h), and
+	 * the peer must know what they are. */
+	if (info->asset) {
+		if (!feature_negotiated(cmd->ld->our_features,
+					peer->their_features,
+					OPT_CHANNEL_ASSET))
+			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+					    "Peer does not support asset"
+					    " channels (or we don't: is the"
+					    " assetchan plugin running?)");
+		if (!channel_type_has(info->ctype,
+				      OPT_ANCHORS_ZERO_FEE_HTLC_TX))
+			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+					    "Asset channels need option_anchors");
+	}
 
 	if (!cmd->ld->dev_any_channel_type &&
 	    !channel_type_accept(tmpctx,
@@ -3553,7 +3666,7 @@ static struct command_result *json_openchannel_init(struct command *cmd,
 				*info->feerate_per_kw_funding, *info->feerate_per_kw,
 				info->our_upfront_shutdown_script,
 				*info->announce_channel,
-				info->rates, info->ctype);
+				info->rates, info->ctype, info->asset);
 }
 
 static void psbt_request_valid(struct psbt_validator *pv)
@@ -4226,6 +4339,7 @@ static struct command_result *json_queryrates(struct command *cmd,
 					   true,
 					   desired_channel_type(tmpctx, cmd->ld->our_features,
 								peer->their_features),
+					   NULL,
 					   NULL);
 
 	if (socketpair(AF_LOCAL, SOCK_STREAM, 0, fds) != 0) {
@@ -4678,7 +4792,8 @@ bool peer_restart_dualopend(struct peer *peer,
 				      channel->req_confirmed_ins[LOCAL],
 				      channel->req_confirmed_ins[REMOTE],
 				      *channel->alias[LOCAL],
-				      inflight->i_sent_sigs);
+				      inflight->i_sent_sigs,
+				      channel->asset);
 
 	subd_send_msg(channel->owner, take(msg));
 	return true;

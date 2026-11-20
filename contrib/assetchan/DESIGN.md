@@ -346,3 +346,74 @@ Reuse map (`git show liquid-merged:<path>`): `common/liquid_asset.[ch]`,
   then announcing asset channels is a choice (`assetchan-open announce=true`), default off.
 - Upstream review will ask about TLV numbers, the reserve, and anchors on Elements;
   the plugin is unaffected by whichever protocol detail changes.
+
+## 8. Dual funding (open_channel2)
+
+Asset channels, and ordinary L-BTC channels, can be opened with the
+interactive protocol (`experimental-dual-fund` on both nodes), where the peer
+may put funds in too. The channel that comes out is the same as §3's: one
+asset per channel, the asset funding at output n, the opener's L-BTC fee
+reserve at n+1; only the funding transaction is built together.
+
+**Elements, for any v2 open** (upstream never ran dual funding on Liquid; its
+tests skip it there):
+- The fee is an explicit output with an empty script, which isn't a standard
+  script to send in `tx_add_output`. Neither side sends it: once the
+  construction is complete both add it the same way, last, as whatever the
+  fee asset's inputs leave over its outputs, under serial_id `UINT64_MAX`,
+  which a peer may not use (`psbt_set_elements_fee_output`,
+  `common/psbt_open.c`). The opener's wallet PSBT comes with a fee output of
+  its own: it stays out of the changeset, and the spender plugin replaces it
+  in the roll-up and the per-peer PSBTs, or their txids would differ.
+- A received input must be explicit; its asset and value go in the PSBT
+  input's witness UTXO (from `prevtx`), where fee and balance accounting look.
+- The wallet adds the non-witness UTXO on Elements too (`tx_add_input` sends
+  the whole previous tx); v2 channels close to P2WPKH as v1 ones do (no P2TR
+  on Elements).
+
+**Asset channels.**
+- `open_channel2` TLVs `channel_asset` (4243) and `fee_reserve` (4245), as
+  `open_channel`'s; `accept_channel2` echoes `channel_asset` (4243) or the
+  open fails. Both `funding_satoshis` are units of the asset. Same gate as v1:
+  the accepter's plugin must offer `option_channel_asset`, the type must have
+  anchors. No `request_funds`/`will_fund` (a lease fee can't be paid in the
+  asset) and no RBF (`tx_init_rbf`, `openchannel_bump`) for asset channels.
+- `tx_add_output` gets a TLV stream: `output_asset` (4243) is the 33-byte
+  explicit tag of an output in another asset than the fee asset (the funding
+  output, the sides' asset change). Splicing (common/interactivetx.c) refuses
+  it.
+- The opener adds the funding output in the asset and the fee reserve in
+  L-BTC to the same 2-of-2, under its serial_ids f and f+2: sorted by
+  serial_id the reserve directly follows the funding output unless the peer
+  used f+1, and both sides fail a transaction where it doesn't
+  (`find_funding_txout`).
+- Balances (`check_balances`): fees, and each side's fee check, are in L-BTC
+  only. Every other asset is tallied per side, and what a side puts in of it
+  must come out again: as outputs, or (the channel's asset) its funding
+  amount. The reserve is an opener output in L-BTC.
+- Commitments as v1: `commitment_signed` carries `fee_reserve_sig` (4241),
+  hsmd signs with `hsmd_sign_asset_remote_commitment_tx`; also when dualopend
+  resends them on reconnect (`dualopend_reinit` carries the asset).
+- lightningd: `openchannel_init asset= fee_reserve=` (amount in units, which
+  the PSBT's inputs in the asset must cover); the `openchannel2` hook payload
+  has `asset` and `fee_reserve_msat`; the channel keeps its asset from the
+  offer, so the DB, the funding watch (in the asset, with the reserve) and
+  channeld are §4's. A plugin answering `openchannel2` without a PSBT no
+  longer drops one an earlier plugin gave, and funder leaves asset offers
+  alone (its wallet has no assets).
+
+**Plugin.** `assetchan-open ... dual_fund=true`: elementsd's explicit UTXOs
+(the asset, and L-BTC for the reserve and the opener's fee share) and change
+go into `openchannel_init`'s PSBT (`createpsbt`, `walletprocesspsbt` without
+signing, plus the previous txs, `pset.py`); `openchannel_update` until the
+commitments are secured; elementsd signs our inputs of core's PSBT, and only
+the final scriptSigs and witnesses are copied back (elementsd may rewrite
+core's fields); `openchannel_signed`. The accepter's plugin
+(`openchannel2` hook) applies the same checks as for `openchannel`, and puts
+`assetchan-dual-fund-match` percent of the opener's amount (at most
+`assetchan-dual-fund-max`) in from its elementsd wallet; it signs in
+`openchannel2_sign`, and unlocks its inputs on `channel_open_failed`.
+
+Tests: `tests/test_dualfund_liquid.py` (L-BTC channel funded by both CLN
+wallets; asset channel funded by both, by one, refused, reconnected while
+exchanging signatures, force-closed and swept).

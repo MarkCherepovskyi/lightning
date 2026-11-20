@@ -1,6 +1,7 @@
 #include <bitcoin/chainparams.h>
 #include <bitcoin/psbt.h>
 #include <bitcoin/signature.h>
+#include <common/channel_asset.h>
 #include <common/cryptomsg.h>
 #include <common/channel_config.h>
 #include <common/channel_id.h>
@@ -87,6 +88,8 @@ msgdata,dualopend_reinit,we_require_confirmed_inputs,bool,
 msgdata,dualopend_reinit,they_require_confirmed_inputs,bool,
 msgdata,dualopend_reinit,local_alias,short_channel_id,
 msgdata,dualopend_reinit,local_funding_sigs_sent,bool,
+# Asset channel (common/channel_asset.h)?
+msgdata,dualopend_reinit,asset,?channel_asset,
 
 # dualopend->master: they offered channel, should we continue?
 msgtype,dualopend_got_offer,7005
@@ -107,6 +110,8 @@ msgdata,dualopend_got_offer,requested_amt,?amount_sat,
 msgdata,dualopend_got_offer,lease_blockheight_start,u32,
 msgdata,dualopend_got_offer,require_confirmed_inputs,bool,
 msgdata,dualopend_got_offer,ctype,channel_type,
+# Asset channel offer (common/channel_asset.h)?
+msgdata,dualopend_got_offer,asset,?channel_asset,
 
 # master->dualopend: reply back with our first funding info/contribs
 msgtype,dualopend_got_offer_reply,7105
@@ -221,6 +226,8 @@ msgdata,dualopend_opener_init,requested_sats,?amount_sat,
 msgdata,dualopend_opener_init,blockheight,u32,
 msgdata,dualopend_opener_init,dry_run,bool,
 msgdata,dualopend_opener_init,channel_type,channel_type,
+# Asset channel (common/channel_asset.h)?
+msgdata,dualopend_opener_init,asset,?channel_asset,
 # must go last because embedded tu32
 msgdata,dualopend_opener_init,expected_rates,?lease_rates,
 

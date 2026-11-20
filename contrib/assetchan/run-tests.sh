@@ -18,7 +18,8 @@
 # instead (e.g. upstream's own tests, to check ordinary channels are
 # untouched); TEST_DEBUG=1 prints the nodes' logs of failed tests;
 # ASSETCHAN_TEST_KEEP_ALL=1 keeps the directories of passed tests too (else
-# only failed ones are kept for `logs`); ASSETCHAN_TEST_REBUILD=1 rebuilds the
+# only failed ones are kept for `logs`); EXPERIMENTAL_DUAL_FUND=1 runs the
+# suite's v2 (open_channel2) variants; ASSETCHAN_TEST_REBUILD=1 rebuilds the
 # image; ASSETCHAN_TEST_IMAGE and ASSETCHAN_TEST_VOLUME override their names.
 set -e
 
@@ -77,6 +78,7 @@ fi
 COPYFILE_DISABLE=1 tar $tarflags -cf - -T "$list" \
 	| docker run --rm -i --name "assetchan-pytest-$$" -v "$volume":/build \
 		-e TEST_DEBUG="${TEST_DEBUG:-}" -e KEEP_ALL="${ASSETCHAN_TEST_KEEP_ALL:-}" \
+		-e EXPERIMENTAL_DUAL_FUND="${EXPERIMENTAL_DUAL_FUND:-0}" \
 		-e TEST_NETWORK="${ASSETCHAN_TEST_NETWORK:-liquid-regtest}" \
 		"$image" sh -c '
 set -e
