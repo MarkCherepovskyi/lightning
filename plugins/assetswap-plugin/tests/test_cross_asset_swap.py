@@ -19,7 +19,7 @@ pytestmark = pytest.mark.skipif(TEST_NETWORK != 'liquid-regtest',
                                 reason="Liquid asset channels need elementsd")
 
 TO_AMOUNT_MSAT = 100_000_000  # 100,000 units of to_asset -- well within CHANNEL_UNITS either side
-MARGINS = {'low': 2010, 'medium': 2030, 'high': 2060}  # pricetiers-plugin's own MARGINS
+MARGINS = {'low': 1010, 'medium': 1030, 'high': 1060}  # pricetiers-plugin's own MARGINS
 
 
 def tier_from_amount(to_amount_msat, tier_name, rate_ppm=DEFAULT_RATE_PPM,

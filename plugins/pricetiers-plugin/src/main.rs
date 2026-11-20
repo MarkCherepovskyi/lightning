@@ -93,10 +93,11 @@ struct Tier {
     from_amount_msat: u64,
 }
 
-/// Margins in parts-per-thousand over today's reference rate: a looser
-/// (higher) cap leaves more room before a live-price recheck can ever
-/// fail, at the cost of a worse worst-case rate for the payer.
-const MARGINS: [(&str, u64); 3] = [("low", 2010), ("medium", 2030), ("high", 2060)];
+/// Each tier's rate as parts-per-thousand of today's reference rate:
+/// +1%, +3%, +6%. A looser (higher) cap leaves more room before a
+/// live-price recheck can ever fail, at the cost of a worse worst-case
+/// rate for the payer.
+const MARGINS: [(&str, u64); 3] = [("low", 1010), ("medium", 1030), ("high", 1060)];
 
 /// In u128: a pair priced in a much smaller unit than what it buys (e.g.
 /// a stablecoin paying for L-BTC, rate_ppm ~6e10) overflows u64 at
@@ -252,8 +253,8 @@ mod tests {
     fn tiers_scale_rate_by_margin() {
         let tiers = make_tiers(&pair(1_000_000, 5), 2_000).unwrap();
         let medium = tiers.iter().find(|t| t.name == "medium").unwrap();
-        assert_eq!(medium.rate_ppm, 2_030_000);
-        assert_eq!(medium.from_amount_msat, 2_000 * 2_030_000 / 1_000_000 + 5);
+        assert_eq!(medium.rate_ppm, 1_030_000);
+        assert_eq!(medium.from_amount_msat, 2_000 * 1_030_000 / 1_000_000 + 5);
     }
 
     #[test]
@@ -261,7 +262,7 @@ mod tests {
         // 1 USDT = 1600 sat paying for 1 L-BTC: rate_ppm 62.5e9, 1e11 msat.
         let tiers = make_tiers(&pair(62_500_000_000, 0), 100_000_000_000).unwrap();
         let low = tiers.iter().find(|t| t.name == "low").unwrap();
-        assert_eq!(low.from_amount_msat, 12_562_500_000_000_000);
+        assert_eq!(low.from_amount_msat, 6_312_500_000_000_000);
     }
 
     #[test]

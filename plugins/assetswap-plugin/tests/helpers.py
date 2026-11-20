@@ -14,7 +14,7 @@ ASSETSWAP_PLUGIN = os.path.join(os.getcwd(), 'target/debug/assetswap-plugin')
 PRICETIERS_PLUGIN = os.path.join(os.getcwd(), 'target/debug/pricetiers-plugin')
 
 # 1:1 reference rate between the two test assets by default, so tier
-# amounts are easy to reason about in assertions (medium tier = 2030/1000
+# amounts are easy to reason about in assertions (medium tier = 1030/1000
 # of that, per pricetiers-plugin's MARGINS).
 DEFAULT_RATE_PPM = 1_000_000
 DEFAULT_FEE_BASE_MSAT = 0

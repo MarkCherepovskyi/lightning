@@ -38,7 +38,7 @@ else:
 TO_MSAT = 100_000_000         # what the payee's invoice asks: 100,000 sat of ETH
 EVM_CHANNEL_SAT = 200_000     # provider_e -> payee
 LBTC_CHANNEL_SAT = 5_000_000  # payer -> provider_l
-MARGINS = {'low': 2010, 'medium': 2030, 'high': 2060}  # pricetiers-plugin's
+MARGINS = {'low': 1010, 'medium': 1030, 'high': 1060}  # pricetiers-plugin's
 
 
 def tier_msat(to_msat, tier='medium', rate_ppm=1_000_000, fee_base_msat=0):
