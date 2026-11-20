@@ -55,16 +55,19 @@ const LEG1_CLTV_MARGIN: u32 = 60;
 /// for a payer to learn a remote provider's price without asking it, and
 /// asking it is exactly the round trip this design avoids. If this node
 /// has no matching config, it fails the same way an unsupported pair
-/// would.
+/// would. `from_asset` (optional) prices paying in that asset - the pair
+/// payassetinvoice's own `from_asset` would use; omitted, the first pair
+/// configured for the invoice's asset.
 pub(crate) async fn quoteassetinvoice(p: Plugin<State>, args: Value) -> Result<Value, Error> {
     require_client_mode(&p, "quoteassetinvoice")?;
     let encoded = param(&args, 0, "assetinvoice")
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("Missing assetinvoice"))?;
+    let from_asset = param(&args, 1, "from_asset").and_then(Value::as_str);
     let wrapper = decode_wrapper(encoded)?;
 
     let mut rpc = new_rpc(&p).await?;
-    let priced = fetch_price_tiers(&mut rpc, &wrapper.asset, wrapper.amount_msat).await?;
+    let priced = fetch_price_tiers(&mut rpc, &wrapper.asset, from_asset, wrapper.amount_msat).await?;
     Ok(json!(priced))
 }
 
@@ -161,7 +164,7 @@ pub(crate) async fn payassetinvoice(p: Plugin<State>, args: Value) -> Result<Val
     let (from_asset, from_amount_msat) = match (from_asset, from_amount_override) {
         (Some(a), Some(m)) => (a, m),
         (Some(a), None) => {
-            let priced = fetch_price_tiers(&mut rpc, &wrapper.asset, wrapper.amount_msat)
+            let priced = fetch_price_tiers(&mut rpc, &wrapper.asset, Some(&a), wrapper.amount_msat)
                 .await
                 .map_err(|e| anyhow!("can't price paying in {a}: {e}"))?;
             if priced.from_asset != a {
@@ -178,7 +181,7 @@ pub(crate) async fn payassetinvoice(p: Plugin<State>, args: Value) -> Result<Val
             (priced.from_asset, tier.from_amount_msat)
         }
         (None, _) => {
-            let priced = fetch_price_tiers(&mut rpc, &wrapper.asset, wrapper.amount_msat)
+            let priced = fetch_price_tiers(&mut rpc, &wrapper.asset, None, wrapper.amount_msat)
                 .await
                 .map_err(|e| anyhow!("direct payment failed; can't price a swap locally: {e}"))?;
             let tier = priced

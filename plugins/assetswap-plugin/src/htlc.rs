@@ -317,11 +317,20 @@ pub(crate) async fn on_htlc_accepted(p: Plugin<State>, v: Value) -> Result<Value
         return Ok(fail_incorrect_details());
     }
 
+    // Leg 1 came in on this channel's asset, which is what the payer paid
+    // with: price the pair from it (several assets can pay for the same
+    // to_asset). listpeerchannels shows no asset for a channel in the
+    // native coin - "lbtc", as rpc.rs's own channel listing calls it.
+    let Ok(chan_asset) = channel_asset(&mut rpc, &scid).await else {
+        return Ok(fail_incorrect_details());
+    };
+    let from_asset = chan_asset.as_deref().unwrap_or("lbtc");
+
     // Live pricing: this is the only check that decides whether we'd lose
     // money, since nothing was pre-approved. Ask pricetiers-plugin for
     // today's rate and require at least its cheapest tier -- anything above
     // that is just extra profit, there's no fixed amount to match exactly.
-    let priced = match fetch_price_tiers(&mut rpc, &meta.to_asset, to_amount_msat).await {
+    let priced = match fetch_price_tiers(&mut rpc, &meta.to_asset, Some(from_asset), to_amount_msat).await {
         Ok(p) => p,
         Err(_) => return Ok(fail_incorrect_details()), // not a pair we quote
     };
@@ -332,11 +341,8 @@ pub(crate) async fn on_htlc_accepted(p: Plugin<State>, v: Value) -> Result<Value
         return Ok(fail_incorrect_details()); // we'd lose money at our own current price
     }
 
-    // Leg 1 must have come in the asset we priced it in: listpeerchannels
-    // shows no asset for a channel in the native coin.
-    let Ok(chan_asset) = channel_asset(&mut rpc, &scid).await else {
-        return Ok(fail_incorrect_details());
-    };
+    // Belt and braces: the pair priced must be the one asked for, i.e.
+    // leg 1 really came in the asset we priced it in.
     let expected_chan_asset = is_asset_id(&priced.from_asset).then_some(priced.from_asset.as_str());
     let budget = leg2_final_cltv + p.state().config.safety_blocks + p.state().config.min_hop_budget;
     if chan_asset.as_deref() != expected_chan_asset || cltv_expiry_relative < budget {

@@ -1,7 +1,10 @@
 //! A standalone plugin that quotes price-ceiling tiers for asset pairs:
-//! given `to_asset` and `to_amount_msat`, returns low/medium/high price
-//! ceilings and the exact `from_amount_msat` each implies, for whichever
-//! pair is configured with that `to_asset`.
+//! given `to_asset`, `to_amount_msat` and optionally `from_asset`, returns
+//! low/medium/high price ceilings and the exact `from_amount_msat` each
+//! implies, for the configured pair from `from_asset` to `to_asset` (or,
+//! without `from_asset`, the first pair configured with that `to_asset`).
+//! Several pairs may share a `to_asset` - one per asset that can pay for
+//! it.
 //!
 //! Deliberately decoupled from `plugins/assetswap-plugin`
 //! (contrib/liquid-poc/CROSS_ASSET_SWAP.md): this plugin knows nothing
@@ -11,8 +14,8 @@
 //! RPC method as a plain local RPC call (`cln_rpc::ClnRpc::call_raw`,
 //! since this isn't a core lightningd method). A future oracle-backed
 //! version (e.g. calling `plugins/currencyrate-plugin`) only needs to
-//! implement the same RPC contract: {to_asset, to_amount_msat} ->
-//! {from_asset, rate_ppm, fee_base_msat, tiers}.
+//! implement the same RPC contract: {to_asset, to_amount_msat, from_asset?}
+//! -> {from_asset, rate_ppm, fee_base_msat, tiers}.
 //!
 //! Two sources for the pairs, never mixed: `pricetiers-ember-url` (an
 //! ember deployment's internal endpoint, polled every
@@ -95,17 +98,24 @@ struct Tier {
 /// fail, at the cost of a worse worst-case rate for the payer.
 const MARGINS: [(&str, u64); 3] = [("low", 2010), ("medium", 2030), ("high", 2060)];
 
-fn make_tiers(pair: &Pair, to_amount_msat: u64) -> Vec<Tier> {
+/// In u128: a pair priced in a much smaller unit than what it buys (e.g.
+/// a stablecoin paying for L-BTC, rate_ppm ~6e10) overflows u64 at
+/// `to_amount_msat * rate_ppm` for amounts as small as ~0.0015 BTC - and
+/// a wrapped product would let a provider accept a tiny leg 1. A result
+/// that doesn't fit u64 is an error, never truncated.
+fn make_tiers(pair: &Pair, to_amount_msat: u64) -> Result<Vec<Tier>, Error> {
     MARGINS
         .iter()
         .map(|(name, permille)| {
-            let rate_ppm = pair.rate_ppm * permille / 1000;
-            let from_amount_msat = to_amount_msat * rate_ppm / 1_000_000 + pair.fee_base_msat;
-            Tier {
+            let rate_ppm = pair.rate_ppm as u128 * *permille as u128 / 1000;
+            let from_amount_msat =
+                to_amount_msat as u128 * rate_ppm / 1_000_000 + pair.fee_base_msat as u128;
+            let too_big = || anyhow!("{name} tier overflows u64 for {to_amount_msat} msat");
+            Ok(Tier {
                 name: name.to_string(),
-                rate_ppm,
-                from_amount_msat,
-            }
+                rate_ppm: u64::try_from(rate_ppm).map_err(|_| too_big())?,
+                from_amount_msat: u64::try_from(from_amount_msat).map_err(|_| too_big())?,
+            })
         })
         .collect()
 }
@@ -125,18 +135,22 @@ async fn pricetiers(p: Plugin<State>, args: Value) -> Result<Value, Error> {
     let to_amount_msat = param(&args, 1, "to_amount_msat")
         .and_then(Value::as_u64)
         .ok_or_else(|| anyhow!("Missing or invalid to_amount_msat"))?;
+    let from_asset = param(&args, 2, "from_asset").and_then(Value::as_str);
 
     let pairs = p.state().pairs.read().await;
     let pair = pairs
         .iter()
-        .find(|pr| pr.to_asset == to_asset)
-        .ok_or_else(|| anyhow!("no price pair configured with to_asset {to_asset:?}"))?;
+        .find(|pr| pr.to_asset == to_asset && from_asset.is_none_or(|f| pr.from_asset == f))
+        .ok_or_else(|| match from_asset {
+            Some(f) => anyhow!("no price pair configured from {f:?} to {to_asset:?}"),
+            None => anyhow!("no price pair configured with to_asset {to_asset:?}"),
+        })?;
 
     Ok(json!({
         "from_asset": pair.from_asset,
         "rate_ppm": pair.rate_ppm,
         "fee_base_msat": pair.fee_base_msat,
-        "tiers": make_tiers(pair, to_amount_msat),
+        "tiers": make_tiers(pair, to_amount_msat)?,
     }))
 }
 
@@ -189,7 +203,7 @@ async fn main() -> Result<(), Error> {
         .rpcmethod(
             "pricetiers",
             "Quote low/medium/high price-ceiling tiers for to_asset/to_amount_msat, \
-             discovering from_asset from the matching configured price pair",
+             paid in from_asset (optional: else the first pair configured with to_asset)",
             pricetiers,
         )
         .configure()
@@ -224,4 +238,34 @@ async fn main() -> Result<(), Error> {
     }
     plugin.join().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pair(rate_ppm: u64, fee_base_msat: u64) -> Pair {
+        Pair { from_asset: "usdt".into(), to_asset: "lbtc".into(), rate_ppm, fee_base_msat }
+    }
+
+    #[test]
+    fn tiers_scale_rate_by_margin() {
+        let tiers = make_tiers(&pair(1_000_000, 5), 2_000).unwrap();
+        let medium = tiers.iter().find(|t| t.name == "medium").unwrap();
+        assert_eq!(medium.rate_ppm, 2_030_000);
+        assert_eq!(medium.from_amount_msat, 2_000 * 2_030_000 / 1_000_000 + 5);
+    }
+
+    #[test]
+    fn large_rate_and_amount_do_not_wrap() {
+        // 1 USDT = 1600 sat paying for 1 L-BTC: rate_ppm 62.5e9, 1e11 msat.
+        let tiers = make_tiers(&pair(62_500_000_000, 0), 100_000_000_000).unwrap();
+        let low = tiers.iter().find(|t| t.name == "low").unwrap();
+        assert_eq!(low.from_amount_msat, 12_562_500_000_000_000);
+    }
+
+    #[test]
+    fn result_beyond_u64_is_an_error() {
+        assert!(make_tiers(&pair(u64::MAX / 1000, 0), u64::MAX).is_err());
+    }
 }

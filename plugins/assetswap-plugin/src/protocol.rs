@@ -63,8 +63,9 @@ pub(crate) fn quote_key(payment_hash: &str) -> Vec<String> {
 }
 
 /// What `plugins/pricetiers-plugin`'s `pricetiers` RPC returns: tiers for
-/// `to_asset`/`to_amount_msat`, plus the `from_asset` it discovered from
-/// its own matching configured pair and the reference `rate_ppm` behind
+/// `to_asset`/`to_amount_msat`, plus the `from_asset` of the pair it priced
+/// with (the one asked for, or the first configured for `to_asset`) and
+/// the reference `rate_ppm` behind
 /// those tiers (used for the `htlc_accepted` hook's live-price recheck,
 /// which only needs the rate, not a concrete amount).
 #[derive(Serialize, Deserialize, Debug)]
@@ -79,16 +80,21 @@ pub(crate) struct PriceTiers {
 struct PriceTiersRequest {
     to_asset: String,
     to_amount_msat: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    from_asset: Option<String>,
 }
 
 /// Calls `pricetiers-plugin`'s `pricetiers` RPC method as a plain local
 /// RPC call -- it's not a core lightningd method, so this goes through
-/// `call_raw` rather than `call_typed`. Fails (as "no pair configured")
-/// if that plugin isn't loaded, or isn't quoting this `to_asset`, exactly
-/// as if the pair were simply unsupported.
+/// `call_raw` rather than `call_typed`. `from_asset` picks which pair
+/// (several assets can pay for the same `to_asset`); `None` takes the
+/// first one configured. Fails (as "no pair configured") if that plugin
+/// isn't loaded, or isn't quoting this pair, exactly as if the pair were
+/// simply unsupported.
 pub(crate) async fn fetch_price_tiers(
     rpc: &mut ClnRpc,
     to_asset: &str,
+    from_asset: Option<&str>,
     to_amount_msat: u64,
 ) -> Result<PriceTiers, Error> {
     rpc.call_raw(
@@ -96,6 +102,7 @@ pub(crate) async fn fetch_price_tiers(
         &PriceTiersRequest {
             to_asset: to_asset.to_string(),
             to_amount_msat,
+            from_asset: from_asset.map(str::to_string),
         },
     )
     .await
