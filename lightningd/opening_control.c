@@ -1062,23 +1062,6 @@ bool peer_start_openingd(struct peer *peer, struct peer_fd *peer_fd)
 	return true;
 }
 
-/* Elements: is this PSET output blinded, or to be blinded? */
-static bool psbt_output_blinded(const struct wally_psbt_output *out)
-{
-	size_t len;
-
-	if (wally_psbt_output_get_blinding_public_key_len(out, &len) != WALLY_OK
-	    || len)
-		return true;
-	if (wally_psbt_output_get_value_commitment_len(out, &len) != WALLY_OK
-	    || len)
-		return true;
-	if (wally_psbt_output_get_asset_commitment_len(out, &len) != WALLY_OK
-	    || len)
-		return true;
-	return false;
-}
-
 static struct command_result *json_fundchannel_complete(struct command *cmd,
 							const char *buffer,
 							const jsmntok_t *obj UNNEEDED,
@@ -1149,57 +1132,16 @@ static struct command_result *json_fundchannel_complete(struct command *cmd,
 		return command_fail(cmd, FUNDING_PSBT_INVALID,
 				    "No output to open channel");
 
-	/* Asset channels: output n must pay exactly the asset amount, and
-	 * n+1 exactly the fee reserve in the fee asset, both explicitly
-	 * (elementsd doesn't blind outputs to unconfidential addresses,
-	 * which is what fundchannel_start gave out). */
-	if (fc->asset) {
-		size_t reserve = *funding_txout_num + 1;
-		struct amount_asset amt;
-
-		if (!reserve_found)
-			return command_fail(cmd, FUNDING_PSBT_INVALID,
-					    "asset channel: output %zu"
-					    " must pay the fee reserve"
-					    " to the channel too", reserve);
-		/* A PSET output still shows its explicit asset and amount
-		 * when it is to be blinded (or was): the peer's funding watch
-		 * would never accept it, and our commitments couldn't spend
-		 * it. */
-		for (size_t i = *funding_txout_num; i <= reserve; i++) {
-			if (psbt_output_blinded(&funding_psbt->outputs[i]))
-				return command_fail(cmd, FUNDING_PSBT_INVALID,
-						    "asset channel: output %zu"
-						    " must not be blinded", i);
-		}
-		amt = wally_psbt_output_get_amount(&funding_psbt->outputs
-						   [*funding_txout_num]);
-		if (amt.value == 0
-		    || !channel_asset_tag_eq(amt.asset, fc->asset->tag)
-		    || !amount_sat_eq(amount_sat(amt.value), fc->funding_sats))
-			return command_fail(cmd, FUNDING_PSBT_INVALID,
-					    "asset channel: output %u must pay"
-					    " exactly %s of asset %s,"
-					    " explicitly",
-					    *funding_txout_num,
-					    fmt_amount_sat(tmpctx,
-							   fc->funding_sats),
-					    fmt_channel_asset(tmpctx,
-							      fc->asset->tag));
-		amt = wally_psbt_output_get_amount(&funding_psbt->outputs
-						   [reserve]);
-		if (amt.value == 0
-		    || !amount_asset_is_main(&amt)
-		    || !amount_sat_eq(amount_sat(amt.value),
-				      fc->asset->fee_reserve))
-			return command_fail(cmd, FUNDING_PSBT_INVALID,
-					    "asset channel: output %zu must pay"
-					    " exactly the %s fee reserve,"
-					    " explicitly",
-					    reserve,
-					    fmt_amount_sat(tmpctx,
-							   fc->asset->fee_reserve));
-	}
+	/* Asset channels: the fee reserve goes to the channel right after the
+	 * funding output.  What the two pay, and that they are explicit, is
+	 * the caller's to check (the asset channel plugin does, before it
+	 * calls us): a wrong one locks only the opener's own coins, as the
+	 * peer's funding watch never accepts it. */
+	if (fc->asset && !reserve_found)
+		return command_fail(cmd, FUNDING_PSBT_INVALID,
+				    "asset channel: output %u must pay the fee"
+				    " reserve to the channel too",
+				    *funding_txout_num + 1);
 
 	/* Can't really check amounts for elements. */
 	if (!chainparams->is_elements

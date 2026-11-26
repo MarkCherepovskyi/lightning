@@ -1441,7 +1441,10 @@ static bool spends_funding_and_sibling(const struct bitcoin_tx *tx)
 
 	if (tx->wtx->num_inputs == 1)
 		return true;
-	if (tx->wtx->num_inputs != 2)
+	/* Only Elements has asset channels: elsewhere, one input as upstream.
+	 * (The global chainparams, from hsmd_init: a client's own may be
+	 * unset.) */
+	if (tx->wtx->num_inputs != 2 || !chainparams || !is_elements(chainparams))
 		return false;
 	bitcoin_tx_input_get_outpoint(tx, 0, &funding);
 	bitcoin_tx_input_get_outpoint(tx, 1, &sibling);
