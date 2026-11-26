@@ -1563,6 +1563,47 @@ def test_funding_reorg_private(node_factory, bitcoind):
     bitcoind.generate_block(1, True)
 
 
+def test_funding_reorg_back_to_old_scid(node_factory, bitcoind):
+    """A reorg moves the funding tx of an announced channel, and a second one
+    puts it back where it was: the scid we then get is one we remembered as
+    old.  lightningd used to die adding it to its scid map a second time (and
+    again on every restart)."""
+    def setup(plugin):
+        @plugin.hook('openchannel')
+        def on_openchannel(openchannel, plugin, **kwargs):
+            # Zeroconf: else we close the channel when its funding is reorged out.
+            return {'result': 'continue', 'mindepth': 0}
+
+    opts = {'funding-confirms': 2, 'dev-fast-reconnect': None}
+    node_opts = {'may_reconnect': True, 'allow_bad_gossip': True, 'allow_warning': True}
+    l1 = node_factory.get_node(inline_plugin=setup, options=opts, **node_opts)
+    l2 = node_factory.get_node(inline_plugin=setup, options=opts, **node_opts)
+    node_factory.join_nodes([l1, l2], fundchannel=False)
+    l1.fundwallet(10000000)
+    sync_blockheight(bitcoind, [l1])                # height 102
+    bitcoind.generate_block(3)                      # heights 103-105
+
+    l1.rpc.fundchannel(l2.info['id'], "all")
+    bitcoind.generate_block(2)                      # heights 106-107
+    l1.wait_local_channel_active('106x1x0')
+    l2.wait_local_channel_active('106x1x0')
+
+    # The funding tx goes from block 106 to block 108...
+    bitcoind.simple_reorg(106, 2)
+    for n in (l1, l2):
+        n.daemon.wait_for_log('Short channel id changed from 106x1x0->108x1x0')
+
+    # ... and back to block 106.
+    bitcoind.simple_reorg(106, 0)
+    for n in (l1, l2):
+        n.daemon.wait_for_log('Short channel id changed from 108x1x0->106x1x0')
+        assert only_one(n.rpc.listpeerchannels()['channels'])['short_channel_id'] == '106x1x0'
+
+    # And what we saved loads again.
+    l2.restart()
+    assert only_one(l2.rpc.listpeerchannels()['channels'])['short_channel_id'] == '106x1x0'
+
+
 @pytest.mark.openchannel('v1')
 def test_funding_reorg_remote_lags(node_factory, bitcoind):
     """Nodes may disagree about short_channel_id before channel announcement

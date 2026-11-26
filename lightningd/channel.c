@@ -299,6 +299,21 @@ static void chanmap_add(struct lightningd *ld,
 	tal_add_destructor2(scc, destroy_scid_to_channel, ld);
 }
 
+/* A reorg can move the funding tx, then another can put it back where it
+ * was: the scid we are given is one we remembered as old.  It is not old any
+ * more (and the map takes each scid once). */
+static void channel_forget_old_scid(struct channel *channel,
+				    struct short_channel_id scid)
+{
+	for (size_t i = 0; i < tal_count(channel->old_scids); i++) {
+		if (!short_channel_id_eq(channel->old_scids[i], scid))
+			continue;
+		chanmap_remove(channel->peer->ld, channel, scid);
+		tal_arr_remove(&channel->old_scids, i);
+		return;
+	}
+}
+
 void channel_set_scid(struct channel *channel, const struct short_channel_id *new_scid)
 {
 	struct lightningd *ld = channel->peer->ld;
@@ -311,6 +326,7 @@ void channel_set_scid(struct channel *channel, const struct short_channel_id *ne
 
 	/* Add new one (if any) */
 	if (new_scid) {
+		channel_forget_old_scid(channel, *new_scid);
 		channel->scid = tal_dup(channel, struct short_channel_id, new_scid);
 		chanmap_add(ld, channel, *new_scid);
 	}
