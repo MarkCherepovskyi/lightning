@@ -54,6 +54,7 @@ plugin.v2_inputs = {}        # channel_id -> elementsd inputs we put into its du
 
 LBTC = 'lbtc'                           # the "asset" of an ordinary channel
 INVOICE_KEY = ['assetchan', 'invoice']  # datastore: + [payment_hash] -> asset
+PAY_KEY = ['assetchan', 'pay']          # datastore: + [payment_hash] -> asset paid in
 
 
 def check_asset(asset):
@@ -624,6 +625,9 @@ def assetchan_pay(plugin, bolt11, asset, maxfee=None):
     params = {'invstring': bolt11, 'layers': [asset_layer(plugin, asset)]}
     if maxfee is not None:
         params['maxfee'] = maxfee
+    # listpays can't tell which asset a payment's msat are in: wallets read it here.
+    plugin.rpc.datastore(key=PAY_KEY + [plugin.rpc.decode(bolt11)['payment_hash']],
+                         string=asset, mode='create-or-replace')
     res = plugin.rpc.call('xpay', params)
     res['asset'] = asset
     return res

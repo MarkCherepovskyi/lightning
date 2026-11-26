@@ -32,9 +32,10 @@ use crate::State;
 use anyhow::{anyhow, Error};
 use cln_plugin::Plugin;
 use cln_rpc::model::requests::{
-    DecodeRequest, GetinfoRequest, GetroutesRequest, SendpayRequest, WaitsendpayRequest,
-    XpayRequest,
+    DatastoreMode, DatastoreRequest, DecodeRequest, GetinfoRequest, GetroutesRequest,
+    SendpayRequest, WaitsendpayRequest, XpayRequest,
 };
+use cln_rpc::ClnRpc;
 use cln_rpc::primitives::{Amount, Sha256};
 use serde_json::{json, Value};
 use std::str::FromStr;
@@ -46,6 +47,26 @@ use std::str::FromStr;
 /// rejects it, the payer just needs to retry with more (same failure mode
 /// as sending too little for the price).
 const LEG1_CLTV_MARGIN: u32 = 60;
+
+/// Notes which asset the payment `payment_hash` goes out in, under
+/// `assetchan/pay/<payment_hash>` (assetchan-pay's key): listpays reports
+/// its amount in that asset's msat but can't say which asset that is, so
+/// wallets read it from here. Best effort - a failed note only costs
+/// the wallet its display, never the payment.
+async fn note_pay_asset(rpc: &mut ClnRpc, payment_hash: &str, asset: &str) {
+    let note = rpc
+        .call_typed(&DatastoreRequest {
+            generation: None,
+            hex: None,
+            mode: Some(DatastoreMode::CREATE_OR_REPLACE),
+            string: Some(asset.to_string()),
+            key: vec!["assetchan".into(), "pay".into(), payment_hash.to_string()],
+        })
+        .await;
+    if let Err(e) = note {
+        log::warn!("assetswap: noting the asset of payment {payment_hash}: {e}");
+    }
+}
 
 /// Ask this node's own `pricetiers-plugin` what paying `assetinvoice` would
 /// cost, for display purposes. This is NOT a quote from the swap provider
@@ -110,6 +131,7 @@ pub(crate) async fn payassetinvoice(p: Plugin<State>, args: Value) -> Result<Val
     let direct_err = if want_direct {
         // (An invoice of another chain's node fails here too: xpay refuses
         // an invoice for another network.)
+        note_pay_asset(&mut rpc, &wrapper.payment_hash, &wrapper.asset).await;
         let direct = match asset_layers(&mut rpc, &wrapper.asset).await {
             Ok(layers) => rpc
                 .call_typed(&XpayRequest {
@@ -240,6 +262,8 @@ pub(crate) async fn payassetinvoice(p: Plugin<State>, args: Value) -> Result<Val
         final_bolt11: wrapper.bolt11.clone(),
         to_asset: wrapper.asset.clone(),
     })?;
+    // Leg 1 goes out in from_asset (replacing a failed direct attempt's note).
+    note_pay_asset(&mut rpc, &wrapper.payment_hash, &from_asset).await;
     rpc.call_typed(&SendpayRequest {
         amount_msat: Some(Amount::from_msat(from_amount_msat)),
         bolt11: None,
