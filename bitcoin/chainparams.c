@@ -2,7 +2,12 @@
 #include <assert.h>
 #include <bitcoin/chainparams.h>
 #include <ccan/array_size/array_size.h>
+#include <ccan/str/hex/hex.h>
 #include <ccan/tal/str/str.h>
+#include <stddef.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
 /* Version codes for BIP32 extended keys in libwally-core.
  * Stolen from wally_bip32.h in libwally-core*/
@@ -247,8 +252,62 @@ const struct chainparams networks[] = {
      .is_elements = true},
 };
 
+/* A network of our own (lightningd --chain-hash): one of the networks above
+ * under another chain hash, so that its peers, gossip and offers are never
+ * taken for that network's.  A chain that a backend plugin emulates has
+ * regtest's parameters, say, but is not regtest.  It is kept in the
+ * environment, CLN_CHAIN_HASH=<network>:<64 hex digits>, which subdaemons and
+ * plugins inherit: they look their chainparams up by name or by hash too. */
+static const struct chainparams *custom;
+static bool custom_looked;
+
+static const struct chainparams *custom_network(void)
+{
+	const char *env, *hex;
+	struct bitcoin_blkid hash;
+	char *copy;
+
+	if (custom_looked)
+		return custom;
+	custom_looked = true;
+	custom = NULL;
+	env = getenv("CLN_CHAIN_HASH");
+	if (!env || !(hex = strchr(env, ':'))
+	    || !hex_decode(hex + 1, strlen(hex + 1), &hash, sizeof(hash)))
+		return NULL;
+	for (size_t i = 0; i < ARRAY_SIZE(networks); i++) {
+		if (strlen(networks[i].network_name) != (size_t)(hex - env)
+		    || !strstarts(env, networks[i].network_name))
+			continue;
+		/* (A struct of const members: copied as bytes.) */
+		copy = malloc(sizeof(networks[i]));
+		memcpy(copy, &networks[i], sizeof(networks[i]));
+		memcpy(copy + offsetof(struct chainparams, genesis_blockhash),
+		       &hash, sizeof(hash));
+		custom = (const struct chainparams *)copy;
+		break;
+	}
+	return custom;
+}
+
+bool chainparams_set_custom_hash(const char *network_name, const char *hex)
+{
+	char env[128];
+
+	if (snprintf(env, sizeof(env), "%s:%s", network_name, hex)
+	    >= (int)sizeof(env))
+		return false;
+	setenv("CLN_CHAIN_HASH", env, 1);
+	custom_looked = false;
+	return custom_network() != NULL;
+}
+
 const struct chainparams *chainparams_for_network(const char *network_name)
 {
+	const struct chainparams *c = custom_network();
+
+	if (c && streq(network_name, c->network_name))
+		return c;
 	for (size_t i = 0; i < ARRAY_SIZE(networks); i++) {
 		if (streq(network_name, networks[i].network_name)) {
 			return &networks[i];
@@ -259,6 +318,10 @@ const struct chainparams *chainparams_for_network(const char *network_name)
 
 const struct chainparams *chainparams_by_chainhash(const struct bitcoin_blkid *chain_hash)
 {
+	const struct chainparams *c = custom_network();
+
+	if (c && bitcoin_blkid_eq(chain_hash, &c->genesis_blockhash))
+		return c;
 	for (size_t i = 0; i < ARRAY_SIZE(networks); i++) {
 		if (bitcoin_blkid_eq(chain_hash, &networks[i].genesis_blockhash)) {
 			return &networks[i];
@@ -269,6 +332,11 @@ const struct chainparams *chainparams_by_chainhash(const struct bitcoin_blkid *c
 
 const struct chainparams *chainparams_by_lightning_hrp(const char *lightning_hrp)
 {
+	const struct chainparams *c = custom_network();
+
+	/* (Its invoices keep that network's prefix.) */
+	if (c && streq(lightning_hrp, c->lightning_hrp))
+		return c;
 	for (size_t i = 0; i < ARRAY_SIZE(networks); i++) {
 		if (streq(lightning_hrp, networks[i].lightning_hrp)) {
 			return &networks[i];

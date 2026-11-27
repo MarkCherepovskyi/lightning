@@ -1819,6 +1819,9 @@ void setup_color_and_alias(struct lightningd *ld)
 	}
 }
 
+/* --chain-hash, if given */
+static char *chain_hash;
+
 void handle_early_opts(struct lightningd *ld, int argc, char *argv[])
 {
 	/* Make ccan/opt use tal for allocations */
@@ -1834,6 +1837,14 @@ void handle_early_opts(struct lightningd *ld, int argc, char *argv[])
 		     opt_set_bool, &ld->developer,
 		     "Enable developer commands/options, disable legacy APIs");
 
+	/*~ A chain hash of our own, for a chain a backend plugin emulates
+	 * (bitcoin/chainparams.c) */
+	clnopt_witharg("--chain-hash", OPT_EARLY,
+		       opt_set_talstr, NULL, &chain_hash,
+		       "Chain hash (64 hex digits) to use instead of the"
+		       " network's own: for a chain that a backend plugin"
+		       " emulates, so it is not taken for that network");
+
 	/*~ This does enough parsing to get us the base configuration options */
 	ld->configvars = initial_config_opts(ld, &argc, argv, true,
 					     &ld->config_filename,
@@ -1844,6 +1855,15 @@ void handle_early_opts(struct lightningd *ld, int argc, char *argv[])
 
 	if (argc != 1)
 		errx(1, "no arguments accepted");
+
+	/* Before any subdaemon or plugin starts: they inherit it. */
+	if (chain_hash) {
+		if (!chainparams_set_custom_hash(chainparams->network_name,
+						 chain_hash))
+			errx(1, "--chain-hash: needs 64 hex digits");
+		chainparams = chainparams_for_network(chainparams->network_name);
+		chain_hash = tal_free(chain_hash);
+	}
 
 	/* Copy in default config, to be modified by further options */
 	if (chainparams->testnet)
@@ -1902,6 +1922,8 @@ void handle_early_opts(struct lightningd *ld, int argc, char *argv[])
 	/* Now, first-pass of parsing.  But only handle the early
 	 * options (testnet, plugins etc), others may be added on-demand */
 	parse_configvars_early(ld->configvars, ld->developer);
+	/* (Set again by that, and already used above.) */
+	chain_hash = tal_free(chain_hash);
 
 	/* Finalize the logging subsystem now. */
 	logging_options_parsed(ld->log_book);

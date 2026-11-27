@@ -1,3 +1,15 @@
+> **This is an experimental fork of Core Lightning that adds asset channels.**
+> It lets Lightning channels hold a Liquid issued asset instead of L-BTC; the
+> asset-specific logic lives in separate plugins
+> ([liquid-plugin](https://github.com/liquid-lightning/liquid-plugin),
+> [swap-plugin](https://github.com/liquid-lightning/swap-plugin),
+> [pricer-plugin](https://github.com/liquid-lightning/pricer-plugin)).
+> It is an MVP and not production ready: use it on test networks only, never
+> with funds that matter. Its database and gRPC schema differ from upstream's.
+> For Core Lightning itself, see
+> [ElementsProject/lightning](https://github.com/ElementsProject/lightning).
+> The rest of this file is upstream's README.
+
 # Core Lightning (CLN): A specification compliant Lightning Network implementation in C
 
 Core Lightning (previously c-lightning) is a lightweight, highly customizable and [standard compliant][std] implementation of the Lightning Network protocol, developed and maintained by [Blockstream][blockstream]. Learn more about Blockstream's Lightning Network updates at [blockstream.com/lightning][blockstream-lightning].

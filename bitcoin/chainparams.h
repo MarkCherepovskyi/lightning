@@ -60,6 +60,15 @@ struct chainparams {
 const struct chainparams *chainparams_for_network(const char *network_name);
 
 /**
+ * chainparams_set_custom_hash - Give @network_name a chain hash of our own
+ *
+ * @hex is 64 hex digits.  From then on (in this process, and those it
+ * starts) the network is looked up under that chain hash.  False if @hex is
+ * not a chain hash, or the network is unknown.
+ */
+bool chainparams_set_custom_hash(const char *network_name, const char *hex);
+
+/**
  * chainparams_by_bip173 - Helper to get a network by its bip173 name
  *
  * This lets us decode BOLT11 addresses.
