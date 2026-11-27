@@ -6,6 +6,7 @@
 #include <ccan/str/hex/hex.h>
 #include <common/channel_asset.h>
 #include <common/utils.h>
+#include <wally_script.h>
 #include <wire/wire.h>
 #include <stdlib.h>
 #include <string.h>
@@ -19,6 +20,14 @@ struct channel_asset *channel_asset_new(const tal_t *ctx,
 	memcpy(asset->tag, tag, sizeof(asset->tag));
 	asset->fee_reserve = fee_reserve;
 	return asset;
+}
+
+bool channel_asset_tag_valid(const u8 *tag, size_t len)
+{
+	if (len != ELEMENTS_ASSET_LEN || tag[0] != 0x01)
+		return false;
+	return !chainparams->fee_asset_tag
+		|| !memeq(tag, len, chainparams->fee_asset_tag, ELEMENTS_ASSET_LEN);
 }
 
 bool channel_asset_eq(const struct channel_asset *a,

@@ -1040,7 +1040,13 @@ static struct command_result *json_utxopsbt(struct command *cmd,
 					    fmt_bitcoin_outpoint(tmpctx,
 							   &utxo->outpoint),
 					    utxo->close_info->csv);
-
+		if (utxo_is_unsignable(utxo))
+			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+					    "UTXO %s is taproot, which we"
+					    " cannot spend on %s",
+					    fmt_bitcoin_outpoint(tmpctx,
+							   &utxo->outpoint),
+					    chainparams->network_name);
 
 		/* It supplies more input. */
 		if (!amount_sat_add(&input, input, utxo->amount))

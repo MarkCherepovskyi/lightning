@@ -2572,7 +2572,11 @@ pub mod requests {
 	    #[serde(skip_serializing_if = "Option::is_none")]
 	    pub announce: Option<bool>,
 	    #[serde(skip_serializing_if = "Option::is_none")]
+	    pub asset: Option<String>,
+	    #[serde(skip_serializing_if = "Option::is_none")]
 	    pub close_to: Option<String>,
+	    #[serde(skip_serializing_if = "Option::is_none")]
+	    pub fee_reserve: Option<AmountSat>,
 	    #[serde(skip_serializing_if = "Option::is_none")]
 	    pub feerate: Option<Feerate>,
 	    #[serde(skip_serializing_if = "Option::is_none")]
@@ -7936,6 +7940,8 @@ pub mod responses {
 	    #[serde(skip_serializing_if = "Option::is_none")]
 	    pub alias: Option<ListpeerchannelsChannelsAlias>,
 	    #[serde(skip_serializing_if = "Option::is_none")]
+	    pub asset: Option<String>,
+	    #[serde(skip_serializing_if = "Option::is_none")]
 	    pub channel_id: Option<Sha256>,
 	    #[serde(skip_serializing_if = "Option::is_none")]
 	    pub close_to: Option<String>,
@@ -7951,6 +7957,8 @@ pub mod responses {
 	    pub fee_base_msat: Option<Amount>,
 	    #[serde(skip_serializing_if = "Option::is_none")]
 	    pub fee_proportional_millionths: Option<u32>,
+	    #[serde(skip_serializing_if = "Option::is_none")]
+	    pub fee_reserve_msat: Option<Amount>,
 	    #[serde(skip_serializing_if = "Option::is_none")]
 	    pub feerate: Option<ListpeerchannelsChannelsFeerate>,
 	    #[serde(skip_serializing_if = "Option::is_none")]

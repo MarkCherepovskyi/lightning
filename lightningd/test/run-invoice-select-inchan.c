@@ -262,16 +262,6 @@ struct channel *find_channel_by_id(const struct peer *peer UNNEEDED,
 struct plugin *find_plugin_for_command(struct lightningd *ld UNNEEDED,
 				       const char *cmd_name UNNEEDED)
 { fprintf(stderr, "find_plugin_for_command called!\n"); abort(); }
-/* Generated stub for find_txwatch_ */
-struct txwatch *find_txwatch_(struct chain_topology *topo UNNEEDED,
-			      const struct bitcoin_txid *txid UNNEEDED,
-			      enum watch_result (*cb)(struct lightningd *ld UNNEEDED,
-						      const struct bitcoin_txid * UNNEEDED,
-						      const struct bitcoin_tx * UNNEEDED,
-						      unsigned int depth UNNEEDED,
-						      void *arg) UNNEEDED,
-			    void *arg UNNEEDED)
-{ fprintf(stderr, "find_txwatch_ called!\n"); abort(); }
 /* Generated stub for fixup_htlcs_out */
 void fixup_htlcs_out(struct lightningd *ld UNNEEDED)
 { fprintf(stderr, "fixup_htlcs_out called!\n"); abort(); }
@@ -316,15 +306,15 @@ bool fromwire_hsmd_preapprove_keysend_reply(const void *p UNNEEDED, bool *approv
 /* Generated stub for fromwire_hsmd_sign_bolt12_reply */
 bool fromwire_hsmd_sign_bolt12_reply(const void *p UNNEEDED, struct bip340sig *sig UNNEEDED)
 { fprintf(stderr, "fromwire_hsmd_sign_bolt12_reply called!\n"); abort(); }
-/* Generated stub for fromwire_hsmd_sign_asset_tx_reply */
-bool fromwire_hsmd_sign_asset_tx_reply(const void *p UNNEEDED, struct bitcoin_signature *sig UNNEEDED, struct bitcoin_signature *fee_reserve_sig UNNEEDED)
-{ fprintf(stderr, "fromwire_hsmd_sign_asset_tx_reply called!\n"); abort(); }
 /* Generated stub for fromwire_hsmd_sign_commitment_tx_reply */
 bool fromwire_hsmd_sign_commitment_tx_reply(const void *p UNNEEDED, struct bitcoin_signature *sig UNNEEDED)
 { fprintf(stderr, "fromwire_hsmd_sign_commitment_tx_reply called!\n"); abort(); }
 /* Generated stub for fromwire_hsmd_sign_invoice_reply */
 bool fromwire_hsmd_sign_invoice_reply(const void *p UNNEEDED, secp256k1_ecdsa_recoverable_signature *sig UNNEEDED)
 { fprintf(stderr, "fromwire_hsmd_sign_invoice_reply called!\n"); abort(); }
+/* Generated stub for fromwire_hsmd_sign_tx_reply */
+bool fromwire_hsmd_sign_tx_reply(const void *p UNNEEDED, struct bitcoin_signature *sig UNNEEDED)
+{ fprintf(stderr, "fromwire_hsmd_sign_tx_reply called!\n"); abort(); }
 /* Generated stub for fromwire_onchaind_dev_memleak_reply */
 bool fromwire_onchaind_dev_memleak_reply(const void *p UNNEEDED, bool *leak UNNEEDED)
 { fprintf(stderr, "fromwire_onchaind_dev_memleak_reply called!\n"); abort(); }
@@ -659,12 +649,12 @@ u8 *towire_hsmd_preapprove_keysend_check(const tal_t *ctx UNNEEDED, const struct
 /* Generated stub for towire_hsmd_sign_bolt12 */
 u8 *towire_hsmd_sign_bolt12(const tal_t *ctx UNNEEDED, const wirestring *messagename UNNEEDED, const wirestring *fieldname UNNEEDED, const struct sha256 *merkleroot UNNEEDED, const u8 *publictweak UNNEEDED)
 { fprintf(stderr, "towire_hsmd_sign_bolt12 called!\n"); abort(); }
-/* Generated stub for towire_hsmd_sign_asset_commitment_tx */
-u8 *towire_hsmd_sign_asset_commitment_tx(const tal_t *ctx UNNEEDED, const struct node_id *peer_id UNNEEDED, u64 channel_dbid UNNEEDED, const struct bitcoin_tx *tx UNNEEDED, const struct pubkey *remote_funding_key UNNEEDED, u64 commit_num UNNEEDED, const struct channel_asset *asset UNNEEDED)
-{ fprintf(stderr, "towire_hsmd_sign_asset_commitment_tx called!\n"); abort(); }
 /* Generated stub for towire_hsmd_sign_commitment_tx */
 u8 *towire_hsmd_sign_commitment_tx(const tal_t *ctx UNNEEDED, const struct node_id *peer_id UNNEEDED, u64 channel_dbid UNNEEDED, const struct bitcoin_tx *tx UNNEEDED, const struct pubkey *remote_funding_key UNNEEDED, u64 commit_num UNNEEDED)
 { fprintf(stderr, "towire_hsmd_sign_commitment_tx called!\n"); abort(); }
+/* Generated stub for towire_hsmd_sign_funding_sibling_input */
+u8 *towire_hsmd_sign_funding_sibling_input(const tal_t *ctx UNNEEDED, const struct node_id *peer_id UNNEEDED, u64 channel_dbid UNNEEDED, const struct bitcoin_tx *tx UNNEEDED, const struct pubkey *remote_funding_key UNNEEDED)
+{ fprintf(stderr, "towire_hsmd_sign_funding_sibling_input called!\n"); abort(); }
 /* Generated stub for towire_hsmd_sign_invoice */
 u8 *towire_hsmd_sign_invoice(const tal_t *ctx UNNEEDED, const u8 *u5bytes UNNEEDED, const u8 *hrp UNNEEDED)
 { fprintf(stderr, "towire_hsmd_sign_invoice called!\n"); abort(); }

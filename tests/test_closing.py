@@ -3543,6 +3543,76 @@ def test_onchaind_rescan_htlc_success(node_factory, bitcoind, executor):
     l2.daemon.wait_for_log('Resolved OUR_HTLC_SUCCESS_TX/DELAYED_OUTPUT_TO_US by our proposal OUR_DELAYED_RETURN_TO_WALLET')
 
 
+@unittest.skipIf(TEST_NETWORK != 'regtest', 'elementsd anchors not supported')
+def test_onchaind_replay_tx_spending_two_watched(node_factory, bitcoind):
+    """l1's HTLC-timeout tx takes its own to_local sweep output (the only coin
+    its wallet has) as its fee input, so it spends two outputs onchaind
+    watches, and onchaind only cares about the HTLC one.  Restarted after the
+    sweep of the HTLC-timeout output, onchaind's replay must still see that
+    sweep and finish: replay used to drop its watch on the whole HTLC-timeout
+    tx as soon as onchaind said it didn't care about one of its inputs."""
+    # l2 hangs up instead of failing an HTLC it doesn't know, which stays
+    # in flight.
+    l1, l2 = node_factory.get_nodes(2, opts=[{}, {'disconnect': ['-WIRE_UPDATE_FAIL_HTLC']}])
+    l1.fundwallet(10**6)
+    l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
+    l1.rpc.fundchannel(l2.info['id'], 'all')
+    bitcoind.generate_block(6, wait_for_mempool=1)
+    wait_for(lambda: only_one(l1.rpc.listpeerchannels()['channels'])['state'] == 'CHANNELD_NORMAL')
+    # What's left is the emergency reserve for anchors: reserve it, so the
+    # to_local sweep is the only coin for the HTLC-timeout tx's fee.
+    reserve = only_one(l1.rpc.listfunds()['outputs'])
+    psbt = bitcoind.rpc.createpsbt([{'txid': reserve['txid'], 'vout': reserve['output']}],
+                                   [{bitcoind.rpc.getnewaddress(): 0.0001}])
+    l1.rpc.reserveinputs(psbt, reserve=1000)
+    assert only_one(l1.rpc.listfunds()['outputs'])['reserved']
+
+    l1.rpc.pay(l2.rpc.invoice(100_000_000, 'r', 'r')['bolt11'])
+    payment_hash = '03' * 32
+    chan = only_one(l1.rpc.listpeerchannels()['channels'])
+    # It expires well after l1's to_local delay.
+    route = [{'id': l2.info['id'], 'channel': chan['short_channel_id'],
+              'amount_msat': 40_000_000, 'delay': 30}]
+    l1.rpc.sendpay(route, payment_hash, payment_secret='03' * 32, amount_msat=40_000_000)
+    l2.daemon.wait_for_log('dev_disconnect: -WIRE_UPDATE_FAIL_HTLC')
+    wait_for(lambda: not only_one(l1.rpc.listpeerchannels()['channels'])['peer_connected'])
+
+    commit = only_one(l1.rpc.close(l2.info['id'], unilateraltimeout=1)['txids'])
+    bitcoind.generate_block(1, wait_for_mempool=commit)
+
+    # onchaind asks for both at once (in either order).
+    (_, sweep, blocks), _ = l1.wait_for_onchaind_txs(
+        ('OUR_DELAYED_RETURN_TO_WALLET', 'OUR_UNILATERAL/DELAYED_OUTPUT_TO_US'),
+        ('OUR_HTLC_TIMEOUT_TX', 'OUR_UNILATERAL/OUR_HTLC'))
+    bitcoind.generate_block(blocks)
+    sweep = l1.mine_txid_or_rbf(sweep)
+    l1.daemon.wait_for_log('Resolved OUR_UNILATERAL/DELAYED_OUTPUT_TO_US by our proposal')
+
+    # Mine to the HTLC's expiry: its timeout tx gets the sweep's output as
+    # fee input (an RBF of the zero-fee one onchaind made).
+    resolved = r'Resolved OUR_UNILATERAL/OUR_HTLC by our proposal OUR_HTLC_TIMEOUT_TX \(([0-9a-f]{64})\)'
+    for _ in range(40):
+        if l1.daemon.is_in_log(resolved):
+            break
+        bitcoind.generate_block(1)
+        sync_blockheight(bitcoind, [l1])
+    htlc_tx = re.search(resolved, l1.daemon.wait_for_log(resolved)).group(1)
+    spends = [(i['txid'], i['vout']) for i in bitcoind.rpc.getrawtransaction(htlc_tx, True)['vin']]
+    # The precondition: it spends the HTLC and the to_local sweep's output.
+    assert len(spends) == 2 and spends[0][0] == commit and spends[1][0] == sweep, spends
+
+    _, second, blocks = l1.wait_for_onchaind_tx('OUR_DELAYED_RETURN_TO_WALLET',
+                                                'OUR_HTLC_TIMEOUT_TX/DELAYED_OUTPUT_TO_US')
+    bitcoind.generate_block(blocks)
+    l1.mine_txid_or_rbf(second)
+    bitcoind.generate_block(3)
+    sync_blockheight(bitcoind, [l1])
+
+    l1.restart()
+    bitcoind.generate_block(100)
+    l1.daemon.wait_for_log('onchaind complete, forgetting peer')
+
+
 def test_permfail_htlc_out(node_factory, bitcoind, executor):
     # Test case where we fail with unsettled outgoing HTLC.
     disconnects = ['+WIRE_REVOKE_AND_ACK', 'permfail']

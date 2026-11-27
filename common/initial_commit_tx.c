@@ -152,9 +152,11 @@ struct bitcoin_tx *initial_commit_tx(const tal_t *ctx,
 	 */
 	if (asset) {
 		/* The fee reserve pays the anchors, and whatever is left is
-		 * the fee: nothing comes out of the opener's asset balance. */
-		if (!amount_sat_greater(asset->fee_reserve, base_fee)) {
-			*err_reason = "Fee reserve cannot afford anchor outputs";
+		 * the fee: nothing comes out of the opener's asset balance.
+		 * (base_fee is 0 for asset channels: commit_tx_base_fee.) */
+		if (!amount_sat_greater(asset->fee_reserve, AMOUNT_SAT(660))) {
+			*err_reason = "Fee reserve must be more than the two"
+				" anchors (660 sat)";
 			return NULL;
 		}
 	} else if (!try_subtract_fee(opener, side, base_fee, &self_pay, &other_pay)) {
@@ -363,4 +365,30 @@ struct bitcoin_tx *initial_commit_tx(const tal_t *ctx,
 	assert(bitcoin_tx_check(tx));
 
 	return tx;
+}
+
+/* Elements' default minrelaytxfee, 0.1 sat/vB, in sat per 1000 weight. */
+#define ASSET_RELAY_FLOOR_PERKW 25
+
+size_t asset_commit_max_htlcs(const struct channel_asset *asset)
+{
+	struct amount_sat fee;
+	size_t n;
+
+	/* The reserve pays both anchors; the rest is the fee. */
+	if (!amount_sat_sub(&fee, asset->fee_reserve, AMOUNT_SAT(660)))
+		return 0;
+	for (n = 0; n <= 2 * 483; n++) {
+		/* The base weight counts the funding input; the reserve
+		 * input adds its outpoint, sequence and 2-of-2 witness. */
+		size_t weight = commit_tx_base_weight(n, false, true)
+			+ 4 * (32 + 4 + 1 + 4) + (1 + 1 + 73 + 73 + 1 + 71)
+			+ elements_tx_overhead(chainparams, 2, 0)
+			- elements_tx_overhead(chainparams, 1, 0);
+		if (amount_sat_greater(amount_tx_fee(ASSET_RELAY_FLOOR_PERKW,
+						     weight),
+				       fee))
+			break;
+	}
+	return n == 0 ? 0 : n - 1;
 }

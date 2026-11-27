@@ -44,6 +44,10 @@ static inline const u8 *channel_asset_tag(const struct channel_asset *asset)
 	return asset ? asset->tag : NULL;
 }
 
+/* Can a channel be in this asset: an explicit tag (0x01 prefix), not the
+ * chain's fee asset (that's an ordinary channel)? */
+bool channel_asset_tag_valid(const u8 *tag, size_t len);
+
 /* Same asset (NULL meaning the chain's own coin)? */
 bool channel_asset_eq(const struct channel_asset *a,
 		      const struct channel_asset *b);
@@ -94,12 +98,20 @@ bool check_fee_reserve_sig(struct bitcoin_tx *tx,
 			   const struct pubkey *their_funding_pubkey,
 			   const secp256k1_ecdsa_signature *sig);
 
+/* Both sides' `dust_limit_satoshis` in an asset channel: one unit.  Elements
+ * has no dust rule for issued assets, and a trimmed HTLC can't go to the
+ * miners as on Bitcoin (the asset pays no fees), so no HTLC worth a unit is
+ * trimmed: it always gets its output, and no side can profit from making
+ * the other's HTLCs dust. */
+#define ASSET_DUST_LIMIT AMOUNT_SAT(1)
+
 /* Finish an asset channel transaction's outputs (before they get sorted):
  * the asset can't pay fees, so the asset outputs must add up to the asset
- * funding amount.  Whatever isn't paid out (trimmed HTLCs, msat rounding)
- * tops up the opener's direct output at @opener_outnum, or the other side's
- * at @other_outnum if the opener has none (-1).  The L-BTC that the outputs
- * don't use (the reserve minus the anchors) is the fee. */
+ * funding amount.  Whatever isn't paid out (less than a unit per balance
+ * and HTLC: msat rounding) tops up the opener's direct output at
+ * @opener_outnum, or the other side's at @other_outnum if the opener has
+ * none (-1).  The L-BTC that the outputs don't use (the reserve minus the
+ * anchors) is the fee. */
 void channel_asset_finish_tx(struct bitcoin_tx *tx,
 			     const struct channel_asset *asset,
 			     struct amount_sat funding_sats,

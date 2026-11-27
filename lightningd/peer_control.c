@@ -253,39 +253,35 @@ static struct bitcoin_tx *sign_last_tx(const tal_t *ctx,
 {
 	struct lightningd *ld = channel->peer->ld;
 	struct bitcoin_signature sig, reserve_sig, *their_reserve_sig;
-	bool ok;
 	const u8 *msg;
 	u8 **witness;
 	u64 commit_index = channel->next_index[LOCAL] - 1;
 	struct bitcoin_tx *tx = clone_bitcoin_tx(ctx, last_tx);
 
 	assert(!tx->wtx->inputs[0].witness);
-	if (channel->asset)
-		msg = towire_hsmd_sign_asset_commitment_tx(NULL,
-							   &channel->peer->id,
-							   channel->dbid,
-							   tx,
-							   &channel->channel_info
-							   .remote_fundingkey,
-							   commit_index,
-							   channel->asset);
-	else
-		msg = towire_hsmd_sign_commitment_tx(NULL,
-						     &channel->peer->id,
-						     channel->dbid,
-						     tx,
-						     &channel->channel_info
-						     .remote_fundingkey,
-						     commit_index);
-
+	msg = towire_hsmd_sign_commitment_tx(NULL,
+					     &channel->peer->id,
+					     channel->dbid,
+					     tx,
+					     &channel->channel_info
+					     .remote_fundingkey,
+					     commit_index);
 	msg = hsm_sync_req(tmpctx, ld, take(msg));
-	if (channel->asset)
-		ok = fromwire_hsmd_sign_asset_tx_reply(msg, &sig, &reserve_sig);
-	else
-		ok = fromwire_hsmd_sign_commitment_tx_reply(msg, &sig);
-	if (!ok)
+	if (!fromwire_hsmd_sign_commitment_tx_reply(msg, &sig))
 		fatal("HSM gave bad sign_commitment_tx_reply %s",
 		      tal_hex(tmpctx, msg));
+	if (channel->asset) {
+		msg = towire_hsmd_sign_funding_sibling_input(NULL,
+							     &channel->peer->id,
+							     channel->dbid,
+							     tx,
+							     &channel->channel_info
+							     .remote_fundingkey);
+		msg = hsm_sync_req(tmpctx, ld, take(msg));
+		if (!fromwire_hsmd_sign_tx_reply(msg, &reserve_sig))
+			fatal("HSM gave bad sign_funding_sibling_input reply %s",
+			      tal_hex(tmpctx, msg));
+	}
 
 	/* Asset channel txs also spend the fee reserve (input 1).  hsmd
 	 * signed it for us; the peer's signature is in the PSBT, where
@@ -876,7 +872,10 @@ static struct amount_sat commit_txfee(const struct channel *channel,
 				 num_untrimmed_htlcs + 1,
 				 option_anchor_outputs, option_anchors_zero_fee_htlc_tx);
 
-	if (option_anchor_outputs || option_anchors_zero_fee_htlc_tx) {
+	/* (Asset channels: the fee reserve pays the anchors, not the
+	 * funder's balance, which is in the asset.) */
+	if ((option_anchor_outputs || option_anchors_zero_fee_htlc_tx)
+	    && !channel->asset) {
 		/* BOLT #3:
 		 * If `option_anchors` applies to the commitment
 		 * transaction, also subtract two times the fixed anchor size
@@ -3022,6 +3021,14 @@ static void json_add_scb(struct command *cmd,
 	scb->tlvs->basepoints = &c->channel_info.theirbase;
 	scb->tlvs->opener = &c->opener;
 	scb->tlvs->remote_to_self_delay = &c->channel_info.their_config.to_self_delay;
+	if (c->asset) {
+		scb->tlvs->asset_channel
+			= tal(scb->tlvs, struct tlv_scb_tlvs_asset_channel);
+		scb->tlvs->asset_channel->asset = *c->asset;
+		scb->tlvs->asset_channel->close_script
+			= tal_dup_talarr(scb->tlvs->asset_channel, u8,
+					 c->shutdown_scriptpubkey[LOCAL]);
+	}
 
 	towire_modern_scb_chan(&scb_wire, scb);
 

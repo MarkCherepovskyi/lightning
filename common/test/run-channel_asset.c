@@ -125,6 +125,59 @@ static void test_explicit(void)
 	chainparams = chainparams_for_network("liquid-regtest");
 }
 
+/* An explicit asset with a confidential value is as unknown as a blinded
+ * output: its value commitment is never read as an amount, and its tag
+ * never matches L-BTC (or a channel asset). */
+static void test_confidential_value_amount(void)
+{
+	struct wally_tx_output out;
+	struct amount_asset amt;
+	u8 asset[ELEMENTS_ASSET_LEN], value[33];
+
+	memcpy(asset, chainparams->fee_asset_tag, sizeof(asset));
+	memset(value, 0xff, sizeof(value));
+	memset(&out, 0, sizeof(out));
+	out.asset = asset;
+	out.asset_len = sizeof(asset);
+	out.value = value;
+
+	/* Explicit: 0x01 and 8 bytes big-endian. */
+	value[0] = 0x01;
+	memset(value + 1, 0, 8);
+	value[8] = 0xe8;
+	value[7] = 0x03;
+	out.value_len = 9;
+	amt = wally_tx_output_get_amount(&out);
+	assert(amount_asset_is_main(&amt));
+	assert(amt.value == 1000);
+
+	/* Confidential: a 33-byte commitment, whatever its bytes say. */
+	memset(value, 0xff, sizeof(value));
+	value[0] = 0x08;
+	out.value_len = 33;
+	amt = wally_tx_output_get_amount(&out);
+	assert(!amount_asset_is_main(&amt));
+	assert(amt.value == 0);
+	assert(!channel_asset_tag_eq(amt.asset, chainparams->fee_asset_tag));
+}
+
+static void test_tag_valid(void)
+{
+	u8 tag[ELEMENTS_ASSET_LEN];
+
+	memset(tag, 0x42, sizeof(tag));
+	tag[0] = 0x01;
+	assert(channel_asset_tag_valid(tag, sizeof(tag)));
+	/* Wrong length. */
+	assert(!channel_asset_tag_valid(tag, sizeof(tag) - 1));
+	/* Not explicit (a blinded asset commitment's prefix). */
+	tag[0] = 0x0a;
+	assert(!channel_asset_tag_valid(tag, sizeof(tag)));
+	/* The fee asset is an ordinary channel's, not an asset channel's. */
+	assert(!channel_asset_tag_valid(chainparams->fee_asset_tag,
+					ELEMENTS_ASSET_LEN));
+}
+
 static void test_finish_tx(void)
 {
 	const u8 *tag = channel_asset_from_hex(tmpctx, ID, strlen(ID));
@@ -139,7 +192,7 @@ static void test_finish_tx(void)
 
 	/* A 100000-unit channel: 60000 to the opener (output 0), 39000 to
 	 * the other side (1), an anchor in the chain's coin (2), and 1000
-	 * units of trimmed HTLCs unpaid. */
+	 * units unpaid. */
 	tx = bitcoin_tx(tmpctx, chainparams, 2, 4, 0);
 	bitcoin_tx_add_asset_output(tx, script, NULL, AMOUNT_SAT(60000), tag);
 	bitcoin_tx_add_asset_output(tx, script, NULL, AMOUNT_SAT(39000), tag);
@@ -187,6 +240,8 @@ int main(int argc, char *argv[])
 	test_wire();
 	test_fee_reserve_outpoint();
 	test_explicit();
+	test_confidential_value_amount();
+	test_tag_valid();
 	test_finish_tx();
 
 	common_shutdown();

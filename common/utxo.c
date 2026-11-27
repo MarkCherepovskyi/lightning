@@ -1,5 +1,12 @@
 #include "config.h"
+#include <bitcoin/chainparams.h>
+#include <common/utils.h>
 #include <common/utxo.h>
+
+bool utxo_is_unsignable(const struct utxo *utxo)
+{
+	return chainparams->is_elements && utxo->utxotype == UTXO_P2TR;
+}
 
 size_t utxo_spend_weight(const struct utxo *utxo, size_t min_witness_weight)
 {

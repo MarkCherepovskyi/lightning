@@ -20,6 +20,13 @@ struct bitcoin_tx_output *new_tx_output(const tal_t *ctx,
 	return output;
 }
 
+/* Elements: in @asset (33-byte explicit tag; NULL means the chain's fee
+ * asset). */
+static struct wally_tx_output *wally_tx_output_asset(const tal_t *ctx,
+						     const u8 *script,
+						     struct amount_sat amount,
+						     const u8 *asset);
+
 struct wally_tx_output *wally_tx_output(const tal_t *ctx,
 					const u8 *script,
 					struct amount_sat amount)
@@ -27,10 +34,10 @@ struct wally_tx_output *wally_tx_output(const tal_t *ctx,
 	return wally_tx_output_asset(ctx, script, amount, NULL);
 }
 
-struct wally_tx_output *wally_tx_output_asset(const tal_t *ctx,
-					      const u8 *script,
-					      struct amount_sat amount,
-					      const u8 *asset)
+static struct wally_tx_output *wally_tx_output_asset(const tal_t *ctx,
+						     const u8 *script,
+						     struct amount_sat amount,
+						     const u8 *asset)
 {
 	u64 satoshis = amount.satoshis; /* Raw: wally API */
 	struct wally_tx_output *output;
@@ -862,10 +869,18 @@ wally_tx_output_get_amount(const struct wally_tx_output *output)
 		/* We currently only support explicit value
 		 * asset tags, others are confidential, so
 		 * don't even try to assign a value to it. */
-		if (output->asset[0] == 0x01) {
+		if (output->asset[0] == 0x01
+		    && output->value_len == 9 && output->value[0] == 0x01) {
 			memcpy(&raw, output->value + 1, sizeof(raw));
 			amount.value = be64_to_cpu(raw);
 		} else {
+			/* An explicit asset with a confidential value
+			 * (a commitment, not 0x01 + 8 bytes) is as
+			 * unknown to us as a blinded one: never read
+			 * the commitment as an amount, and never let
+			 * the tag match L-BTC or a channel asset. */
+			if (output->asset[0] == 0x01)
+				memset(&amount.asset, 0, sizeof(amount.asset));
 			amount.value = 0;
 		}
 	} else {
@@ -967,8 +982,11 @@ size_t bitcoin_tx_input_witness_weight(enum utxotype utxotype)
 		 * to `1` and witness: <remote_sig>
 		 * Otherwise, this output is a simple P2WPKH to `remotepubkey`.
 		 */
-		/* In practice, these predate anchors, so: */
-		return 1 + 1 + bitcoin_tx_input_sig_weight();
+		/* We only use this type for the anchor variant, and being
+		 * P2WSH its witness also carries the script itself:
+		 * a 33-byte key push, OP_CHECKSIGVERIFY, OP_1 and
+		 * OP_CHECKSEQUENCEVERIFY. */
+		return bitcoin_tx_input_sig_weight() + 1 + (1 + 33 + 1 + 1 + 1);
 	case UTXO_P2TR:
 		return 1 + 64;
 	}

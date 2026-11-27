@@ -155,7 +155,6 @@ static void send_offer(struct per_peer_state *pps,
 {
 	struct bitcoin_tx *tx;
 	struct bitcoin_signature our_sig, our_reserve_sig;
-	bool ok;
 	struct tlv_closing_signed_tlvs *close_tlvs;
 	u8 *msg;
 
@@ -191,25 +190,27 @@ static void send_offer(struct per_peer_state *pps,
 	 *   - MAY eliminate its own output.
 	 */
 	/* (We don't do this). */
-	if (chan_asset)
-		msg = towire_hsmd_sign_asset_mutual_close_tx(NULL, tx,
-							     &funding_pubkey[REMOTE],
-							     chan_asset);
-	else
-		msg = towire_hsmd_sign_mutual_close_tx(NULL,
-						       tx,
-						       &funding_pubkey[REMOTE]);
+	msg = towire_hsmd_sign_mutual_close_tx(NULL,
+					       tx,
+					       &funding_pubkey[REMOTE]);
 	wire_sync_write(HSM_FD, take(msg));
 	msg = wire_sync_read(tmpctx, HSM_FD);
-	if (chan_asset)
-		ok = fromwire_hsmd_sign_asset_tx_reply(msg, &our_sig,
-						       &our_reserve_sig);
-	else
-		ok = fromwire_hsmd_sign_tx_reply(msg, &our_sig);
-	if (!ok)
+	if (!fromwire_hsmd_sign_tx_reply(msg, &our_sig))
 		status_failed(STATUS_FAIL_HSM_IO,
 			      "Bad hsm_sign_mutual_close_tx reply %s",
 			      tal_hex(tmpctx, msg));
+	/* Asset channels: and the fee reserve input (input 1). */
+	if (chan_asset) {
+		msg = towire_hsmd_sign_funding_sibling_input(NULL, NULL, 0,
+							     tx,
+							     &funding_pubkey[REMOTE]);
+		wire_sync_write(HSM_FD, take(msg));
+		msg = wire_sync_read(tmpctx, HSM_FD);
+		if (!fromwire_hsmd_sign_tx_reply(msg, &our_reserve_sig))
+			status_failed(STATUS_FAIL_HSM_IO,
+				      "Bad sign_funding_sibling_input reply %s",
+				      tal_hex(tmpctx, msg));
+	}
 
 	status_debug("sending fee offer %s",
 		     fmt_amount_sat(tmpctx, fee_to_offer));
@@ -344,6 +345,15 @@ receive_offer(struct per_peer_state *pps,
 
 	if (!check_tx_sig(tx, 0, NULL, funding_wscript,
 			  &funding_pubkey[REMOTE], &their_sig)) {
+		/* Asset channels (common/channel_asset.h) have no "trimmed"
+		 * variant: their output's asset couldn't go to the fee (that's
+		 * L-BTC, from the reserve), so a close without it doesn't
+		 * balance. */
+		if (chan_asset)
+			peer_failed_warn(pps, channel_id,
+					 "Bad closing_signed signature for %s",
+					 fmt_bitcoin_tx(tmpctx, tx));
+
 		/* Trim it by reducing their output to minimum */
 		struct bitcoin_tx *trimmed;
 		struct amount_sat trimming_out[NUM_SIDES];

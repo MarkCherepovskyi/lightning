@@ -382,8 +382,9 @@ struct bitcoin_tx *commit_tx(const tal_t *ctx,
 		redeem = NULL;
 	}
 
-	/* Asset channel: the asset leftovers (trimmed HTLCs, rounding) go to
-	 * the opener, not to fees. */
+	/* Asset channel: the asset can't pay fees, so the leftover rounding
+	 * goes to the opener (no HTLC worth a unit is trimmed:
+	 * ASSET_DUST_LIMIT). */
 	if (asset)
 		channel_asset_finish_tx(tx, asset, funding_sats,
 					outnum[opener], outnum[!opener]);

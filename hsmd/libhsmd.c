@@ -119,7 +119,6 @@ bool hsmd_check_client_capabilities(struct hsmd_client *client,
 		return (client->capabilities & HSM_PERM_COMMITMENT_POINT) != 0;
 
 	case WIRE_HSMD_SIGN_REMOTE_COMMITMENT_TX:
-	case WIRE_HSMD_SIGN_ASSET_REMOTE_COMMITMENT_TX:
 	case WIRE_HSMD_SIGN_REMOTE_HTLC_TX:
 	case WIRE_HSMD_VALIDATE_COMMITMENT_TX:
 	case WIRE_HSMD_REVOKE_COMMITMENT_TX:
@@ -127,8 +126,13 @@ bool hsmd_check_client_capabilities(struct hsmd_client *client,
 		return (client->capabilities & HSM_PERM_SIGN_REMOTE_TX) != 0;
 
 	case WIRE_HSMD_SIGN_MUTUAL_CLOSE_TX:
-	case WIRE_HSMD_SIGN_ASSET_MUTUAL_CLOSE_TX:
 		return (client->capabilities & HSM_PERM_SIGN_CLOSING_TX) != 0;
+
+	/* With the transaction whose input 0 the client may sign. */
+	case WIRE_HSMD_SIGN_FUNDING_SIBLING_INPUT:
+		return (client->capabilities & (HSM_PERM_SIGN_REMOTE_TX
+						| HSM_PERM_SIGN_CLOSING_TX
+						| HSM_PERM_MASTER)) != 0;
 
 	case WIRE_HSMD_SIGN_SPLICE_TX:
 		return (client->capabilities & HSM_PERM_SIGN_SPLICE_TX) != 0;
@@ -149,7 +153,6 @@ bool hsmd_check_client_capabilities(struct hsmd_client *client,
 	case WIRE_HSMD_SIGN_WITHDRAWAL:
 	case WIRE_HSMD_SIGN_INVOICE:
 	case WIRE_HSMD_SIGN_COMMITMENT_TX:
-	case WIRE_HSMD_SIGN_ASSET_COMMITMENT_TX:
 	case WIRE_HSMD_GET_CHANNEL_BASEPOINTS:
 	case WIRE_HSMD_DEV_MEMLEAK:
 	case WIRE_HSMD_SIGN_MESSAGE:
@@ -191,7 +194,6 @@ bool hsmd_check_client_capabilities(struct hsmd_client *client,
 	case WIRE_HSMD_INIT_REPLY_FAILURE:
 	case WIRE_HSMSTATUS_CLIENT_BAD_REQUEST:
 	case WIRE_HSMD_SIGN_COMMITMENT_TX_REPLY:
-	case WIRE_HSMD_SIGN_ASSET_TX_REPLY:
 	case WIRE_HSMD_VALIDATE_COMMITMENT_TX_REPLY:
 	case WIRE_HSMD_REVOKE_COMMITMENT_TX_REPLY:
 	case WIRE_HSMD_VALIDATE_REVOCATION_REPLY:
@@ -676,11 +678,14 @@ static u8 *handle_sign_to_us_tx(struct hsmd_client *c, const u8 *msg_in,
 		return hsmd_status_bad_request(c, msg_in,
 					       "bad pubkey_from_privkey");
 
-	/* Asset channels (common/channel_asset.h): an output in an asset
-	 * can't pay the fee, so we sign it with just its output, and whoever
-	 * broadcasts adds the L-BTC that does. */
-	if (!psbt_input_in_fee_asset(tx->psbt, input_num))
-		sighash_type = SIGHASH_SINGLE | SIGHASH_ANYONECANPAY;
+	/* One input, as upstream: except for an asset channel's sweep of an
+	 * asset output (common/channel_asset.h), which can't pay its own fee:
+	 * lightningd adds L-BTC inputs from its wallet (signed like a
+	 * withdrawal).  SIGHASH_ALL either way, so the signature commits to
+	 * every input and output. */
+	if (tx->wtx->num_inputs != 1
+	    && psbt_input_in_fee_asset(tx->psbt, input_num))
+		return hsmd_status_bad_request(c, msg_in, "bad txinput count");
 
 	sign_tx_input(tx, input_num, NULL, wscript, privkey, &pubkey,
 		      sighash_type, &sig);
@@ -1427,115 +1432,69 @@ static u8 *handle_sign_withdrawal_tx(struct hsmd_client *c, const u8 *msg_in)
 	return towire_hsmd_sign_withdrawal_reply(NULL, psbt);
 }
 
-/* Asset channels (common/channel_asset.h): sign input 0 (the funding
- * output) of a commitment or mutual close tx with our funding key, and
- * input 1, the fee reserve (the output after the funding one, same
- * 2-of-2). */
-static u8 *sign_asset_funding_inputs(struct hsmd_client *c, const u8 *msg_in,
-				     const struct node_id *peer_id, u64 dbid,
-				     struct bitcoin_tx *tx,
-				     const struct pubkey *remote_funding_pubkey,
-				     const struct channel_asset *asset)
+/* A channel tx spends the funding output, and maybe the output right after
+ * it, to the same 2-of-2 (an asset channel's fee reserve,
+ * common/channel_asset.h): input 0, and input 1 if there is one. */
+static bool spends_funding_and_sibling(const struct bitcoin_tx *tx)
 {
+	struct bitcoin_outpoint funding, sibling;
+
+	if (tx->wtx->num_inputs == 1)
+		return true;
+	/* Only Elements has asset channels: elsewhere, one input as upstream.
+	 * (The global chainparams, from hsmd_init: a client's own may be
+	 * unset.) */
+	if (tx->wtx->num_inputs != 2 || !chainparams || !is_elements(chainparams))
+		return false;
+	bitcoin_tx_input_get_outpoint(tx, 0, &funding);
+	bitcoin_tx_input_get_outpoint(tx, 1, &sibling);
+	return bitcoin_txid_eq(&funding.txid, &sibling.txid)
+		&& sibling.n == funding.n + 1;
+}
+
+/* Input 1 of such a tx, with the same funding key as input 0. */
+static u8 *handle_sign_funding_sibling_input(struct hsmd_client *c,
+					     const u8 *msg_in)
+{
+	struct pubkey remote_funding_pubkey, local_funding_pubkey;
+	struct node_id *peer_id;
+	u64 dbid;
+	struct bitcoin_tx *tx;
 	struct secret channel_seed;
 	struct secrets secrets;
-	struct pubkey local_funding_pubkey;
 	const u8 *funding_wscript;
-	struct bitcoin_signature sig, reserve_sig;
-	struct bitcoin_outpoint funding, reserve, expected;
+	struct bitcoin_signature sig;
 
+	if (!fromwire_hsmd_sign_funding_sibling_input(tmpctx, msg_in,
+						      &peer_id, &dbid, &tx,
+						      &remote_funding_pubkey))
+		return hsmd_status_malformed_request(c, msg_in);
 	tx->chainparams = c->chainparams;
-	if (tx->wtx->num_inputs != 2)
+	/* A channel's client signs for its own channel only. */
+	if (!(c->capabilities & HSM_PERM_MASTER)) {
+		peer_id = &c->id;
+		dbid = c->dbid;
+	} else if (!peer_id)
+		return hsmd_status_bad_request(c, msg_in, "no peer_id");
+	if (tx->wtx->num_inputs != 2 || !spends_funding_and_sibling(tx))
 		return hsmd_status_bad_request(c, msg_in,
-					       "tx must have 2 inputs");
+					       "input 1 must spend the output"
+					       " after input 0's");
 	if (tx->wtx->num_outputs == 0)
 		return hsmd_status_bad_request(c, msg_in,
 					       "tx must have > 0 outputs");
-	bitcoin_tx_input_get_outpoint(tx, 0, &funding);
-	bitcoin_tx_input_get_outpoint(tx, 1, &reserve);
-	expected = fee_reserve_outpoint(&funding);
-	if (!bitcoin_outpoint_eq(&reserve, &expected)
-	    || !amount_sat_eq(psbt_input_get_amount(tx->psbt, 1),
-			      asset->fee_reserve))
-		return hsmd_status_bad_request(c, msg_in,
-					       "input 1 is not the fee reserve");
 
 	get_channel_seed(peer_id, dbid, &channel_seed);
 	derive_basepoints(&channel_seed,
 			  &local_funding_pubkey, NULL, &secrets, NULL);
 	funding_wscript = bitcoin_redeem_2of2(tmpctx,
 					      &local_funding_pubkey,
-					      remote_funding_pubkey);
-	sign_tx_input(tx, 0, NULL, funding_wscript,
+					      &remote_funding_pubkey);
+	sign_tx_input(tx, 1, NULL, funding_wscript,
 		      &secrets.funding_privkey, &local_funding_pubkey,
 		      SIGHASH_ALL, &sig);
 	check_overgrind(&sig);
-	sign_tx_input(tx, 1, NULL, funding_wscript,
-		      &secrets.funding_privkey, &local_funding_pubkey,
-		      SIGHASH_ALL, &reserve_sig);
-	check_overgrind(&reserve_sig);
-
-	return towire_hsmd_sign_asset_tx_reply(NULL, &sig, &reserve_sig);
-}
-
-/* hsmd_sign_commitment_tx, for an asset channel. */
-static u8 *handle_sign_asset_commitment_tx(struct hsmd_client *c,
-					   const u8 *msg_in)
-{
-	struct pubkey remote_funding_pubkey;
-	struct node_id peer_id;
-	u64 dbid, commit_num;
-	struct bitcoin_tx *tx;
-	struct channel_asset asset;
-
-	if (!fromwire_hsmd_sign_asset_commitment_tx(tmpctx, msg_in,
-						    &peer_id, &dbid, &tx,
-						    &remote_funding_pubkey,
-						    &commit_num, &asset))
-		return hsmd_status_malformed_request(c, msg_in);
-	return sign_asset_funding_inputs(c, msg_in, &peer_id, dbid, tx,
-					 &remote_funding_pubkey, &asset);
-}
-
-/* hsmd_sign_remote_commitment_tx, for an asset channel. */
-static u8 *handle_sign_asset_remote_commitment_tx(struct hsmd_client *c,
-						  const u8 *msg_in)
-{
-	struct pubkey remote_funding_pubkey, remote_per_commit;
-	bool option_static_remotekey;
-	u64 commit_num;
-	struct hsm_htlc *htlc;
-	u32 feerate;
-	struct bitcoin_tx *tx;
-	struct channel_asset asset;
-
-	if (!fromwire_hsmd_sign_asset_remote_commitment_tx(tmpctx, msg_in,
-							   &tx,
-							   &remote_funding_pubkey,
-							   &remote_per_commit,
-							   &option_static_remotekey,
-							   &commit_num,
-							   &htlc, &feerate,
-							   &asset))
-		return hsmd_status_malformed_request(c, msg_in);
-	return sign_asset_funding_inputs(c, msg_in, &c->id, c->dbid, tx,
-					 &remote_funding_pubkey, &asset);
-}
-
-/* hsmd_sign_mutual_close_tx, for an asset channel. */
-static u8 *handle_sign_asset_mutual_close_tx(struct hsmd_client *c,
-					     const u8 *msg_in)
-{
-	struct pubkey remote_funding_pubkey;
-	struct bitcoin_tx *tx;
-	struct channel_asset asset;
-
-	if (!fromwire_hsmd_sign_asset_mutual_close_tx(tmpctx, msg_in, &tx,
-						      &remote_funding_pubkey,
-						      &asset))
-		return hsmd_status_malformed_request(c, msg_in);
-	return sign_asset_funding_inputs(c, msg_in, &c->id, c->dbid, tx,
-					 &remote_funding_pubkey, &asset);
+	return towire_hsmd_sign_tx_reply(NULL, &sig);
 }
 
 /* This is used by closingd to sign off on a mutual close tx. */
@@ -1665,23 +1624,22 @@ static u8 *do_sign_local_htlc_tx(struct hsmd_client *c,
 		return hsmd_status_bad_request_fmt(c, msg_in,
 						   "bad pubkey_from_privkey");
 
-	if (tx->wtx->num_inputs != 1)
+	/* With anchors, lightningd adds our wallet inputs to pay the fee
+	 * (upstream efdfcc6da) */
+	if (!option_anchor_outputs && tx->wtx->num_inputs != 1)
 		return hsmd_status_bad_request_fmt(c, msg_in,
 						   "bad txinput count");
 
 	/* FIXME: Check that output script is correct! */
 
-	/* BOLT #3:
-	 * ## HTLC-Timeout and HTLC-Success Transactions
-	 *...
-	 * * if `option_anchors` applies to this commitment transaction,
-	 *   `SIGHASH_SINGLE|SIGHASH_ANYONECANPAY` is used as described in [BOLT #5]
+	/* BOLT #5:
+	 * Otherwise, `SIGHASH_SINGLE|SIGHASH_ANYONECANPAY` MUST be used on the
+	 * HTLC signatures received from the peer, as this allows HTLC transactions to be combined with
+	 * other transactions.  The local signature MUST use `SIGHASH_ALL`, otherwise
+	 * anyone can attach additional inputs and outputs to the tx
 	 */
 	sign_tx_input(tx, input_num, NULL, wscript, &htlc_privkey, &htlc_pubkey,
-		      option_anchor_outputs
-		      ? (SIGHASH_SINGLE|SIGHASH_ANYONECANPAY)
-		      : SIGHASH_ALL,
-		      &sig);
+		      SIGHASH_ALL, &sig);
 	check_overgrind(&sig);
 
 	return towire_hsmd_sign_tx_reply(NULL, &sig);
@@ -1795,9 +1753,10 @@ static u8 *handle_sign_remote_commitment_tx(struct hsmd_client *c, const u8 *msg
 	tx->chainparams = c->chainparams;
 
 	/* Basic sanity checks. */
-	if (tx->wtx->num_inputs != 1)
+	if (!spends_funding_and_sibling(tx))
 		return hsmd_status_bad_request_fmt(c, msg_in,
-						   "tx must have 1 input");
+						   "tx must spend the funding"
+						   " output (and maybe the next)");
 
 	if (tx->wtx->num_outputs == 0)
 		return hsmd_status_bad_request_fmt(c, msg_in,
@@ -1961,8 +1920,8 @@ static u8 *handle_sign_htlc_tx_mingle(struct hsmd_client *c, const u8 *msg_in)
 					       &peer_id, &dbid, &utxos, &psbt))
 		return hsmd_status_malformed_request(c, msg_in);
 
-	/* Sign all the UTXOs (htlc_inout input is already signed with
-	 * SIGHASH_SINGLE|SIGHASH_ANYONECANPAY) */
+	/* Sign all the UTXOs (lightningd gets the htlc input signed
+	 * separately, using hsmd_sign_any_local_htlc_tx) */
 	sign_our_inputs(utxos, psbt);
 
 	return towire_hsmd_sign_htlc_tx_mingle_reply(NULL, psbt);
@@ -1997,9 +1956,10 @@ static u8 *handle_sign_commitment_tx(struct hsmd_client *c, const u8 *msg_in)
 	tx->chainparams = c->chainparams;
 
 	/* Basic sanity checks. */
-	if (tx->wtx->num_inputs != 1)
+	if (!spends_funding_and_sibling(tx))
 		return hsmd_status_bad_request(c, msg_in,
-					       "tx must have 1 input");
+					       "tx must spend the funding"
+					       " output (and maybe the next)");
 
 	if (tx->wtx->num_outputs == 0)
 		return hsmd_status_bad_request_fmt(c, msg_in,
@@ -2140,8 +2100,7 @@ static u8 *do_sign_remote_htlc_to_us(struct hsmd_client *c,
 				     u64 channel_dbid,
 				     const struct pubkey *remote_per_commitment_point,
 				     struct bitcoin_tx *tx,
-				     const u8 *wscript,
-				     bool option_anchor_outputs)
+				     const u8 *wscript)
 {
 	struct secret channel_seed, htlc_basepoint_secret;
 	struct pubkey htlc_basepoint;
@@ -2162,16 +2121,12 @@ static u8 *do_sign_remote_htlc_to_us(struct hsmd_client *c,
 		return hsmd_status_bad_request(c, msg_in,
 					       "Failed deriving htlc privkey");
 
-	/* BOLT #3:
-	 * ## HTLC-Timeout and HTLC-Success Transactions
-	 *...
-	 * * if `option_anchors` applies to this commitment transaction,
-	 *   `SIGHASH_SINGLE|SIGHASH_ANYONECANPAY` is used as described in [BOLT #5]
-	 */
-	return handle_sign_to_us_tx(
-	    c, msg_in, input_num, tx, &privkey, wscript,
-	    option_anchor_outputs ? (SIGHASH_SINGLE | SIGHASH_ANYONECANPAY)
-				  : SIGHASH_ALL);
+	/* This is a direct sweep, not an HTLC tx, and we're the only
+	 * signer, so we use SIGHASH_ALL (upstream efdfcc6da): with
+	 * SIGHASH_SINGLE|SIGHASH_ANYONECANPAY anyone could re-wrap this
+	 * input, and replace or pin our claim against its deadline. */
+	return handle_sign_to_us_tx(c, msg_in, input_num, tx, &privkey, wscript,
+				    SIGHASH_ALL);
 }
 
 /*~ When called by onchaind */
@@ -2190,8 +2145,7 @@ static u8 *handle_sign_remote_htlc_to_us(struct hsmd_client *c,
 
 	return do_sign_remote_htlc_to_us(c, msg_in, 0, &c->id, c->dbid,
 					 &remote_per_commitment_point,
-					 tx, wscript,
-					 option_anchor_outputs);
+					 tx, wscript);
 }
 
 /*~ When called by lightningd */
@@ -2213,8 +2167,7 @@ static u8 *handle_sign_any_remote_htlc_to_us(struct hsmd_client *c,
 
 	return do_sign_remote_htlc_to_us(c, msg_in, input_num, &peer_id, dbid,
 					 &remote_per_commitment_point,
-					 tx, wscript,
-					 option_anchor_outputs);
+					 tx, wscript);
 }
 
 /*~ When we send a commitment transaction onchain (unilateral close), there's
@@ -2405,12 +2358,8 @@ u8 *hsmd_handle_client_message(const tal_t *ctx, struct hsmd_client *client,
 		return handle_sign_penalty_to_us(client, msg);
 	case WIRE_HSMD_SIGN_COMMITMENT_TX:
 		return handle_sign_commitment_tx(client, msg);
-	case WIRE_HSMD_SIGN_ASSET_COMMITMENT_TX:
-		return handle_sign_asset_commitment_tx(client, msg);
-	case WIRE_HSMD_SIGN_ASSET_REMOTE_COMMITMENT_TX:
-		return handle_sign_asset_remote_commitment_tx(client, msg);
-	case WIRE_HSMD_SIGN_ASSET_MUTUAL_CLOSE_TX:
-		return handle_sign_asset_mutual_close_tx(client, msg);
+	case WIRE_HSMD_SIGN_FUNDING_SIBLING_INPUT:
+		return handle_sign_funding_sibling_input(client, msg);
 	case WIRE_HSMD_VALIDATE_COMMITMENT_TX:
 		return handle_validate_commitment_tx(client, msg);
 	case WIRE_HSMD_REVOKE_COMMITMENT_TX:
@@ -2463,7 +2412,6 @@ u8 *hsmd_handle_client_message(const tal_t *ctx, struct hsmd_client *client,
 	case WIRE_HSMD_INIT_REPLY_FAILURE:
 	case WIRE_HSMSTATUS_CLIENT_BAD_REQUEST:
 	case WIRE_HSMD_SIGN_COMMITMENT_TX_REPLY:
-	case WIRE_HSMD_SIGN_ASSET_TX_REPLY:
 	case WIRE_HSMD_VALIDATE_COMMITMENT_TX_REPLY:
 	case WIRE_HSMD_REVOKE_COMMITMENT_TX_REPLY:
 	case WIRE_HSMD_VALIDATE_REVOCATION_REPLY:
@@ -2577,6 +2525,7 @@ u8 *hsmd_init(const u8 *secret_data, size_t secret_len, const u64 hsmd_version,
 		WIRE_HSMD_REVOKE_COMMITMENT_TX,
 		WIRE_HSMD_SIGN_BOLT12_2,
 		WIRE_HSMD_BIP137_SIGN_MESSAGE,
+		WIRE_HSMD_SIGN_FUNDING_SIBLING_INPUT,
 	};
 	u32 *caps;
 

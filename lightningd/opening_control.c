@@ -409,6 +409,8 @@ static void opening_funder_finished(struct subd *openingd, const u8 *resp,
 					   &funding,
 					   &feerate,
 					   &fc->uc->our_config.channel_reserve,
+					   &fc->uc->our_config.max_accepted_htlcs,
+					   &fc->uc->our_config.dust_limit,
 					   &remote_upfront_shutdown_script,
 					   &type)) {
 		log_broken(fc->uc->log,
@@ -535,6 +537,8 @@ static void opening_fundee_finished(struct subd *openingd,
 				     &feerate,
 				     cast_const2(u8 **, &fwd_msg),
 				     &uc->our_config.channel_reserve,
+				     &uc->our_config.max_accepted_htlcs,
+				     &uc->our_config.dust_limit,
 				     &local_upfront_shutdown_script,
 				     &remote_upfront_shutdown_script,
 				     &type)) {
@@ -831,7 +835,10 @@ openchannel_hook_deserialize(struct openchannel_hook_payload *payload,
 				   " already set by other plugin. Ignoring!");
 			return true;
 		}
-		switch (json_to_address_scriptpubkey(tmpctx, chainparams,
+		/* On the payload, not tmpctx: with another plugin after
+		 * this one, the hook chain goes on (and tmpctx is freed)
+		 * before openchannel_hook_final uses it. */
+		switch (json_to_address_scriptpubkey(payload, chainparams,
 						     buffer, t_closeto,
 						     &payload->our_upfront_shutdown_script)) {
 			case ADDRESS_PARSE_UNRECOGNIZED:
@@ -1125,47 +1132,16 @@ static struct command_result *json_fundchannel_complete(struct command *cmd,
 		return command_fail(cmd, FUNDING_PSBT_INVALID,
 				    "No output to open channel");
 
-	/* Asset channels: output n must pay exactly the asset amount, and
-	 * n+1 exactly the fee reserve in the fee asset, both explicitly
-	 * (elementsd doesn't blind outputs to unconfidential addresses,
-	 * which is what fundchannel_start gave out). */
-	if (fc->asset) {
-		size_t reserve = *funding_txout_num + 1;
-		struct amount_asset amt;
-
-		if (!reserve_found)
-			return command_fail(cmd, FUNDING_PSBT_INVALID,
-					    "asset channel: output %zu"
-					    " must pay the fee reserve"
-					    " to the channel too", reserve);
-		amt = wally_psbt_output_get_amount(&funding_psbt->outputs
-						   [*funding_txout_num]);
-		if (amt.value == 0
-		    || !channel_asset_tag_eq(amt.asset, fc->asset->tag)
-		    || !amount_sat_eq(amount_sat(amt.value), fc->funding_sats))
-			return command_fail(cmd, FUNDING_PSBT_INVALID,
-					    "asset channel: output %u must pay"
-					    " exactly %s of asset %s,"
-					    " explicitly",
-					    *funding_txout_num,
-					    fmt_amount_sat(tmpctx,
-							   fc->funding_sats),
-					    fmt_channel_asset(tmpctx,
-							      fc->asset->tag));
-		amt = wally_psbt_output_get_amount(&funding_psbt->outputs
-						   [reserve]);
-		if (amt.value == 0
-		    || !amount_asset_is_main(&amt)
-		    || !amount_sat_eq(amount_sat(amt.value),
-				      fc->asset->fee_reserve))
-			return command_fail(cmd, FUNDING_PSBT_INVALID,
-					    "asset channel: output %zu must pay"
-					    " exactly the %s fee reserve,"
-					    " explicitly",
-					    reserve,
-					    fmt_amount_sat(tmpctx,
-							   fc->asset->fee_reserve));
-	}
+	/* Asset channels: the fee reserve goes to the channel right after the
+	 * funding output.  What the two pay, and that they are explicit, is
+	 * the caller's to check (the asset channel plugin does, before it
+	 * calls us): a wrong one locks only the opener's own coins, as the
+	 * peer's funding watch never accepts it. */
+	if (fc->asset && !reserve_found)
+		return command_fail(cmd, FUNDING_PSBT_INVALID,
+				    "asset channel: output %u must pay the fee"
+				    " reserve to the channel too",
+				    *funding_txout_num + 1);
 
 	/* Can't really check amounts for elements. */
 	if (!chainparams->is_elements
@@ -1340,11 +1316,13 @@ static void fundchannel_start_after_sync(struct chain_topology *topo,
 		return;
 	}
 
-	if (peer->connected != PEER_CONNECTED)
+	if (peer->connected != PEER_CONNECTED) {
 		was_pending(command_fail(info->cmd, FUNDING_PEER_NOT_CONNECTED,
 					 "Peer %s",
 					 peer->connected == PEER_DISCONNECTED
 					 ? "not connected" : "still connecting"));
+		return;
+	}
 	fundchannel_start(info->cmd, peer, info->fc,
 			  &info->tmp_channel_id, info->mindepth, info->reserve);
 }
@@ -1361,10 +1339,11 @@ static struct command_result *param_asset(struct command *cmd,
 {
 	*asset = channel_asset_from_hex(cmd, buffer + tok->start,
 					tok->end - tok->start);
-	if (*asset)
+	if (*asset && channel_asset_tag_valid(*asset, tal_bytelen(*asset)))
 		return NULL;
 	return command_fail_badparam(cmd, name, buffer, tok,
-				     "should be a 32-byte asset id");
+				     "should be a 32-byte asset id, not the"
+				     " chain's fee asset");
 }
 
 static struct command_result *json_fundchannel_start(struct command *cmd,
@@ -1623,7 +1602,8 @@ static struct channel *stub_chan(struct command *cmd,
 				 struct shachain shachain,
 				 struct basepoints their_basepoint,
 				 enum side opener,
-				 u16 remote_to_self_delay)
+				 u16 remote_to_self_delay,
+				 const struct tlv_scb_tlvs_asset_channel *asset_channel)
 {
 	struct basepoints basepoints;
 	struct bitcoin_signature *sig;
@@ -1790,6 +1770,19 @@ static struct channel *stub_chan(struct command *cmd,
 	/* We don't want to gossip about this, ever. */
 	channel->channel_gossip = tal_free(channel->channel_gossip);
 
+	/* Asset channel: its asset and fee reserve shape every tx of it,
+	 * and our side goes to its close script (an address of the asset
+	 * wallet), not to our wallet, which can't hold the asset. */
+	if (asset_channel) {
+		channel->asset = channel_asset_new(channel,
+						   asset_channel->asset.tag,
+						   asset_channel->asset.fee_reserve);
+		tal_free(channel->shutdown_scriptpubkey[LOCAL]);
+		channel->shutdown_scriptpubkey[LOCAL]
+			= tal_dup_talarr(channel, u8,
+					 asset_channel->close_script);
+	}
+
 	return channel;
 }
 
@@ -1860,6 +1853,19 @@ static struct command_result *json_recoverchannel(struct command *cmd,
 			&_localfundingpubkey);
 		}
 
+		/* Asset channel (common/channel_asset.h)? */
+		const struct tlv_scb_tlvs_asset_channel *asset_channel
+			= scb_chan->tlvs ? scb_chan->tlvs->asset_channel : NULL;
+		if (asset_channel
+		    && (!chainparams->is_elements
+			|| !channel_asset_tag_valid(asset_channel->asset.tag,
+						    sizeof(asset_channel->asset.tag)))) {
+			log_broken(cmd->ld->log, "SCB for %s: not an asset"
+				   " channel we can restore here",
+				   fmt_channel_id(tmpctx, &scb_chan->cid));
+			continue;
+		}
+
 		struct lightningd *ld = cmd->ld;
 		struct channel *channel= stub_chan(cmd,
 						   scb_chan->id,
@@ -1872,7 +1878,8 @@ static struct command_result *json_recoverchannel(struct command *cmd,
 						   chain,
 						   basepoints,
 						   opener,
-						   remote_to_self_delay);
+						   remote_to_self_delay,
+						   asset_channel);
 
 		/* Returns NULL only when channel already exists, so we skip over it. */
 		if (channel == NULL)

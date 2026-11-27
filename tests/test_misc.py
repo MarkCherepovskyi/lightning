@@ -349,6 +349,48 @@ def test_lightningd_still_loading(node_factory, bitcoind, executor):
     l1.pay(l2, 1000)
 
 
+def test_fundchannel_start_peer_gone_while_syncing(node_factory, bitcoind, executor):
+    """fundchannel_start waits until we have synced.  If the peer is no longer
+    connected by then, the command must fail, not go on with a freed command."""
+    mock_release = Event()
+
+    def mock_getblock(r):
+        brpc = RawProxy(btc_conf_file=bitcoind.conf_file)
+        if r['params'][0] == slow_blockid:
+            mock_release.wait(TIMEOUT)
+        return {
+            "result": brpc._call(r['method'], *r['params']),
+            "error": None,
+            "id": r['id']
+        }
+
+    # A channel between them, so l1 keeps the peer when it disconnects.
+    l1, l2 = node_factory.line_graph(2, opts=[{'may_reconnect': True,
+                                               'wait_for_bitcoind_sync': False},
+                                              {'may_reconnect': True}])
+    l1.stop()
+    bitcoind.generate_block(2)
+    sync_blockheight(bitcoind, [l2])
+
+    # Make it slow grabbing the final block.
+    slow_blockid = bitcoind.rpc.getblockhash(bitcoind.rpc.getblockcount())
+    l1.daemon.rpcproxy.mock_rpc('getblock', mock_getblock)
+    l1.start(wait_for_bitcoind_sync=False)
+    wait_for(lambda: only_one(l1.rpc.listpeers(l2.info['id'])['peers'])['connected'])
+
+    fut = executor.submit(l1.rpc.fundchannel_start, l2.info['id'], '30000sat')
+    l1.daemon.wait_for_log("NOTIFY .* unusual Waiting to sync with bitcoind network")
+
+    # The peer goes away while we wait.
+    l2.stop()
+    wait_for(lambda: not only_one(l1.rpc.listpeers(l2.info['id'])['peers'])['connected'])
+
+    mock_release.set()
+    with pytest.raises(RpcError, match=r'Peer not connected'):
+        fut.result(TIMEOUT)
+    assert l1.rpc.getinfo()['id'] == l1.info['id']
+
+
 def test_ping(node_factory):
     l1, l2 = node_factory.line_graph(2)
 
@@ -1519,6 +1561,47 @@ def test_funding_reorg_private(node_factory, bitcoind):
 
     l1.rpc.close(l2.info['id'])
     bitcoind.generate_block(1, True)
+
+
+def test_funding_reorg_back_to_old_scid(node_factory, bitcoind):
+    """A reorg moves the funding tx of an announced channel, and a second one
+    puts it back where it was: the scid we then get is one we remembered as
+    old.  lightningd used to die adding it to its scid map a second time (and
+    again on every restart)."""
+    def setup(plugin):
+        @plugin.hook('openchannel')
+        def on_openchannel(openchannel, plugin, **kwargs):
+            # Zeroconf: else we close the channel when its funding is reorged out.
+            return {'result': 'continue', 'mindepth': 0}
+
+    opts = {'funding-confirms': 2, 'dev-fast-reconnect': None}
+    node_opts = {'may_reconnect': True, 'allow_bad_gossip': True, 'allow_warning': True}
+    l1 = node_factory.get_node(inline_plugin=setup, options=opts, **node_opts)
+    l2 = node_factory.get_node(inline_plugin=setup, options=opts, **node_opts)
+    node_factory.join_nodes([l1, l2], fundchannel=False)
+    l1.fundwallet(10000000)
+    sync_blockheight(bitcoind, [l1])                # height 102
+    bitcoind.generate_block(3)                      # heights 103-105
+
+    l1.rpc.fundchannel(l2.info['id'], "all")
+    bitcoind.generate_block(2)                      # heights 106-107
+    l1.wait_local_channel_active('106x1x0')
+    l2.wait_local_channel_active('106x1x0')
+
+    # The funding tx goes from block 106 to block 108...
+    bitcoind.simple_reorg(106, 2)
+    for n in (l1, l2):
+        n.daemon.wait_for_log('Short channel id changed from 106x1x0->108x1x0')
+
+    # ... and back to block 106.
+    bitcoind.simple_reorg(106, 0)
+    for n in (l1, l2):
+        n.daemon.wait_for_log('Short channel id changed from 108x1x0->106x1x0')
+        assert only_one(n.rpc.listpeerchannels()['channels'])['short_channel_id'] == '106x1x0'
+
+    # And what we saved loads again.
+    l2.restart()
+    assert only_one(l2.rpc.listpeerchannels()['channels'])['short_channel_id'] == '106x1x0'
 
 
 @pytest.mark.openchannel('v1')
@@ -3267,7 +3350,13 @@ def test_emergencyrecoverpenaltytxn(node_factory, bitcoind):
     l1.daemon.wait_for_log('Resolved THEIR_REVOKED_UNILATERAL/DELAYED_CHEAT_OUTPUT_TO_THEM by our proposal OUR_PENALTY_TX')
 
     assert(l1.rpc.listfunds()["channels"][0]["state"] == "ONCHAIN")
-    assert(l1.rpc.listfunds()["outputs"][0]["txid"] == txid)
+    # The penalty's output, and our to_remote on their commitment: a stub
+    # can't place their anchor (it doesn't know their funding key), and
+    # onchaind used to lose our to_remote when such an output came first.
+    outputs = l1.rpc.listfunds()["outputs"]
+    assert txid in [o["txid"] for o in outputs]
+    cheat = bitcoind.rpc.getrawtransaction(txid, True)["vin"][0]["txid"]
+    assert cheat in [o["txid"] for o in outputs]
 
 
 @unittest.skipIf(os.getenv('TEST_DB_PROVIDER', 'sqlite3') != 'sqlite3', "deletes database, which is assumed sqlite3")

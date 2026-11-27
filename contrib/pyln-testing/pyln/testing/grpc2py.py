@@ -1005,6 +1005,7 @@ def listpeerchannels_channels2py(m):
         "state": str(m.state),  # EnumField in generate_composite
         "state_changes": [listpeerchannels_channels_state_changes2py(i) for i in m.state_changes],  # ArrayField[composite] in generate_composite
         "status": [m.status for i in m.status],  # ArrayField[primitive] in generate_composite
+        "asset": hexlify(m.asset),  # PrimitiveField in generate_composite
         "channel_id": hexlify(m.channel_id),  # PrimitiveField in generate_composite
         "close_to": hexlify(m.close_to),  # PrimitiveField in generate_composite
         "close_to_addr": m.close_to_addr,  # PrimitiveField in generate_composite
@@ -1012,6 +1013,7 @@ def listpeerchannels_channels2py(m):
         "dust_limit_msat": amount2msat(m.dust_limit_msat),  # PrimitiveField in generate_composite
         "fee_base_msat": amount2msat(m.fee_base_msat),  # PrimitiveField in generate_composite
         "fee_proportional_millionths": m.fee_proportional_millionths,  # PrimitiveField in generate_composite
+        "fee_reserve_msat": amount2msat(m.fee_reserve_msat),  # PrimitiveField in generate_composite
         "funding_outnum": m.funding_outnum,  # PrimitiveField in generate_composite
         "funding_txid": hexlify(m.funding_txid),  # PrimitiveField in generate_composite
         "ignore_fee_limits": m.ignore_fee_limits,  # PrimitiveField in generate_composite
